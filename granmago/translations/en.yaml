@@ -1,0 +1,16 @@
+configuration:
+  log_level:
+    name: Log level
+    description: How much the add-on writes to the log.
+  risk_pct:
+    name: Risk %
+    description: Percent of the paper balance risked on each trade.
+  leverage:
+    name: Leverage
+    description: Stored on the trade. Size comes from risk and stop distance.
+  initial_balance:
+    name: Initial balance
+    description: Paper balance used when you reset from the page.
+  scan_seconds:
+    name: Seconds between scans
+    description: An open position is marked every 20 seconds.

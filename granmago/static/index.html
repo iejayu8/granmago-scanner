@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GranMago Scanner</title>
+<style>
+  :root {
+    --bg: #0d1117; --card: #161b22; --border: #30363d; --text: #e6edf3;
+    --muted: #8b949e; --green: #3fb950; --red: #f85149; --blue: #58a6ff; --orange: #d29922;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); font-size: 16px; }
+  header { padding: 12px 16px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  h1 { margin: 0; font-size: 1.25rem; }
+  .badge { background: #238636; color: white; padding: 4px 10px; border-radius: 20px; font-size: 0.75rem; font-weight: 600; }
+  .badge.warn { background: var(--orange); }
+  .container { max-width: 960px; margin: 0 auto; padding: 12px; }
+  .disclaimer { background: #1c2128; border: 1px solid var(--orange); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; font-size: 0.8rem; color: #ffa657; line-height: 1.4; }
+  .live { background: #12261e; border: 1px solid #238636; border-radius: 8px; padding: 10px 12px; margin-bottom: 16px; font-size: 0.85rem; color: #7ee787; line-height: 1.4; }
+  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 16px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+  .card h3 { margin: 0 0 6px; font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  .card .value { font-size: 1.3rem; font-weight: 600; }
+  .positive { color: var(--green); } .negative { color: var(--red); }
+  .controls { display: flex; flex-direction: column; gap: 12px; }
+  .control-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+  label { display: block; font-size: 0.75rem; color: var(--muted); margin-bottom: 4px; }
+  input, select { background: #21262d; color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-size: 16px; width: 100%; max-width: 140px; }
+  button { cursor: pointer; font-weight: 600; border-radius: 8px; padding: 14px 16px; font-size: 16px; border: none; }
+  button:disabled { opacity: 0.45; cursor: default; }
+  button.primary { background: var(--green); color: #0d1117; }
+  button.danger { background: var(--red); color: white; }
+  button.secondary { background: #21262d; color: var(--text); border: 1px solid var(--border); }
+  .btn-row { display: flex; gap: 10px; }
+  .btn-row button { flex: 1; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.75rem; }
+  th, td { padding: 8px 6px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; }
+  .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .score-high { color: var(--green); font-weight: 600; }
+  .score-mid { color: var(--orange); }
+  .score-low { color: var(--muted); }
+  .log { max-height: 180px; overflow-y: auto; font-family: ui-monospace, monospace; font-size: 0.75rem; background: #0d1117; padding: 10px; border-radius: 6px; }
+  .log div { margin-bottom: 3px; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 12px; }
+  .tab { padding: 10px 14px; border-radius: 8px; background: #21262d; cursor: pointer; font-size: 0.85rem; flex: 1; text-align: center; }
+  .tab.active { background: var(--blue); color: white; }
+  .hidden { display: none; }
+  .best { background: rgba(63,185,80,0.08); }
+  footer { text-align: center; padding: 16px; color: var(--muted); font-size: 0.7rem; }
+  #heartbeat { display: block; color: var(--muted); font-size: 0.7rem; margin-top: 4px; text-align: right; }
+  @media (min-width: 700px) {
+    .grid { grid-template-columns: repeat(3, 1fr); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>GranMago Scanner</h1>
+    <small style="color:var(--muted)">Paper trading en el servidor</small>
+  </div>
+  <div style="text-align:right">
+    <span class="badge">PAPER</span>
+    <span class="badge warn" id="statusBadge">DETENIDO</span>
+    <small id="heartbeat"></small>
+  </div>
+</header>
+
+<div class="container">
+  <div class="disclaimer">
+    <strong>AVISO:</strong> Scanner educativo. Rankea las principales monedas según EMA50 multi-timeframe, estocástico y zona de liquidez. No es asesoramiento financiero y no opera en un exchange real.
+  </div>
+  <div class="live" id="liveNote">
+    El bot corre en Home Assistant. Puedes cerrar esta página o apagar la pantalla: la operación sigue.
+  </div>
+
+  <div class="grid">
+    <div class="card"><h3>Balance</h3><div class="value" id="balance">—</div></div>
+    <div class="card"><h3>PnL total</h3><div class="value" id="pnl">—</div></div>
+    <div class="card"><h3>Win rate</h3><div class="value" id="winrate">-</div></div>
+    <div class="card"><h3>Operaciones</h3><div class="value" id="tradeCount">0</div></div>
+    <div class="card"><h3>Mejor Long</h3><div class="value" id="bestLong">-</div></div>
+    <div class="card"><h3>Mejor Short</h3><div class="value" id="bestShort">-</div></div>
+  </div>
+
+  <div class="card" style="margin-bottom:16px">
+    <h3>Controles</h3>
+    <div class="controls">
+      <div class="control-row">
+        <div>
+          <label>Riesgo %</label>
+          <input type="number" id="riskPct" value="2" min="0.5" max="5" step="0.5">
+        </div>
+        <div>
+          <label>Apalancamiento</label>
+          <select id="leverage">
+            <option value="1">1x</option>
+            <option value="2">2x</option>
+            <option value="3">3x</option>
+            <option value="5">5x</option>
+          </select>
+        </div>
+        <div>
+          <label>Balance</label>
+          <input type="number" id="initBalance" value="10000" min="100">
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="secondary" id="btnScan">Escanear ahora</button>
+        <button class="primary" id="btnStart">Iniciar bot</button>
+      </div>
+      <div class="btn-row">
+        <button class="danger" id="btnStop" disabled>Detener</button>
+        <button class="secondary" id="btnReset">Reset</button>
+      </div>
+    </div>
+    <div id="scanStatus" style="font-size:0.8rem; color:var(--muted); margin-top:8px;">Conectando con el servidor…</div>
+  </div>
+
+  <div class="card" style="margin-bottom:16px">
+    <h3>Ranking de oportunidades</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Par</th><th>Sesgo</th><th>Long</th><th>Short</th><th>EMA</th><th>Stoch</th><th>Rec</th></tr>
+        </thead>
+        <tbody id="scanTable"><tr><td colspan="7" style="color:var(--muted)">Sin escaneo</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="grid" style="grid-template-columns: 1fr;">
+    <div class="card">
+      <h3>Último análisis</h3>
+      <div id="indicators" style="font-size:0.9rem; line-height:1.6">-</div>
+    </div>
+    <div class="card">
+      <h3>Log del servidor</h3>
+      <div class="log" id="log"></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <div class="tabs">
+      <div class="tab active" data-tab="open">Posición abierta</div>
+      <div class="tab" data-tab="history">Historial</div>
+    </div>
+    <div id="tab-open">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Par</th><th>Lado</th><th>Entrada</th><th>Precio</th><th>SL</th><th>TP</th><th>PnL</th></tr></thead>
+          <tbody id="openTrades"></tbody>
+        </table>
+      </div>
+    </div>
+    <div id="tab-history" class="hidden">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Fecha</th><th>Par</th><th>Lado</th><th>PnL</th><th>Motivo</th></tr></thead>
+          <tbody id="historyTrades"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+<footer>GranMago Scanner · paper trading · el proceso vive en Home Assistant</footer>
+<script>
+const ROOT = "__INGRESS__";
+const $ = (id) => document.getElementById(id);
+
+function api(path) { return ROOT + path; }
+
+function esc(s) {
+  return String(s).replace(/[&<>]/g, (c) => {
+    if (c === "&") return "&" + "amp;";
+    if (c === "<") return "&" + "lt;";
+    return "&" + "gt;";
+  });
+}
+
+function fmt(p) {
+  if (p === null || p === undefined || p === "") return "-";
+  const n = +p;
+  if (!isFinite(n)) return "-";
+  if (n >= 1000) return n.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  if (n >= 1) return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  return n.toLocaleString(undefined, { maximumFractionDigits: 4 });
+}
+
+function scoreClass(n) {
+  return n >= 70 ? "score-high" : n >= 45 ? "score-mid" : "score-low";
+}
+
+let formDirty = false;
+["riskPct", "leverage", "initBalance"].forEach((id) => {
+  $(id).addEventListener("input", () => { formDirty = true; });
+});
+
+function render(s) {
+  const running = !!s.running;
+  $("statusBadge").textContent = running ? "CORRIENDO" : "DETENIDO";
+  $("statusBadge").className = "badge" + (running ? "" : " warn");
+  $("btnStart").disabled = running;
+  $("btnStop").disabled = !running;
+  $("heartbeat").textContent = running
+    ? (s.busy ? "Escaneando en el servidor…" : ("Activo en el servidor" + (s.lastTickAt ? " · " + s.lastTickAt.replace("T", " ").slice(0, 19) : "")))
+    : "Parado. La página no hace falta para que corra, pero ahora mismo está detenido.";
+
+  $("balance").textContent = (+s.balance || 0).toLocaleString(undefined, { maximumFractionDigits: 0 }) + " USDT";
+  const pnl = (+s.balance || 0) - (+s.initialBalance || 0);
+  $("pnl").textContent = (pnl >= 0 ? "+" : "") + pnl.toFixed(2);
+  $("pnl").className = "value " + (pnl >= 0 ? "positive" : "negative");
+  const hist = s.history || [];
+  const wins = hist.filter((t) => t.pnl > 0).length;
+  $("winrate").textContent = hist.length ? Math.round(wins / hist.length * 100) + "%" : "-";
+  $("tradeCount").textContent = hist.length;
+
+  const bl = s.bestLong;
+  const bs = s.bestShort;
+  $("bestLong").textContent = bl ? bl.pair.replace("-USDT", "") + " (" + bl.scoreLong + ")" : "-";
+  $("bestShort").textContent = bs ? bs.pair.replace("-USDT", "") + " (" + bs.scoreShort + ")" : "-";
+
+  if (!formDirty && s.settings) {
+    $("riskPct").value = s.settings.riskPct;
+    $("leverage").value = String(s.settings.leverage);
+    $("initBalance").value = s.initialBalance;
+  }
+
+  const rows = s.lastScan || [];
+  $("scanTable").innerHTML = rows.length ? rows.map((r) => {
+    const best = (bl && r.pair === bl.pair) || (bs && r.pair === bs.pair);
+    const bias = r.bias === "ALCISTA" ? "L" : r.bias === "BAJISTA" ? "S" : "-";
+    return `<tr class="${best ? "best" : ""}">
+      <td><strong>${esc(r.pair.replace("-USDT", ""))}</strong></td>
+      <td class="${r.bias === "ALCISTA" ? "positive" : r.bias === "BAJISTA" ? "negative" : ""}">${bias}</td>
+      <td class="${scoreClass(r.scoreLong)}">${r.scoreLong}</td>
+      <td class="${scoreClass(r.scoreShort)}">${r.scoreShort}</td>
+      <td>${r.nearEMA ? "Sí" : "No"}</td>
+      <td>${r.stoch}</td>
+      <td>${r.validLong ? "LONG" : r.validShort ? "SHORT" : "-"}</td>
+    </tr>`;
+  }).join("") : '<tr><td colspan="7" style="color:var(--muted)">Sin escaneo</td></tr>';
+
+  const top = rows[0];
+  $("indicators").innerHTML = top ? `
+    Top: <strong>${top.pair}</strong> @ ${fmt(top.price)}<br>
+    Sesgo: ${top.bias}<br>
+    Score L/S: ${top.scoreLong} / ${top.scoreShort}<br>
+    EMA50 4H: ${top.ema50_4 ? fmt(top.ema50_4) : "-"} · Stoch: ${top.stoch}
+  ` : "-";
+
+  $("scanStatus").textContent = s.busy
+    ? "Escaneando en el servidor…"
+    : (s.lastScanAt ? ("Último escaneo: " + s.lastScanAt.replace("T", " ").slice(0, 19)) : "Aún no hay escaneo");
+
+  $("log").innerHTML = (s.log || []).map((l) => `<div>${esc(l)}</div>`).join("");
+
+  const p = s.openPosition;
+  $("openTrades").innerHTML = p ? `<tr>
+    <td>${p.pair.replace("-USDT", "")}</td><td>${String(p.side).toUpperCase()}</td>
+    <td>${fmt(p.entry)}</td><td>${fmt(p.price)}</td><td>${fmt(p.sl)}</td><td>${fmt(p.tp)}</td>
+    <td class="${(p.unrealized || 0) >= 0 ? "positive" : "negative"}">${(+p.unrealized || 0).toFixed(2)}</td>
+  </tr>` : '<tr><td colspan="7" style="color:var(--muted)">Sin posición</td></tr>';
+
+  $("historyTrades").innerHTML = hist.slice(0, 30).map((t) => `
+    <tr>
+      <td>${t.time}</td><td>${String(t.pair).replace("-USDT", "")}</td><td>${String(t.side).toUpperCase()}</td>
+      <td class="${t.pnl >= 0 ? "positive" : "negative"}">${(+t.pnl).toFixed(2)}</td>
+      <td>${t.reason}</td>
+    </tr>
+  `).join("") || '<tr><td colspan="5" style="color:var(--muted)">Sin historial</td></tr>';
+}
+
+async function refresh() {
+  try {
+    const r = await fetch(api("/api/state"), { cache: "no-store" });
+    if (!r.ok) throw new Error("http " + r.status);
+    render(await r.json());
+  } catch (e) {
+    $("scanStatus").textContent = "Sin conexión con el servidor";
+  }
+}
+
+function payload() {
+  return {
+    riskPct: +$("riskPct").value,
+    leverage: +$("leverage").value,
+    initialBalance: +$("initBalance").value
+  };
+}
+
+async function post(path, body) {
+  formDirty = false;
+  try {
+    const r = await fetch(api(path), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {})
+    });
+    const data = await r.json();
+    if (data && typeof data.balance === "number") render(data);
+    else refresh();
+  } catch (e) {
+    $("scanStatus").textContent = "Sin conexión con el servidor";
+  }
+}
+
+$("btnStart").onclick = () => post("/api/start", payload());
+$("btnStop").onclick = () => post("/api/stop");
+$("btnScan").onclick = () => post("/api/scan");
+$("btnReset").onclick = () => {
+  if (!confirm("¿Resetear balance e historial? El bot no se detiene.")) return;
+  post("/api/reset", payload());
+};
+["riskPct", "leverage"].forEach((id) => {
+  $(id).addEventListener("change", () => post("/api/settings", payload()));
+});
+
+document.querySelectorAll(".tab").forEach((t) => {
+  t.onclick = () => {
+    document.querySelectorAll(".tab").forEach((x) => x.classList.remove("active"));
+    t.classList.add("active");
+    $("tab-open").classList.toggle("hidden", t.dataset.tab !== "open");
+    $("tab-history").classList.toggle("hidden", t.dataset.tab !== "history");
+  };
+});
+
+refresh();
+setInterval(refresh, 4000);
+</script>
+</body>
+</html>

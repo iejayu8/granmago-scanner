@@ -1,0 +1,32 @@
+name: GranMago Scanner
+version: "1.0.0"
+slug: granmago
+description: Paper trading del scanner GranMago. El bot corre en el servidor aunque cierres la página.
+url: https://github.com/iejayu8/granmago-scanner
+arch:
+  - aarch64
+  - amd64
+  - armv7
+  - armhf
+init: false
+boot: auto
+ingress: true
+ingress_port: 8787
+panel_icon: mdi:crystal-ball
+panel_title: GranMago
+ports:
+  8787/tcp: 8787
+ports_description:
+  8787/tcp: Interfaz web del scanner
+options:
+  log_level: info
+  risk_pct: 2
+  leverage: 3
+  initial_balance: 10000
+  scan_seconds: 90
+schema:
+  log_level: list(trace|debug|info|notice|warning|error|fatal)
+  risk_pct: float
+  leverage: int
+  initial_balance: int
+  scan_seconds: int
