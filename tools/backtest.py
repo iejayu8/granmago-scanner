@@ -605,7 +605,7 @@ def summarize(variant, end_ms):
         "avg_loss": round(sum(t["pnl"] for t in losses) / len(losses), 2) if losses else None,
         "avg_hold_h": round(sum(holds) / len(holds), 2) if holds else None,
         "reasons": reasons,
-        "rejected_wide_sl": variant.rejected,
+        "minutes_with_signal_but_no_new_entry": variant.rejected,
         "equity_samples": variant.equity_samples,
         "trade_list": trades,
     }
@@ -869,7 +869,8 @@ def print_report(report):
             row["max_dd"], row["max_dd_pct"], row["peak_positions"], row["capped_entries"]))
         print("avg_win %s  avg_loss %s  avg_hold_h %s" % (
             row["avg_win"], row["avg_loss"], row["avg_hold_h"]))
-        print("exits %s  wide_sl_or_unfilled %d" % (row["reasons"], row["rejected_wide_sl"]))
+        print("exits %s  minutes_with_signal_but_no_new_entry %d" % (
+            row["reasons"], row["minutes_with_signal_but_no_new_entry"]))
         for op in row["open"]:
             print("OPEN %s %s entry %s @ %s mark %s uPnL %s trailing %s" % (
                 op["side"], op["pair"], madrid(op["entry_ms"]), op["entry"], op["price"], op["unrealized"], op["trailing"]))
