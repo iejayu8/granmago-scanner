@@ -13,6 +13,7 @@ built from prices up to that minute, which is what the exchange returns
 for the forming candle. No future close is used.
 """
 
+import argparse
 import json
 import math
 import os
@@ -391,7 +392,7 @@ def path_of(bar):
     return [o, h, l, c]
 
 
-def new_state(threshold, trailing):
+def new_state(threshold, trailing, activation=1.0, distance=0.5):
     return {
         "running": True,
         "balance": INITIAL_BALANCE,
@@ -410,19 +411,44 @@ def new_state(threshold, trailing):
             "leverage": LEVERAGE,
             "scanSeconds": 90,
             "trailingEnabled": trailing,
-            "trailingActivationPct": 1.0,
-            "trailingDistance": 0.5,
+            "trailingActivationPct": float(activation),
+            "trailingDistance": float(distance),
             "entryThreshold": threshold,
         },
     }
 
 
+def pick_best(rows, threshold):
+    """Same ranking as scan_all + maybe_open: long wins ties, stable sort."""
+    ordered = sorted(rows, key=lambda r: max(r["scoreLong"], r["scoreShort"]), reverse=True)
+    longs = [r for r in ordered if r["scoreLong"] >= threshold and r["bias"] == "ALCISTA"]
+    shorts = [r for r in ordered if r["scoreShort"] >= threshold and r["bias"] == "BAJISTA"]
+    longs.sort(key=lambda r: r["scoreLong"], reverse=True)
+    shorts.sort(key=lambda r: r["scoreShort"], reverse=True)
+    return (longs[0] if longs else None, shorts[0] if shorts else None)
+
+
+def _signal(row):
+    if row is None:
+        return None
+    return {
+        "pair": row["pair"],
+        "price": row["price"],
+        "recentLow": row["recentLow"],
+        "recentHigh": row["recentHigh"],
+        "scoreLong": row["scoreLong"],
+        "scoreShort": row["scoreShort"],
+    }
+
+
 class Variant:
-    def __init__(self, name, threshold, trailing):
+    def __init__(self, name, threshold, trailing, activation=1.0, distance=0.5):
         self.name = name
         self.threshold = threshold
         self.trailing = trailing
-        self.state = new_state(threshold, trailing)
+        self.activation = float(activation)
+        self.distance = float(distance)
+        self.state = new_state(threshold, trailing, activation, distance)
         self.trades = []
         self.rejected = 0
         self.peak = INITIAL_BALANCE
@@ -492,21 +518,16 @@ class Variant:
             self._open_meta = None
         self.note_equity(decision_ms, sample=False)
 
-    def maybe_open(self, rows, decision_ms):
+    def maybe_open(self, rows, decision_ms, picked=None):
         self.bind()
         if self.state["openPosition"] is not None:
             return
-        tagged = []
-        for row in rows:
-            copy = dict(row)
-            copy["validLong"] = row["scoreLong"] >= self.threshold and row["bias"] == "ALCISTA"
-            copy["validShort"] = row["scoreShort"] >= self.threshold and row["bias"] == "BAJISTA"
-            tagged.append(copy)
-        tagged.sort(key=lambda r: max(r["scoreLong"], r["scoreShort"]), reverse=True)
-        best_l = sorted((r for r in tagged if r["validLong"]), key=lambda r: r["scoreLong"], reverse=True)
-        best_s = sorted((r for r in tagged if r["validShort"]), key=lambda r: r["scoreShort"], reverse=True)
-        self.state["bestLong"] = best_l[0] if best_l else None
-        self.state["bestShort"] = best_s[0] if best_s else None
+        if picked is None:
+            best_l, best_s = pick_best(rows, self.threshold)
+        else:
+            best_l, best_s = picked
+        self.state["bestLong"] = best_l
+        self.state["bestShort"] = best_s
         server.maybe_open()
         pos = self.state["openPosition"]
         if pos is None:
@@ -543,6 +564,9 @@ def summarize(variant, end_ms):
         variant.equity_samples.append((end_ms, equity))
     return {
         "name": variant.name,
+        "trailing": variant.trailing,
+        "activation": variant.activation if variant.trailing else None,
+        "distance": variant.distance if variant.trailing else None,
         "trades": len(trades),
         "wins": len(wins),
         "losses": len(losses),
@@ -837,5 +861,281 @@ def print_report(report):
                 ))
 
 
+ACTIVATIONS = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0)
+DISTANCES = (0.25, 0.5, 0.75, 1.0, 1.5, 2.0)
+OOS_START = datetime(2026, 9, 20, 0, 0, tzinfo=MADRID)
+
+
+def closed_now_ms():
+    now_ms = int(time.time() * 1000)
+    end_ms = now_ms - (now_ms % MIN_MS)
+    if end_ms == now_ms:
+        end_ms -= MIN_MS
+    return end_ms
+
+
+def make_clock(market, start_ms, end_ms):
+    clock = []
+    first_open = start_ms - (start_ms % MIN_MS)
+    if first_open + MIN_MS < start_ms:
+        first_open += MIN_MS
+    open_ts = first_open
+    btc = market["BTC-USDT"]
+    last_open = btc.m1[-1]["ts"]
+    while open_ts <= last_open:
+        decision = open_ts + MIN_MS
+        if decision >= start_ms and decision <= end_ms and open_ts in btc.m1_by_ts:
+            clock.append(open_ts)
+        open_ts += MIN_MS
+    return clock
+
+
+def precompute(market, clock, threshold):
+    """Score every minute once. Entry ranking does not depend on the trail."""
+    frames = []
+    mismatches = 0
+    started = time.time()
+    for n, open_ts in enumerate(clock):
+        decision = open_ts + MIN_MS
+        bars = {}
+        for pair, data in market.items():
+            bar = data.minute(open_ts)
+            if bar is not None:
+                bars[pair] = bar
+        rows = []
+        for pair in server.PAIRS:
+            if pair not in bars:
+                continue
+            c4, cd, cw = market[pair].window(decision)
+            row = server.score_market(pair, c4, cd, cw, 0)
+            if row is None:
+                continue
+            if abs(row["price"] - bars[pair]["c"]) > max(1e-6, abs(bars[pair]["c"]) * 1e-8):
+                mismatches += 1
+            rows.append(row)
+        best_l, best_s = pick_best(rows, threshold)
+        frames.append({
+            "decision": decision,
+            "bars": bars,
+            "best_l": _signal(best_l),
+            "best_s": _signal(best_s),
+        })
+        if n and n % 2000 == 0:
+            print("  scored %d/%d  %.0fs" % (n, len(clock), time.time() - started), flush=True)
+    hit = sum(1 for f in frames if f["best_l"] or f["best_s"])
+    print("scored %d minutes, signals %d, price mismatches %d, %.0fs" % (
+        len(frames), hit, mismatches, time.time() - started), flush=True)
+    return frames, mismatches
+
+
+def simulate(frames, variants, market):
+    prev_close = {p: None for p in server.PAIRS}
+    started = time.time()
+    for n, frame in enumerate(frames):
+        bars = frame["bars"]
+        decision = frame["decision"]
+        picked = (frame["best_l"], frame["best_s"])
+        for variant in variants:
+            pos = variant.state["openPosition"]
+            if pos and pos["pair"] in bars:
+                variant.on_bar(pos["pair"], bars[pos["pair"]], prev_close[pos["pair"]], decision)
+            variant.note_equity(decision, sample=False)
+            variant.maybe_open(None, decision, picked=picked)
+        for pair, bar in bars.items():
+            prev_close[pair] = bar["c"]
+        if n and n % 5000 == 0:
+            print("    sim %d/%d  %.0fs" % (n, len(frames), time.time() - started), flush=True)
+    if frames:
+        last = frames[-1]
+        for variant in variants:
+            pos = variant.state["openPosition"]
+            if not pos:
+                continue
+            bar = last["bars"].get(pos["pair"])
+            if bar is None:
+                bar = market[pos["pair"]].minute(last["decision"] - MIN_MS)
+            if bar is None:
+                continue
+            variant.bind()
+            pnl = server.position_pnl(pos, bar["c"])
+            pos["price"] = bar["c"]
+            if pnl is not None:
+                pos["unrealized"] = round(pnl, 2)
+            variant.note_equity(last["decision"], sample=False)
+    return [summarize(v, frames[-1]["decision"] if frames else 0) for v in variants]
+
+
+def grid_specs():
+    specs = [("fixed", False, 1.0, 0.5)]
+    for act in ACTIVATIONS:
+        for dist in DISTANCES:
+            specs.append(("a%s_d%s" % (act, dist), True, act, dist))
+    return specs
+
+
+def fresh_variants():
+    return [Variant(name, 100, trailing, act, dist) for name, trailing, act, dist in grid_specs()]
+
+
+def _cell_key(row):
+    if not row["trailing"]:
+        return ("fixed", None)
+    return (row["activation"], row["distance"])
+
+
+def _neighbours(act, dist):
+    ai = ACTIVATIONS.index(act)
+    di = DISTANCES.index(dist)
+    found = []
+    for da, dd in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        ia, id_ = ai + da, di + dd
+        if 0 <= ia < len(ACTIVATIONS) and 0 <= id_ < len(DISTANCES):
+            found.append((ACTIVATIONS[ia], DISTANCES[id_]))
+    return found
+
+
+def print_matrix(title, rows, field):
+    by = {_cell_key(r): r for r in rows}
+    print()
+    print(title)
+    header = "dist\\act".ljust(10) + "".join("%8s" % a for a in ACTIVATIONS)
+    print(header)
+    for dist in DISTANCES:
+        line = ("%s" % dist).ljust(10)
+        for act in ACTIVATIONS:
+            row = by.get((act, dist))
+            line += "%8s" % ("" if row is None else row[field])
+        print(line)
+    fixed = by.get(("fixed", None))
+    if fixed:
+        print("fixed %s" % fixed[field])
+
+
+def run_grid():
+    _self_check_exits()
+    end_ms = closed_now_ms()
+    oos_start = int(OOS_START.timestamp() * 1000)
+    is_start = int(START_LOCAL.timestamp() * 1000)
+    print("grid %s → %s Madrid, split %s" % (madrid(oos_start), madrid(end_ms), madrid(is_start)), flush=True)
+    print("source Blofin. fees none. threshold 100. balance %s risk %s" % (INITIAL_BALANCE, RISK_PCT), flush=True)
+    market = load_market(oos_start, end_ms - MIN_MS)
+    clock = make_clock(market, oos_start, end_ms)
+    if not clock:
+        raise SystemExit("no minutes in the grid window")
+    actual_start = clock[0] + MIN_MS
+    actual_end = clock[-1] + MIN_MS
+    print("clock %s → %s (%d minutes)" % (madrid(actual_start), madrid(actual_end), len(clock)), flush=True)
+    frames, mismatches = precompute(market, clock, 100)
+    windows = {
+        "oos": [f for f in frames if f["decision"] <= is_start],
+        "in_sample": [f for f in frames if f["decision"] > is_start],
+        "combined": frames,
+    }
+    report = {
+        "source": "Blofin openapi.blofin.com candles (add-on primary; Binance not used)",
+        "fees": "none (the add-on applies none)",
+        "threshold": 100,
+        "balance": INITIAL_BALANCE,
+        "risk_pct": RISK_PCT,
+        "leverage_stored": LEVERAGE,
+        "leverage_affects_size": False,
+        "activations": list(ACTIVATIONS),
+        "distances": list(DISTANCES),
+        "price_mismatches": mismatches,
+        "windows": {},
+    }
+    keyed = {}
+    for name, subset in windows.items():
+        print("simulate %s (%d minutes, %d settings)" % (name, len(subset), len(grid_specs())), flush=True)
+        rows = simulate(subset, fresh_variants(), market)
+        for row in rows:
+            row["pnls"] = [t["pnl"] for t in row["trade_list"]]
+            # The full path is large and not needed for the grid table.
+            row["trade_list"] = [
+                {"pair": t["pair"], "side": t["side"], "pnl": t["pnl"], "reason": t["reason"]}
+                for t in row["trade_list"]
+            ]
+            del row["equity_samples"]
+        report["windows"][name] = {
+            "start": madrid(subset[0]["decision"]) if subset else None,
+            "end": madrid(subset[-1]["decision"]) if subset else None,
+            "minutes": len(subset),
+            "results": rows,
+        }
+        keyed[name] = {_cell_key(r): r for r in rows}
+        print_matrix("%s realized PnL" % name, rows, "pnl")
+        print_matrix("%s end equity" % name, rows, "equity")
+        print_matrix("%s max drawdown" % name, rows, "max_dd")
+    # Neighbourhood: orthogonal cells on both the earlier window and this one.
+    ranked = []
+    for act in ACTIVATIONS:
+        for dist in DISTANCES:
+            ins = keyed["in_sample"].get((act, dist))
+            oos = keyed["oos"].get((act, dist))
+            both = keyed["combined"].get((act, dist))
+            if not ins or not oos or not both:
+                continue
+            neigh = _neighbours(act, dist)
+            def mean_field(window, field):
+                vals = []
+                for na, nd in neigh:
+                    cell = keyed[window].get((na, nd))
+                    if cell:
+                        vals.append(cell[field])
+                return sum(vals) / len(vals) if vals else None
+            ranked.append({
+                "activation": act,
+                "distance": dist,
+                "in_pnl": ins["pnl"],
+                "oos_pnl": oos["pnl"],
+                "all_pnl": both["pnl"],
+                "in_equity": ins["equity"],
+                "oos_equity": oos["equity"],
+                "all_equity": both["equity"],
+                "in_dd": ins["max_dd"],
+                "oos_dd": oos["max_dd"],
+                "all_dd": both["max_dd"],
+                "in_trades": ins["trades"],
+                "oos_trades": oos["trades"],
+                "all_trades": both["trades"],
+                "neigh_in_pnl": round(mean_field("in_sample", "pnl"), 2),
+                "neigh_oos_pnl": round(mean_field("oos", "pnl"), 2),
+                "worst": min(ins["pnl"], oos["pnl"]),
+            })
+    ranked.sort(key=lambda r: (r["worst"], r["neigh_in_pnl"] + r["neigh_oos_pnl"]), reverse=True)
+    fixed_is = keyed["in_sample"][("fixed", None)]
+    fixed_oos = keyed["oos"][("fixed", None)]
+    fixed_all = keyed["combined"][("fixed", None)]
+    print()
+    print("BASELINE fixed  IS pnl %s eq %s dd %s trades %s | OOS pnl %s eq %s dd %s trades %s | ALL pnl %s eq %s" % (
+        fixed_is["pnl"], fixed_is["equity"], fixed_is["max_dd"], fixed_is["trades"],
+        fixed_oos["pnl"], fixed_oos["equity"], fixed_oos["max_dd"], fixed_oos["trades"],
+        fixed_all["pnl"], fixed_all["equity"],
+    ))
+    print("TOP by worse-window realized PnL (neighbour mean beside it)")
+    for row in ranked[:15]:
+        print("  act %s dist %s  worst %s  IS %s (nbr %s)  OOS %s (nbr %s)  ALL %s  trades %s/%s/%s  dd %s/%s" % (
+            row["activation"], row["distance"], row["worst"],
+            row["in_pnl"], row["neigh_in_pnl"], row["oos_pnl"], row["neigh_oos_pnl"],
+            row["all_pnl"], row["in_trades"], row["oos_trades"], row["all_trades"],
+            row["in_dd"], row["oos_dd"],
+        ))
+    report["ranked"] = ranked
+    report["baseline"] = {
+        "in_sample": {k: fixed_is[k] for k in ("trades", "win_rate", "pnl", "equity", "max_dd", "reasons", "pnls")},
+        "oos": {k: fixed_oos[k] for k in ("trades", "win_rate", "pnl", "equity", "max_dd", "reasons", "pnls")},
+        "combined": {k: fixed_all[k] for k in ("trades", "win_rate", "pnl", "equity", "max_dd", "reasons", "pnls")},
+    }
+    out = Path("/tmp/granmago-grid.json")
+    out.write_text(json.dumps(report), encoding="utf-8")
+    print("wrote %s" % out, flush=True)
+
+
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser(description="Replay GranMago or grid-search the trailing stop.")
+    parser.add_argument("--grid", action="store_true", help="Grid activation x distance on two windows plus the combined period.")
+    args = parser.parse_args()
+    if args.grid:
+        run_grid()
+    else:
+        run()
