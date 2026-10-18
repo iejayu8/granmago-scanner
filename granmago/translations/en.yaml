@@ -26,3 +26,6 @@ configuration:
   entry_threshold:
     name: Entry threshold
     description: Minimum score required to open a trade. 100 requires a perfect score.
+  max_positions:
+    name: Max positions
+    description: How many trades can be open at once, each on a different coin. From 1 to 12.

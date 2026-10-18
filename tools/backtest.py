@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """Backtest the GranMago paper loop over a fixed window.
 
-Reuses scoring, sizing, SL/TP and trailing from granmago/server.py.
-Does not change add-on behaviour. The add-on charges no fees, so this
-charges none. Candles come from Blofin, the source the add-on requests
-before Binance.
+Reuses scoring, sizing, the notional cap, SL/TP and trailing from
+granmago/server.py. Does not change add-on behaviour. The add-on charges
+no fees, so this charges none. Candles come from Blofin, the source the
+add-on requests before Binance.
 
 The scan is evaluated on each closed 1-minute bar (the live loop scans
-about every 90s and checks an open trade about every 20s). Scoring uses
+about every 90s and checks open trades about every 20s). Scoring uses
 only candles that had closed, plus a synthetic in-progress 4H/1D/1W bar
 built from prices up to that minute, which is what the exchange returns
 for the forming candle. No future close is used.
+
+The default run compares max_positions 1, 3 and 5 from 20 Sep 2026
+(Europe/Madrid) through the last closed minute, with the live entry
+settings: threshold 100, trailing activation 1% and distance 0.25, risk 2%.
 """
 
 import json
@@ -43,10 +47,14 @@ WEEK_MS = 7 * DAY_MS
 # 1970-01-05 was the first Monday. Blofin weeks open Monday 00:00 UTC.
 MONDAY_SHIFT_MS = 4 * DAY_MS
 
-START_LOCAL = datetime(2026, 10, 4, 0, 0, tzinfo=MADRID)
+START_LOCAL = datetime(2026, 9, 20, 0, 0, tzinfo=MADRID)
 INITIAL_BALANCE = 1000.0
 RISK_PCT = 2.0
 LEVERAGE = 5
+THRESHOLD = 100
+ACTIVATION_PCT = 1.0
+TRAIL_DISTANCE = 0.25
+MAX_POSITIONS = (1, 3, 5)
 CACHE_DIR = Path(os.environ.get("BACKTEST_CACHE", "/tmp/granmago-bt-cache"))
 BLOFIN = "https://openapi.blofin.com/api/v1/market/candles"
 
@@ -310,9 +318,16 @@ def activation_price(pos):
     return math.nextafter(entry * (1.0 - move), 0.0)
 
 
-def mark(price):
-    """One live monitor tick at `price`. Returns the exit reason, or None."""
-    pos = server.STATE["openPosition"]
+def _bt_position(pair):
+    for pos in server.STATE.get("openPositions") or []:
+        if isinstance(pos, dict) and pos.get("pair") == pair:
+            return pos
+    return None
+
+
+def mark(pair, price):
+    """One live monitor tick for `pair` at `price`. Returns the exit reason, or None."""
+    pos = _bt_position(pair)
     if not pos:
         return None
     server.ensure_position_fields(pos)
@@ -325,40 +340,41 @@ def mark(price):
     if pos.get("trailingActive"):
         server.tighten_stop(pos)
         if server._stop_hit(side, price, pos.get("sl")):
-            server.close_position("trailing", price)
+            server.close_position("trailing", price, pair)
             return "trailing"
     else:
         if server._stop_hit(side, price, pos.get("sl")):
-            server.close_position("SL", price)
+            server.close_position("SL", price, pair)
             return "SL"
         if server._target_hit(side, price, pos.get("tp")):
-            server.close_position("TP", price)
+            server.close_position("TP", price, pair)
             return "TP"
         if server.trailing_should_activate(pos, price):
             server.activate_trailing(pos)
             if server._stop_hit(side, price, pos.get("sl")):
-                server.close_position("trailing", price)
+                server.close_position("trailing", price, pair)
                 return "trailing"
     return None
 
 
-def drive(p0, p1, gap, on_close):
-    """Move from an already-processed price p0 to p1.
+def drive(pair, p0, p1, gap, on_close):
+    """Move one pair from an already-processed price p0 to p1.
 
     A gap fill uses p1 itself (the next print). Inside a 1-minute bar the
     high and low did trade, so a stop or target between the two prices fills
     at that level. Levels are visited in price order, so a 1% activation is
     applied before the further fixed target and the target is then dropped.
+    Other open pairs are not touched.
     """
-    pos = server.STATE["openPosition"]
+    pos = _bt_position(pair)
     if not pos:
         return
     if gap or p0 == p1:
-        reason = mark(p1)
+        reason = mark(pair, p1)
         if reason:
             on_close(reason, p1)
         return
-    pos = server.STATE["openPosition"]
+    pos = _bt_position(pair)
     levels = []
     sl = server._as_price(pos.get("sl"))
     tp = server._as_price(pos.get("tp"))
@@ -376,9 +392,9 @@ def drive(p0, p1, gap, on_close):
             mids.append(level)
     mids.sort(reverse=p1 < p0)
     for px in mids + [p1]:
-        if server.STATE["openPosition"] is None:
+        if _bt_position(pair) is None:
             return
-        reason = mark(px)
+        reason = mark(pair, px)
         if reason:
             on_close(reason, px)
             return
@@ -391,12 +407,12 @@ def path_of(bar):
     return [o, h, l, c]
 
 
-def new_state(threshold, trailing):
+def new_state(threshold, trailing, max_positions=1, activation=1.0, distance=0.5):
     return {
         "running": True,
         "balance": INITIAL_BALANCE,
         "initialBalance": INITIAL_BALANCE,
-        "openPosition": None,
+        "openPositions": [],
         "history": [],
         "log": [],
         "lastScan": [],
@@ -410,36 +426,42 @@ def new_state(threshold, trailing):
             "leverage": LEVERAGE,
             "scanSeconds": 90,
             "trailingEnabled": trailing,
-            "trailingActivationPct": 1.0,
-            "trailingDistance": 0.5,
+            "trailingActivationPct": activation,
+            "trailingDistance": distance,
             "entryThreshold": threshold,
+            "maxPositions": max_positions,
         },
     }
 
 
 class Variant:
-    def __init__(self, name, threshold, trailing):
+    def __init__(self, name, threshold, trailing, max_positions=1, activation=1.0, distance=0.5):
         self.name = name
         self.threshold = threshold
         self.trailing = trailing
-        self.state = new_state(threshold, trailing)
+        self.max_positions = max_positions
+        self.state = new_state(threshold, trailing, max_positions, activation, distance)
         self.trades = []
         self.rejected = 0
+        self.capped_entries = 0
+        self.peak_positions = 0
         self.peak = INITIAL_BALANCE
         self.max_dd = 0.0
         self.max_dd_pct = 0.0
         self.equity_samples = []
-        self._open_meta = None
+        self._open_meta = {}
         self._last_sample_bucket = None
 
     def bind(self):
         server.STATE = self.state
 
     def note_equity(self, decision_ms, sample):
-        pos = self.state["openPosition"]
+        positions = self.state.get("openPositions") or []
+        if len(positions) > self.peak_positions:
+            self.peak_positions = len(positions)
         unreal = 0.0
-        if pos is not None:
-            unreal = float(pos.get("unrealized") or 0.0)
+        for pos in positions:
+            unreal += float(pos.get("unrealized") or 0.0)
         eq = round(self.state["balance"] + unreal, 2)
         if eq > self.peak:
             self.peak = eq
@@ -455,13 +477,12 @@ class Variant:
 
     def on_bar(self, pair, bar, prev_close, decision_ms):
         self.bind()
-        pos = self.state["openPosition"]
-        if not pos or pos["pair"] != pair:
+        if _bt_position(pair) is None:
             return
         closed = {}
 
         def on_close(reason, price):
-            meta = self._open_meta or {}
+            meta = self._open_meta.pop(pair, {})
             hist = self.state["history"][0]
             closed["row"] = {
                 "pair": hist["pair"],
@@ -473,29 +494,28 @@ class Variant:
                 "reason": reason,
                 "pnl": hist["pnl"],
                 "score": meta.get("score"),
+                "capped": bool(meta.get("capped")),
             }
 
         if prev_close is None:
-            reason = mark(bar["o"])
+            reason = mark(pair, bar["o"])
             if reason:
                 on_close(reason, bar["o"])
         else:
-            drive(prev_close, bar["o"], gap=True, on_close=on_close)
-        if self.state["openPosition"] is not None:
+            drive(pair, prev_close, bar["o"], gap=True, on_close=on_close)
+        if _bt_position(pair) is not None:
             points = path_of(bar)
             for left, right in zip(points, points[1:]):
-                if self.state["openPosition"] is None:
+                if _bt_position(pair) is None:
                     break
-                drive(left, right, gap=False, on_close=on_close)
+                drive(pair, left, right, gap=False, on_close=on_close)
         if closed:
             self.trades.append(closed["row"])
-            self._open_meta = None
         self.note_equity(decision_ms, sample=False)
 
     def maybe_open(self, rows, decision_ms):
         self.bind()
-        if self.state["openPosition"] is not None:
-            return
+        before = {p["pair"] for p in self.state["openPositions"]}
         tagged = []
         for row in rows:
             copy = dict(row)
@@ -505,20 +525,26 @@ class Variant:
         tagged.sort(key=lambda r: max(r["scoreLong"], r["scoreShort"]), reverse=True)
         best_l = sorted((r for r in tagged if r["validLong"]), key=lambda r: r["scoreLong"], reverse=True)
         best_s = sorted((r for r in tagged if r["validShort"]), key=lambda r: r["scoreShort"], reverse=True)
+        self.state["lastScan"] = tagged
         self.state["bestLong"] = best_l[0] if best_l else None
         self.state["bestShort"] = best_s[0] if best_s else None
         server.maybe_open()
-        pos = self.state["openPosition"]
-        if pos is None:
-            if self.state["bestLong"] or self.state["bestShort"]:
-                self.rejected += 1
-            return
-        side = pos["side"]
-        chosen = self.state["bestLong"] if side == "long" else self.state["bestShort"]
-        self._open_meta = {
-            "entry_ms": decision_ms,
-            "score": chosen["scoreLong"] if side == "long" else chosen["scoreShort"],
-        }
+        opened = [p for p in self.state["openPositions"] if p["pair"] not in before]
+        if not opened and (best_l or best_s) and len(before) < self.max_positions:
+            self.rejected += 1
+        for pos in opened:
+            side = pos["side"]
+            chosen = next((r for r in tagged if r["pair"] == pos["pair"]), None)
+            score = None
+            if chosen is not None:
+                score = chosen["scoreLong"] if side == "long" else chosen["scoreShort"]
+            self._open_meta[pos["pair"]] = {
+                "entry_ms": decision_ms,
+                "score": score,
+                "capped": bool(pos.get("notionalCapped")),
+            }
+            if pos.get("notionalCapped"):
+                self.capped_entries += 1
         self.note_equity(decision_ms, sample=False)
 
 
@@ -534,8 +560,10 @@ def summarize(variant, end_ms):
     for t in trades:
         if t["entry_ms"] is not None and t["exit_ms"] is not None:
             holds.append((t["exit_ms"] - t["entry_ms"]) / 3_600_000)
-    pos = variant.state["openPosition"]
-    unreal = float(pos["unrealized"]) if pos else 0.0
+    positions = variant.state.get("openPositions") or []
+    unreal = 0.0
+    for pos in positions:
+        unreal += float(pos.get("unrealized") or 0.0)
     balance = variant.state["balance"]
     equity = round(balance + unreal, 2)
     variant.note_equity(end_ms, sample=True)
@@ -543,6 +571,9 @@ def summarize(variant, end_ms):
         variant.equity_samples.append((end_ms, equity))
     return {
         "name": variant.name,
+        "max_positions": variant.max_positions,
+        "peak_positions": variant.peak_positions,
+        "capped_entries": variant.capped_entries,
         "trades": len(trades),
         "wins": len(wins),
         "losses": len(losses),
@@ -552,18 +583,22 @@ def summarize(variant, end_ms):
         "pnl_pct": round((balance - INITIAL_BALANCE) / INITIAL_BALANCE * 100, 2),
         "balance": balance,
         "equity": equity,
-        "open": None if not pos else {
-            "pair": pos["pair"],
-            "side": pos["side"],
-            "entry": pos["entry"],
-            "price": pos.get("price"),
-            "unrealized": round(unreal, 2),
-            "reason": "abierta",
-            "entry_ms": (variant._open_meta or {}).get("entry_ms"),
-            "sl": pos.get("sl"),
-            "tp": pos.get("tp"),
-            "trailing": bool(pos.get("trailingActive")),
-        },
+        "open": [
+            {
+                "pair": pos["pair"],
+                "side": pos["side"],
+                "entry": pos["entry"],
+                "price": pos.get("price"),
+                "unrealized": round(float(pos.get("unrealized") or 0.0), 2),
+                "reason": "abierta",
+                "entry_ms": (variant._open_meta.get(pos["pair"]) or {}).get("entry_ms"),
+                "sl": pos.get("sl"),
+                "tp": pos.get("tp"),
+                "trailing": bool(pos.get("trailingActive")),
+                "capped": bool(pos.get("notionalCapped")),
+            }
+            for pos in positions
+        ],
         "max_dd": round(variant.max_dd, 2),
         "max_dd_pct": round(variant.max_dd_pct * 100, 2),
         "avg_win": round(sum(t["pnl"] for t in wins) / len(wins), 2) if wins else None,
@@ -594,18 +629,18 @@ def _self_check_exits():
         "scoreLong": 100,
         "scoreShort": 0,
     }, "long")
-    pos = book["openPosition"]
+    pos = book["openPositions"][0] if book["openPositions"] else None
     if pos is None or pos["tp"] is None:
         raise SystemExit("self-check: entry did not set a target")
     tp = pos["tp"]
     # 1% move activates; the fixed target is further away and must not fill.
-    drive(100.0, tp + 1, gap=False, on_close=lambda *a: None)
-    if book["openPosition"] is None:
+    drive("TEST-USDT", 100.0, tp + 1, gap=False, on_close=lambda *a: None)
+    if not book["openPositions"]:
         raise SystemExit("self-check: trailing variant closed at the fixed target")
-    if not book["openPosition"].get("trailingActive") or book["openPosition"].get("tp") is not None:
+    if not book["openPositions"][0].get("trailingActive") or book["openPositions"][0].get("tp") is not None:
         raise SystemExit("self-check: trailing did not take over")
-    sl = book["openPosition"]["sl"]
-    drive(tp + 1, sl - 1, gap=False, on_close=lambda *a: None)
+    sl = book["openPositions"][0]["sl"]
+    drive("TEST-USDT", tp + 1, sl - 1, gap=False, on_close=lambda *a: None)
     if not book["history"] or book["history"][0]["reason"] != "trailing":
         raise SystemExit("self-check: expected a trailing exit")
     if book["history"][0]["exit"] != sl:
@@ -621,8 +656,8 @@ def _self_check_exits():
         "scoreLong": 100,
         "scoreShort": 0,
     }, "long")
-    tp = book["openPosition"]["tp"]
-    drive(100.0, tp + 1, gap=False, on_close=lambda *a: None)
+    tp = book["openPositions"][0]["tp"]
+    drive("TEST-USDT", 100.0, tp + 1, gap=False, on_close=lambda *a: None)
     if not book["history"] or book["history"][0]["reason"] != "TP":
         raise SystemExit("self-check: fixed target did not fill")
     if book["history"][0]["exit"] != tp:
@@ -705,9 +740,15 @@ def run():
     print("minutes %d" % len(clock), flush=True)
 
     variants = [
-        Variant("A threshold 100 + trailing", 100, True),
-        Variant("B threshold 100 fixed SL/TP", 100, False),
-        Variant("C threshold 75 fixed SL/TP", 75, False),
+        Variant(
+            "max_positions %d" % slots,
+            THRESHOLD,
+            True,
+            max_positions=slots,
+            activation=ACTIVATION_PCT,
+            distance=TRAIL_DISTANCE,
+        )
+        for slots in MAX_POSITIONS
     ]
     scans = 0
     scans_100 = 0
@@ -723,9 +764,10 @@ def run():
             if bar is not None:
                 bars[pair] = bar
         for variant in variants:
-            pos = variant.state["openPosition"]
-            if pos and pos["pair"] in bars:
-                variant.on_bar(pos["pair"], bars[pos["pair"]], prev_close[pos["pair"]], decision)
+            for pos in list(variant.state["openPositions"]):
+                pair = pos.get("pair")
+                if pair in bars:
+                    variant.on_bar(pair, bars[pair], prev_close[pair], decision)
             variant.note_equity(decision, sample=True)
         rows = []
         for pair in server.PAIRS:
@@ -762,17 +804,15 @@ def run():
         last_open_ts = clock[-1]
         last_decision = last_open_ts + MIN_MS
         for variant in variants:
-            pos = variant.state["openPosition"]
-            if not pos:
-                continue
-            bar = market[pos["pair"]].minute(last_open_ts)
-            if bar is None:
-                continue
             variant.bind()
-            pnl = server.position_pnl(pos, bar["c"])
-            pos["price"] = bar["c"]
-            if pnl is not None:
-                pos["unrealized"] = round(pnl, 2)
+            for pos in variant.state["openPositions"]:
+                bar = market[pos["pair"]].minute(last_open_ts)
+                if bar is None:
+                    continue
+                pnl = server.position_pnl(pos, bar["c"])
+                pos["price"] = bar["c"]
+                if pnl is not None:
+                    pos["unrealized"] = round(pnl, 2)
             variant.note_equity(last_decision, sample=True)
 
     results = [summarize(v, clock[-1] + MIN_MS if clock else end_ms) for v in variants]
@@ -788,11 +828,15 @@ def run():
         "score_price_mismatches": price_mismatches,
         "balance": INITIAL_BALANCE,
         "risk_pct": RISK_PCT,
-        "leverage_stored": LEVERAGE,
-        "leverage_affects_size": False,
+        "leverage": LEVERAGE,
+        "entry_threshold": THRESHOLD,
+        "trailing_activation_pct": ACTIVATION_PCT,
+        "trailing_distance": TRAIL_DISTANCE,
+        "max_positions": list(MAX_POSITIONS),
+        "notional_cap": "new entries shrink so total notional stays within balance x leverage; leverage does not multiply size",
         "results": results,
     }
-    out = Path("/tmp/granmago-backtest-report.json")
+    out = Path("/tmp/granmago-multipos-report.json")
     out.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print_report(report)
     print("wrote %s" % out, flush=True)
@@ -821,20 +865,20 @@ def print_report(report):
         ))
         print("pnl %s USDT (%s%%)  balance %s  equity %s" % (
             row["pnl"], row["pnl_pct"], row["balance"], row["equity"]))
-        print("max_dd %s USDT (%s%%)  avg_win %s  avg_loss %s  avg_hold_h %s" % (
-            row["max_dd"], row["max_dd_pct"], row["avg_win"], row["avg_loss"], row["avg_hold_h"]))
-        print("exits %s  wide_sl_rejected %d" % (row["reasons"], row["rejected_wide_sl"]))
-        if row["open"]:
-            op = row["open"]
+        print("max_dd %s USDT (%s%%)  peak_positions %s  capped_entries %s" % (
+            row["max_dd"], row["max_dd_pct"], row["peak_positions"], row["capped_entries"]))
+        print("avg_win %s  avg_loss %s  avg_hold_h %s" % (
+            row["avg_win"], row["avg_loss"], row["avg_hold_h"]))
+        print("exits %s  wide_sl_or_unfilled %d" % (row["reasons"], row["rejected_wide_sl"]))
+        for op in row["open"]:
             print("OPEN %s %s entry %s @ %s mark %s uPnL %s trailing %s" % (
                 op["side"], op["pair"], madrid(op["entry_ms"]), op["entry"], op["price"], op["unrealized"], op["trailing"]))
-        if row["name"].startswith("A "):
-            print("trades:")
-            for t in row["trade_list"]:
-                print("  %s %s %s  entry %s  exit %s  %s  pnl %s  (%s → %s)" % (
-                    t["pair"], t["side"], t["score"], t["entry"], t["exit"], t["reason"], t["pnl"],
-                    madrid(t["entry_ms"]), madrid(t["exit_ms"]),
-                ))
+        print("trades:")
+        for t in row["trade_list"]:
+            print("  %s %s %s  entry %s  exit %s  %s  pnl %s  (%s → %s)" % (
+                t["pair"], t["side"], t["score"], t["entry"], t["exit"], t["reason"], t["pnl"],
+                madrid(t["entry_ms"]), madrid(t["exit_ms"]),
+            ))
 
 
 if __name__ == "__main__":
