@@ -11,5 +11,6 @@ export TRAILING_ENABLED="$(bashio::config 'trailing_enabled')"
 export TRAILING_ACTIVATION_PCT="$(bashio::config 'trailing_activation_pct')"
 export TRAILING_DISTANCE="$(bashio::config 'trailing_distance')"
 export ENTRY_THRESHOLD="$(bashio::config 'entry_threshold')"
+export MAX_POSITIONS="$(bashio::config 'max_positions')"
 
 exec python -u /app/server.py

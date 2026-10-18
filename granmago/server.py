@@ -2,12 +2,13 @@
 """GranMago Scanner — paper trading loop for the Home Assistant add-on.
 
 The loop lives in this process. Closing the browser does not stop it.
-A full scan keeps running on the scan interval even while a position is
-open. The bot still holds one position at a time.
+A full scan keeps running on the scan interval. Several positions can be
+open at once, each on a different coin, up to max_positions.
 """
 
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -22,7 +23,7 @@ PAIRS = [
     "DOGE-USDT", "AVAX-USDT", "LINK-USDT", "DOT-USDT", "LTC-USDT", "BCH-USDT",
 ]
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 STATE_FILE = DATA_DIR / "state.json"
 PORT = int(os.environ.get("PORT", "8787"))
@@ -128,6 +129,10 @@ def _apply_runtime_options(settings):
         settings["entryThreshold"] = _sane_threshold(os.environ.get("ENTRY_THRESHOLD"))
     else:
         settings["entryThreshold"] = _sane_threshold(settings.get("entryThreshold", 100))
+    if _env_set("MAX_POSITIONS"):
+        settings["maxPositions"] = _sane_max_positions(os.environ.get("MAX_POSITIONS"))
+    else:
+        settings["maxPositions"] = _sane_max_positions(settings.get("maxPositions", 5))
 
 
 def _settings():
@@ -162,6 +167,23 @@ def _sane_threshold(value, fallback=100):
 
 def entry_threshold():
     return _sane_threshold(_settings().get("entryThreshold", 100), 100)
+
+
+def _sane_max_positions(value, fallback=5):
+    """Integer slot count from 1 to 12. Invalid values use the fallback."""
+    try:
+        num = int(float(value))
+    except (TypeError, ValueError):
+        return int(fallback)
+    if num < 1:
+        return 1
+    if num > 12:
+        return 12
+    return num
+
+
+def max_positions():
+    return _sane_max_positions(_settings().get("maxPositions", 5), 5)
 
 
 def _as_price(value):
@@ -337,7 +359,7 @@ def default_state():
         "running": False,
         "balance": balance,
         "initialBalance": balance,
-        "openPosition": None,
+        "openPositions": [],
         "history": [],
         "lastScan": [],
         "bestLong": None,
@@ -354,10 +376,107 @@ def default_state():
             "trailingActivationPct": 1.0,
             "trailingDistance": 0.5,
             "entryThreshold": 100,
+            "maxPositions": 5,
         },
     }
     _apply_runtime_options(state["settings"])
     return state
+
+
+def _positions():
+    positions = STATE.get("openPositions")
+    if not isinstance(positions, list):
+        positions = []
+        STATE["openPositions"] = positions
+    return positions
+
+
+def _find_position(pair):
+    for pos in _positions():
+        if isinstance(pos, dict) and pos.get("pair") == pair:
+            return pos
+    return None
+
+
+def _migrate_positions(state, raw):
+    """Move a saved single openPosition into the list. Does not close it.
+
+    Entry, stop, target, size and the rest of the book stay as they were.
+    Missing trailing fields are filled the same way as in 1.1.0.
+    """
+    positions = state.get("openPositions")
+    if not isinstance(positions, list):
+        positions = []
+    legacy = raw.get("openPosition") if isinstance(raw, dict) else None
+    if not positions and isinstance(legacy, dict) and legacy.get("pair"):
+        positions = [legacy]
+    cleaned = []
+    seen = set()
+    for pos in positions:
+        if not isinstance(pos, dict) or not pos.get("pair"):
+            continue
+        if pos["pair"] in seen:
+            continue
+        seen.add(pos["pair"])
+        ensure_position_fields(pos)
+        cleaned.append(pos)
+    state["openPositions"] = cleaned
+    state.pop("openPosition", None)
+
+
+def _score_num(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _qualifying_side(row, threshold):
+    """At most one side of a pair. The higher score wins; a tie stays long.
+
+    A missing bias is allowed so a row already chosen as a setup still
+    qualifies. A real scan always carries the weekly bias, and a score of
+    100 already includes that bias.
+    """
+    bias = row.get("bias") if isinstance(row, dict) else None
+    long_score = _score_num(row.get("scoreLong") if isinstance(row, dict) else None)
+    short_score = _score_num(row.get("scoreShort") if isinstance(row, dict) else None)
+    long_ok = long_score >= threshold and bias in (None, "ALCISTA")
+    short_ok = short_score >= threshold and bias in (None, "BAJISTA")
+    if long_ok and short_ok:
+        if short_score > long_score:
+            return "short", short_score
+        return "long", long_score
+    if long_ok:
+        return "long", long_score
+    if short_ok:
+        return "short", short_score
+    return None, None
+
+
+def _leverage():
+    try:
+        lev = int(float(STATE["settings"].get("leverage", 1)))
+    except (TypeError, ValueError):
+        lev = 1
+    return max(1, lev)
+
+
+def _notional_room():
+    """Notional still allowed under balance × leverage.
+
+    Open positions keep the size they were given. Only a new entry is
+    reduced or skipped.
+    """
+    used = 0.0
+    for pos in _positions():
+        if not isinstance(pos, dict):
+            continue
+        try:
+            used += max(0.0, float(pos.get("notional") or 0))
+        except (TypeError, ValueError):
+            continue
+    return float(STATE["balance"]) * _leverage() - used
 
 
 def load_state():
@@ -370,8 +489,7 @@ def load_state():
                 if isinstance(data.get("settings"), dict):
                     base["settings"].update(data["settings"])
             _apply_runtime_options(base["settings"])
-            if isinstance(base.get("openPosition"), dict):
-                ensure_position_fields(base["openPosition"])
+            _migrate_positions(base, data if isinstance(data, dict) else {})
             base["busy"] = False
             return base
         except (OSError, json.JSONDecodeError) as exc:
@@ -610,6 +728,17 @@ def scan_all():
 
 
 def open_from_result(res, side):
+    """Append one paper trade. False when the pair is taken or the size is refused.
+
+    risk_pct is applied to the current realized balance, same as a single
+    trade. If this notional would push the book past balance × leverage,
+    the new trade is shrunk to the room that is left, or skipped at zero.
+    """
+    pair = res.get("pair")
+    if not pair or _find_position(pair):
+        if pair:
+            add_log("Ya hay posición en %s, no se duplica." % pair)
+        return False
     entry = res["price"]
     if side == "long":
         sl_dist = entry - res["recentLow"] * 0.996
@@ -618,22 +747,38 @@ def open_from_result(res, side):
     if sl_dist <= entry * 0.004:
         sl_dist = entry * 0.012
     if sl_dist > entry * 0.08:
-        add_log("SL demasiado amplio en %s" % res["pair"])
-        return
+        add_log("SL demasiado amplio en %s" % pair)
+        return False
     risk_pct = float(STATE["settings"]["riskPct"]) / 100
-    lev = int(STATE["settings"]["leverage"])
+    lev = _leverage()
     risk_amt = STATE["balance"] * risk_pct
-    notional = risk_amt / (sl_dist / entry)
+    notional = round(risk_amt / (sl_dist / entry), 2)
+    room = _notional_room()
+    capped = False
+    if room <= 0 or notional > room:
+        capped = True
+        notional = math.floor(max(0.0, room) * 100 + 1e-9) / 100.0
+        if notional <= 0:
+            add_log(
+                "Sin hueco de nocional para %s (tope balance × apalancamiento)." % pair
+            )
+            return False
+        risk_amt = notional * (sl_dist / entry)
+        add_log(
+            "Tamaño de %s limitado a %.2f USDT de nocional (tope balance × apalancamiento)."
+            % (pair, notional)
+        )
     sl = entry - sl_dist if side == "long" else entry + sl_dist
     tp = entry + sl_dist * 1.7 if side == "long" else entry - sl_dist * 1.7
     score = res["scoreLong"] if side == "long" else res["scoreShort"]
-    STATE["openPosition"] = {
-        "pair": res["pair"],
+    _positions().append({
+        "pair": pair,
         "side": side,
         "entry": entry,
         "sl": sl,
         "tp": tp,
-        "notional": round(notional, 2),
+        "notional": notional,
+        "notionalCapped": capped,
         "leverage": lev,
         "riskAmt": round(risk_amt, 2),
         "time": _now(),
@@ -643,14 +788,29 @@ def open_from_result(res, side):
         "initialTp": tp,
         "bestPrice": entry,
         "trailingActive": False,
-    }
-    add_log("ENTRADA AUTO %s %s @ %s (score %s)" % (side.upper(), res["pair"], _fmt(entry), score))
+    })
+    add_log(
+        "ENTRADA AUTO %s %s @ %s (score %s) [%d/%d]"
+        % (side.upper(), pair, _fmt(entry), score, len(_positions()), max_positions())
+    )
+    return True
 
 
-def close_position(reason, price):
-    pos = STATE["openPosition"]
-    if not pos:
-        return
+def close_position(reason, price, pair=None):
+    """Close one open pair. With a single position, the pair can be omitted."""
+    positions = _positions()
+    if pair is None:
+        if len(positions) != 1:
+            return None
+        pair = positions[0].get("pair")
+    idx = None
+    for i, item in enumerate(positions):
+        if isinstance(item, dict) and item.get("pair") == pair:
+            idx = i
+            break
+    if idx is None:
+        return None
+    pos = positions[idx]
     if pos["side"] == "long":
         pnl_pct = (price - pos["entry"]) / pos["entry"]
     else:
@@ -668,74 +828,105 @@ def close_position(reason, price):
     })
     del STATE["history"][200:]
     add_log("CERRADA %s %s → PnL %.2f USDT" % (pos["pair"], reason, pnl))
-    STATE["openPosition"] = None
+    del positions[idx]
+    return pos
+
+
+def _apply_mark(pos, price):
+    """SL, TP or trailing for one position. The caller holds LOCK."""
+    ensure_position_fields(pos)
+    pair = pos["pair"]
+    side = pos["side"]
+    pnl = position_pnl(pos, price)
+    pos["price"] = price
+    if pnl is not None:
+        pos["unrealized"] = round(pnl, 2)
+    update_best_price(pos, price)
+    if pos.get("trailingActive"):
+        moved = tighten_stop(pos)
+        if moved:
+            add_log("Trailing %s SL → %s (mejor %s)" % (pair, _fmt(pos["sl"]), _fmt(pos["bestPrice"])))
+        if _stop_hit(side, price, pos.get("sl")):
+            close_position("trailing", price, pair)
+    else:
+        # Fixed stop and target, unchanged, until the trail takes over.
+        if _stop_hit(side, price, pos.get("sl")):
+            close_position("SL", price, pair)
+        elif _target_hit(side, price, pos.get("tp")):
+            close_position("TP", price, pair)
+        elif trailing_should_activate(pos, price):
+            activate_trailing(pos)
+            add_log(
+                "Trailing activo en %s. SL %s (mejor %s)"
+                % (pair, _fmt(pos["sl"]), _fmt(pos["bestPrice"]))
+            )
+            if _stop_hit(side, price, pos.get("sl")):
+                close_position("trailing", price, pair)
+
+
+def _monitor_one(pair):
+    price = fetch_price(pair)
+    with LOCK:
+        pos = _find_position(pair)
+        if not pos:
+            return
+        if price is None:
+            add_log("Sin precio de %s, se reintenta" % pair)
+            return
+        _apply_mark(pos, price)
 
 
 def monitor_position():
     with LOCK:
-        pos = STATE["openPosition"]
-        if not pos:
-            return
-        ensure_position_fields(pos)
-        pair = pos["pair"]
-        side = pos["side"]
-    price = fetch_price(pair)
-    if price is None:
-        with LOCK:
-            add_log("Sin precio de %s, se reintenta" % pair)
-            STATE["lastTickAt"] = _now()
-            save_state()
+        pairs = [p.get("pair") for p in _positions() if isinstance(p, dict) and p.get("pair")]
+    if not pairs:
         return
+    for pair in pairs:
+        _monitor_one(pair)
     with LOCK:
-        pos = STATE["openPosition"]
-        if not pos or pos["pair"] != pair:
-            return
-        ensure_position_fields(pos)
-        pnl = position_pnl(pos, price)
-        pos["price"] = price
-        if pnl is not None:
-            pos["unrealized"] = round(pnl, 2)
-        update_best_price(pos, price)
-        if pos.get("trailingActive"):
-            moved = tighten_stop(pos)
-            if moved:
-                add_log("Trailing %s SL → %s (mejor %s)" % (pair, _fmt(pos["sl"]), _fmt(pos["bestPrice"])))
-            if _stop_hit(side, price, pos.get("sl")):
-                close_position("trailing", price)
-        else:
-            # Fixed stop and target, unchanged, until the trail takes over.
-            if _stop_hit(side, price, pos.get("sl")):
-                close_position("SL", price)
-            elif _target_hit(side, price, pos.get("tp")):
-                close_position("TP", price)
-            elif trailing_should_activate(pos, price):
-                activate_trailing(pos)
-                add_log(
-                    "Trailing activo en %s. SL %s (mejor %s)"
-                    % (pair, _fmt(pos["sl"]), _fmt(pos["bestPrice"]))
-                )
-                if _stop_hit(side, price, pos.get("sl")):
-                    close_position("trailing", price)
         STATE["lastTickAt"] = _now()
         save_state()
 
 
 def maybe_open():
-    """Open at most one position from the latest scan. No-op while one is open."""
+    """Fill free slots from the latest scan, best score first.
+
+    One position per coin, long or short, never both. A manual scan does
+    not call this. Nothing is opened while the bot is stopped.
+    """
     opened = False
     with LOCK:
-        if STATE["openPosition"] or not STATE["running"]:
+        if not STATE["running"]:
             return
-        best_l = STATE["bestLong"]
-        best_s = STATE["bestShort"]
+        limit = max_positions()
+        if len(_positions()) >= limit:
+            return
         threshold = entry_threshold()
-        if best_l and best_l["scoreLong"] >= threshold:
-            open_from_result(best_l, "long")
-        elif best_s and best_s["scoreShort"] >= threshold:
-            open_from_result(best_s, "short")
-        else:
+        rows = STATE.get("lastScan") or []
+        occupied = {p.get("pair") for p in _positions() if isinstance(p, dict)}
+        candidates = []
+        seen = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            pair = row.get("pair")
+            if not pair or pair in occupied or pair in seen:
+                continue
+            side, score = _qualifying_side(row, threshold)
+            if side is None:
+                continue
+            seen.add(pair)
+            candidates.append((score, row, side))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        if not candidates:
             add_log("Ningún setup alcanza el umbral de entrada (%d). Esperando..." % threshold)
-        opened = STATE["openPosition"] is not None
+            save_state()
+            return
+        for _score, row, side in candidates:
+            if len(_positions()) >= limit:
+                break
+            if open_from_result(row, side):
+                opened = True
         save_state()
     if opened:
         kick()
@@ -747,7 +938,8 @@ def next_actions(running, has_position):
     Scans stay on the scan interval whenever the bot is running, including
     while a position is open, so the ranking in the UI keeps updating.
     The 20s SL/TP check runs only when a position is open. Entering a new
-    trade is decided later by maybe_open(), which refuses a second position.
+    trade is decided later by maybe_open(), which fills free slots up to
+    max_positions and never repeats a coin.
     """
     running = bool(running)
     has_position = bool(has_position)
@@ -784,7 +976,7 @@ def scan_loop():
     while not STOP.is_set():
         with LOCK:
             running = STATE["running"]
-            has_pos = STATE["openPosition"] is not None
+            has_pos = bool(STATE.get("openPositions"))
             interval = max(30, int(STATE["settings"].get("scanSeconds") or 90))
         if not next_actions(running, has_pos)["scan"]:
             if not _wait(2):
@@ -792,8 +984,8 @@ def scan_loop():
             continue
         try:
             scan_all()
-            # maybe_open checks the position again under the lock, so a scan
-            # that finishes while a trade is still open cannot open another.
+            # maybe_open re-checks the book under the lock. A pair that
+            # already has a position is skipped, in either direction.
             maybe_open()
         except Exception as exc:
             log.exception("scan")
@@ -810,7 +1002,7 @@ def monitor_loop():
     while not STOP.is_set():
         with LOCK:
             running = STATE["running"]
-            has_pos = STATE["openPosition"] is not None
+            has_pos = bool(STATE.get("openPositions"))
         if not next_actions(running, has_pos)["monitor"]:
             if not _wait(1):
                 return
@@ -823,7 +1015,7 @@ def monitor_loop():
                 add_log("Fallo vigilando la posición, el bot sigue: %s" % exc)
                 save_state()
         with LOCK:
-            still_open = STATE["openPosition"] is not None
+            still_open = bool(STATE.get("openPositions"))
         if not _wait(MONITOR_SECONDS if still_open else 1):
             return
 
@@ -848,7 +1040,7 @@ def api_start():
     body = request.get_json(silent=True) or {}
     with LOCK:
         _apply_settings_locked(body)
-        if not STATE["history"] and not STATE["openPosition"] and body.get("initialBalance"):
+        if not STATE["history"] and not _positions() and body.get("initialBalance"):
             try:
                 bal = float(body["initialBalance"])
             except (TypeError, ValueError):
@@ -934,28 +1126,31 @@ def api_scan():
 
 @app.route("/api/close_position", methods=["POST"])
 def api_close_position():
-    """Close the open paper position at the current market price.
+    """Close one paper position at the current market price.
 
-    Same balance and history path as an SL/TP close. Reason is 'manual'.
+    Body: {"pair": "ETH-USDT"}. Same balance and history path as an SL/TP
+    close. Reason is 'manual'. Other open pairs stay open.
     """
     if not _closing.acquire(blocking=False):
         return jsonify({"ok": False, "error": "ocupado"}), 409
     try:
+        body = request.get_json(silent=True) or {}
+        pair = body.get("pair")
+        if not isinstance(pair, str) or not pair.strip():
+            return jsonify({"ok": False, "error": "falta_par"}), 400
+        pair = pair.strip()
         with LOCK:
-            pos = STATE["openPosition"]
-            if not pos:
+            if not _find_position(pair):
                 return jsonify({"ok": False, "error": "sin_posicion"}), 409
-            pair = pos["pair"]
         price = fetch_price(pair)
         with LOCK:
-            pos = STATE["openPosition"]
-            if not pos or pos.get("pair") != pair:
+            if not _find_position(pair):
                 return jsonify({"ok": False, "error": "sin_posicion"}), 409
             if price is None or price <= 0:
                 add_log("No se pudo cerrar %s: sin precio de mercado." % pair)
                 save_state()
                 return jsonify({"ok": False, "error": "sin_precio"}), 503
-            close_position("manual", price)
+            close_position("manual", price, pair)
             save_state()
         return jsonify(public_state())
     finally:
@@ -966,6 +1161,7 @@ def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with LOCK:
         add_log("Umbral de entrada: %d." % entry_threshold())
+        add_log("Máximo de posiciones: %d (una por moneda)." % max_positions())
         add_log("Trailing: %s." % _trail_label())
         if STATE["running"]:
             add_log("Bot reanudado al arrancar el complemento.")
@@ -973,11 +1169,12 @@ def main():
     threading.Thread(target=monitor_loop, name="granmago-monitor", daemon=True).start()
     threading.Thread(target=scan_loop, name="granmago-scan", daemon=True).start()
     log.info(
-        "GranMago Scanner %s on 0.0.0.0:%s data=%s entry_threshold=%s trailing=%s activation_pct=%s distance=%s",
+        "GranMago Scanner %s on 0.0.0.0:%s data=%s entry_threshold=%s max_positions=%s trailing=%s activation_pct=%s distance=%s",
         VERSION,
         PORT,
         DATA_DIR,
         entry_threshold(),
+        max_positions(),
         trailing_enabled(),
         trailing_activation_pct(),
         trailing_distance(),

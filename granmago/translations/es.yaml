@@ -26,3 +26,6 @@ configuration:
   entry_threshold:
     name: Umbral de entrada
     description: Puntuación mínima para abrir una operación. 100 exige el score máximo.
+  max_positions:
+    name: Máximo de posiciones
+    description: Cuántas operaciones pueden estar abiertas a la vez, cada una en una moneda distinta. De 1 a 12.
