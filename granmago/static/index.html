@@ -123,6 +123,7 @@
 
   <div class="card" style="margin-bottom:16px">
     <h3>Ranking de oportunidades</h3>
+    <p id="entryRule" style="margin:0 0 8px; font-size:0.8rem; color:var(--muted);">Umbral de entrada: 100. Solo abre con esa puntuación.</p>
     <div class="table-wrap">
       <table>
         <thead>
@@ -197,8 +198,10 @@ function fmt(p) {
   return n.toLocaleString(undefined, { maximumFractionDigits: 4 });
 }
 
-function scoreClass(n) {
-  return n >= 70 ? "score-high" : n >= 45 ? "score-mid" : "score-low";
+function scoreClass(n, threshold) {
+  if (n >= threshold) return "score-high";
+  if (n >= 45) return "score-mid";
+  return "score-low";
 }
 
 let formDirty = false;
@@ -243,6 +246,10 @@ function render(s) {
     $("initBalance").value = s.initialBalance;
   }
 
+  const entryThreshold = (s.settings && Number.isFinite(+s.settings.entryThreshold))
+    ? +s.settings.entryThreshold : 100;
+  $("entryRule").textContent = "Umbral de entrada: " + entryThreshold + ". Solo abre con esa puntuación.";
+
   const rows = s.lastScan || [];
   $("scanTable").innerHTML = rows.length ? rows.map((r) => {
     const best = (bl && r.pair === bl.pair) || (bs && r.pair === bs.pair);
@@ -250,8 +257,8 @@ function render(s) {
     return `<tr class="${best ? "best" : ""}">
       <td><strong>${esc(r.pair.replace("-USDT", ""))}</strong></td>
       <td class="${r.bias === "ALCISTA" ? "positive" : r.bias === "BAJISTA" ? "negative" : ""}">${bias}</td>
-      <td class="${scoreClass(r.scoreLong)}">${r.scoreLong}</td>
-      <td class="${scoreClass(r.scoreShort)}">${r.scoreShort}</td>
+      <td class="${scoreClass(r.scoreLong, entryThreshold)}">${r.scoreLong}</td>
+      <td class="${scoreClass(r.scoreShort, entryThreshold)}">${r.scoreShort}</td>
       <td>${r.nearEMA ? "Sí" : "No"}</td>
       <td>${r.stoch}</td>
       <td>${r.validLong ? "LONG" : r.validShort ? "SHORT" : "-"}</td>
