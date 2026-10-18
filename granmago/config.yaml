@@ -1,5 +1,5 @@
 name: GranMago Scanner
-version: "1.0.0"
+version: "1.1.0"
 slug: granmago
 description: Paper trading del scanner GranMago. El bot corre en el servidor aunque cierres la página.
 url: https://github.com/iejayu8/granmago-scanner
@@ -24,9 +24,15 @@ options:
   leverage: 3
   initial_balance: 10000
   scan_seconds: 90
+  trailing_enabled: true
+  trailing_activation_pct: 1.0
+  trailing_distance: 0.5
 schema:
   log_level: list(trace|debug|info|notice|warning|error|fatal)
   risk_pct: float
   leverage: int
   initial_balance: int
   scan_seconds: int
+  trailing_enabled: bool
+  trailing_activation_pct: float
+  trailing_distance: float

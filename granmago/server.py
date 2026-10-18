@@ -2,6 +2,8 @@
 """GranMago Scanner — paper trading loop for the Home Assistant add-on.
 
 The loop lives in this process. Closing the browser does not stop it.
+A full scan keeps running on the scan interval even while a position is
+open. The bot still holds one position at a time.
 """
 
 import json
@@ -20,6 +22,7 @@ PAIRS = [
     "DOGE-USDT", "AVAX-USDT", "LINK-USDT", "DOT-USDT", "LTC-USDT", "BCH-USDT",
 ]
 
+VERSION = "1.1.0"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 STATE_FILE = DATA_DIR / "state.json"
 PORT = int(os.environ.get("PORT", "8787"))
@@ -43,11 +46,13 @@ log = logging.getLogger("granmago")
 
 app = Flask(__name__)
 SESSION = requests.Session()
-SESSION.headers["User-Agent"] = "granmago-scanner/1.0"
+SESSION.headers["User-Agent"] = "granmago-scanner/%s" % VERSION
 
 LOCK = threading.Lock()
 SCAN_LOCK = threading.Lock()
-KICK = threading.Event()
+_closing = threading.Lock()
+_wake = threading.Condition()
+_kick_gen = 0
 STOP = threading.Event()
 
 
@@ -69,9 +74,245 @@ def _env_int(name, default):
         return int(default)
 
 
+def _env_set(name):
+    raw = os.environ.get(name)
+    return raw is not None and str(raw).strip() != ""
+
+
+def _as_bool(value, default):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value != 0
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return bool(default)
+
+
+def _sane_float(value, fallback):
+    """Non-negative float. Invalid or negative values use the fallback."""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return float(fallback)
+    if num < 0:
+        return float(fallback)
+    return num
+
+
+def _apply_runtime_options(settings):
+    """Apply add-on options. A leftover max-hold field is ignored.
+
+    Positions close only by the stop, the target, the trailing stop, or a
+    manual close. There is no time limit.
+    """
+    settings.pop("maxHoldHours", None)
+    if _env_set("TRAILING_ENABLED"):
+        settings["trailingEnabled"] = _as_bool(os.environ.get("TRAILING_ENABLED"), True)
+    else:
+        settings["trailingEnabled"] = _as_bool(settings.get("trailingEnabled"), True)
+    if _env_set("TRAILING_ACTIVATION_PCT"):
+        settings["trailingActivationPct"] = _sane_float(os.environ.get("TRAILING_ACTIVATION_PCT"), 1.0)
+    else:
+        settings["trailingActivationPct"] = _sane_float(settings.get("trailingActivationPct", 1.0), 1.0)
+    if _env_set("TRAILING_DISTANCE"):
+        settings["trailingDistance"] = _sane_float(os.environ.get("TRAILING_DISTANCE"), 0.5)
+    else:
+        settings["trailingDistance"] = _sane_float(settings.get("trailingDistance", 0.5), 0.5)
+
+
+def _settings():
+    settings = STATE.get("settings") if isinstance(STATE.get("settings"), dict) else {}
+    return settings
+
+
+def trailing_enabled():
+    return _as_bool(_settings().get("trailingEnabled"), True)
+
+
+def trailing_activation_pct():
+    return _sane_float(_settings().get("trailingActivationPct", 1.0), 1.0)
+
+
+def trailing_distance():
+    return _sane_float(_settings().get("trailingDistance", 0.5), 0.5)
+
+
+def _as_price(value):
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if num <= 0:
+        return None
+    return num
+
+
+def ensure_position_fields(pos):
+    """Fill trailing fields missing from a 1.0.0 position. Does not close it."""
+    if not isinstance(pos, dict):
+        return pos
+    if _as_price(pos.get("initialSl")) is None and _as_price(pos.get("sl")) is not None:
+        pos["initialSl"] = pos["sl"]
+    if pos.get("initialTp") is None and pos.get("tp") is not None:
+        pos["initialTp"] = pos["tp"]
+    if pos.get("trailingActive") is None:
+        pos["trailingActive"] = False
+    if _as_price(pos.get("bestPrice")) is None:
+        # Seed with the entry. The next live check keeps whichever of the
+        # entry and the current price is more favourable. A stale last mark
+        # is not treated as the best price since entry.
+        pos["bestPrice"] = _as_price(pos.get("entry"))
+    return pos
+
+
+def position_pnl(pos, price):
+    entry = _as_price(pos.get("entry"))
+    notional = _as_price(pos.get("notional"))
+    mark = _as_price(price)
+    if entry is None or notional is None or mark is None:
+        return None
+    if pos.get("side") == "long":
+        pct = (mark - entry) / entry
+    else:
+        pct = (entry - mark) / entry
+    return pct * notional
+
+
+def trail_distance_price(pos):
+    entry = _as_price(pos.get("entry"))
+    initial_sl = _as_price(pos.get("initialSl"))
+    if initial_sl is None:
+        initial_sl = _as_price(pos.get("sl"))
+    if entry is None or initial_sl is None:
+        return None
+    return abs(entry - initial_sl) * trailing_distance()
+
+
+def update_best_price(pos, price):
+    mark = _as_price(price)
+    if mark is None:
+        return _as_price(pos.get("bestPrice"))
+    current = _as_price(pos.get("bestPrice"))
+    if current is None:
+        current = _as_price(pos.get("entry"))
+    if current is None:
+        pos["bestPrice"] = mark
+        return mark
+    if pos.get("side") == "short":
+        pos["bestPrice"] = min(current, mark)
+    else:
+        pos["bestPrice"] = max(current, mark)
+    return pos["bestPrice"]
+
+
+def trailed_stop(pos):
+    """Stop once trailing is on: breakeven floor, then only tighter from the best price."""
+    entry = _as_price(pos.get("entry"))
+    best = _as_price(pos.get("bestPrice"))
+    dist = trail_distance_price(pos)
+    if entry is None or best is None or dist is None:
+        return None
+    if pos.get("side") == "long":
+        return max(entry, best - dist)
+    return min(entry, best + dist)
+
+
+def tighten_stop(pos):
+    """Move the live stop to the trail if that tightens it. Never loosens."""
+    candidate = trailed_stop(pos)
+    current = _as_price(pos.get("sl"))
+    if candidate is None or current is None:
+        return False
+    if pos.get("side") == "long":
+        updated = max(current, candidate)
+    else:
+        updated = min(current, candidate)
+    if abs(updated - current) <= 1e-12:
+        return False
+    pos["sl"] = updated
+    return True
+
+
+def activate_trailing(pos):
+    """Drop the fixed target and replace the protective stop with the trail.
+
+    The original stop stays stored as initialSl so the distance is stable.
+    The live stop is always a price; the position is never left unprotected.
+    """
+    if pos.get("initialTp") is None and pos.get("tp") is not None:
+        pos["initialTp"] = pos["tp"]
+    pos["tp"] = None
+    pos["trailingActive"] = True
+    tighten_stop(pos)
+    if _as_price(pos.get("sl")) is None:
+        restored = trailed_stop(pos)
+        if restored is None:
+            restored = _as_price(pos.get("initialSl"))
+        if restored is not None:
+            pos["sl"] = restored
+
+
+def trailing_should_activate(pos, price):
+    if not trailing_enabled() or pos.get("trailingActive"):
+        return False
+    pnl = position_pnl(pos, price)
+    notional = _as_price(pos.get("notional"))
+    if pnl is None or notional is None:
+        return False
+    return pnl >= notional * (trailing_activation_pct() / 100.0)
+
+
+def _stop_hit(side, price, sl):
+    if _as_price(sl) is None or _as_price(price) is None:
+        return False
+    if side == "long":
+        return price <= sl
+    return price >= sl
+
+
+def _target_hit(side, price, tp):
+    if _as_price(tp) is None or _as_price(price) is None:
+        return False
+    if side == "long":
+        return price >= tp
+    return price <= tp
+
+
+def kick():
+    """Wake the scan and monitor loops early (start, stop, new position)."""
+    global _kick_gen
+    with _wake:
+        _kick_gen += 1
+        _wake.notify_all()
+
+
+def _wait(seconds):
+    """Sleep up to `seconds`. Return False when the process is stopping.
+
+    A kick() returns early. Spurious condition wakeups wait out the remainder.
+    """
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    with _wake:
+        seen = _kick_gen
+        while not STOP.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            _wake.wait(timeout=remaining)
+            if _kick_gen != seen:
+                return not STOP.is_set()
+        return False
+
+
 def default_state():
     balance = _env_float("INITIAL_BALANCE", 10000)
-    return {
+    state = {
         "running": False,
         "balance": balance,
         "initialBalance": balance,
@@ -88,8 +329,13 @@ def default_state():
             "riskPct": _env_float("RISK_PCT", 2),
             "leverage": _env_int("LEVERAGE", 3),
             "scanSeconds": max(30, _env_int("SCAN_SECONDS", 90)),
+            "trailingEnabled": True,
+            "trailingActivationPct": 1.0,
+            "trailingDistance": 0.5,
         },
     }
+    _apply_runtime_options(state["settings"])
+    return state
 
 
 def load_state():
@@ -101,6 +347,9 @@ def load_state():
                 base.update({k: data[k] for k in base if k in data and k != "settings"})
                 if isinstance(data.get("settings"), dict):
                     base["settings"].update(data["settings"])
+            _apply_runtime_options(base["settings"])
+            if isinstance(base.get("openPosition"), dict):
+                ensure_position_fields(base["openPosition"])
             base["busy"] = False
             return base
         except (OSError, json.JSONDecodeError) as exc:
@@ -360,6 +609,10 @@ def open_from_result(res, side):
         "time": _now(),
         "unrealized": 0,
         "price": entry,
+        "initialSl": sl,
+        "initialTp": tp,
+        "bestPrice": entry,
+        "trailingActive": False,
     }
     add_log("ENTRADA AUTO %s %s @ %s (score %s)" % (side.upper(), res["pair"], _fmt(entry), score))
 
@@ -393,10 +646,9 @@ def monitor_position():
         pos = STATE["openPosition"]
         if not pos:
             return
+        ensure_position_fields(pos)
         pair = pos["pair"]
         side = pos["side"]
-        sl = pos["sl"]
-        tp = pos["tp"]
     price = fetch_price(pair)
     if price is None:
         with LOCK:
@@ -408,24 +660,39 @@ def monitor_position():
         pos = STATE["openPosition"]
         if not pos or pos["pair"] != pair:
             return
-        if side == "long":
-            pnl_pct = (price - pos["entry"]) / pos["entry"]
-        else:
-            pnl_pct = (pos["entry"] - price) / pos["entry"]
+        ensure_position_fields(pos)
+        pnl = position_pnl(pos, price)
         pos["price"] = price
-        pos["unrealized"] = round(pnl_pct * pos["notional"], 2)
-        hit = None
-        if (side == "long" and price <= sl) or (side == "short" and price >= sl):
-            hit = "SL"
-        elif (side == "long" and price >= tp) or (side == "short" and price <= tp):
-            hit = "TP"
-        if hit:
-            close_position(hit, price)
+        if pnl is not None:
+            pos["unrealized"] = round(pnl, 2)
+        update_best_price(pos, price)
+        if pos.get("trailingActive"):
+            moved = tighten_stop(pos)
+            if moved:
+                add_log("Trailing %s SL → %s (mejor %s)" % (pair, _fmt(pos["sl"]), _fmt(pos["bestPrice"])))
+            if _stop_hit(side, price, pos.get("sl")):
+                close_position("trailing", price)
+        else:
+            # Fixed stop and target, unchanged, until the trail takes over.
+            if _stop_hit(side, price, pos.get("sl")):
+                close_position("SL", price)
+            elif _target_hit(side, price, pos.get("tp")):
+                close_position("TP", price)
+            elif trailing_should_activate(pos, price):
+                activate_trailing(pos)
+                add_log(
+                    "Trailing activo en %s. SL %s (mejor %s)"
+                    % (pair, _fmt(pos["sl"]), _fmt(pos["bestPrice"]))
+                )
+                if _stop_hit(side, price, pos.get("sl")):
+                    close_position("trailing", price)
         STATE["lastTickAt"] = _now()
         save_state()
 
 
 def maybe_open():
+    """Open at most one position from the latest scan. No-op while one is open."""
+    opened = False
     with LOCK:
         if STATE["openPosition"] or not STATE["running"]:
             return
@@ -437,7 +704,26 @@ def maybe_open():
             open_from_result(best_s, "short")
         else:
             add_log("Ningún setup alcanza el umbral mínimo (75). Esperando...")
+        opened = STATE["openPosition"] is not None
         save_state()
+    if opened:
+        kick()
+
+
+def next_actions(running, has_position):
+    """What the background loops should do.
+
+    Scans stay on the scan interval whenever the bot is running, including
+    while a position is open, so the ranking in the UI keeps updating.
+    The 20s SL/TP check runs only when a position is open. Entering a new
+    trade is decided later by maybe_open(), which refuses a second position.
+    """
+    running = bool(running)
+    has_position = bool(has_position)
+    return {
+        "scan": running,
+        "monitor": running and has_position,
+    }
 
 
 def _fmt(price):
@@ -448,39 +734,67 @@ def _fmt(price):
     return "%.4f" % price
 
 
-def loop():
-    log.info("loop started, running=%s", STATE["running"])
-    if STATE["running"]:
-        add_log("Bot reanudado al arrancar el complemento.")
-        save_state()
+def _trail_label():
+    if not trailing_enabled():
+        return "desactivado, SL y TP fijos"
+    return "se activa al %s%% del nocional, distancia %s del riesgo inicial" % (
+        _fmt_num(trailing_activation_pct()),
+        _fmt_num(trailing_distance()),
+    )
+
+
+def _fmt_num(value):
+    text = ("%.4f" % float(value)).rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def scan_loop():
+    """Full market scan on the scan interval, whether or not a position is open."""
     while not STOP.is_set():
         with LOCK:
             running = STATE["running"]
             has_pos = STATE["openPosition"] is not None
             interval = max(30, int(STATE["settings"].get("scanSeconds") or 90))
-        if running and has_pos:
-            try:
-                monitor_position()
-            except Exception as exc:
-                log.exception("monitor")
-                with LOCK:
-                    add_log("Fallo vigilando la posición, el bot sigue: %s" % exc)
-                    save_state()
-            KICK.wait(MONITOR_SECONDS)
-        elif running:
-            try:
-                scan_all()
-                maybe_open()
-            except Exception as exc:
-                log.exception("scan")
-                with LOCK:
-                    add_log("Fallo en el ciclo, el bot sigue: %s" % exc)
-                    STATE["lastTickAt"] = _now()
-                    save_state()
-            KICK.wait(interval)
-        else:
-            KICK.wait(2)
-        KICK.clear()
+        if not next_actions(running, has_pos)["scan"]:
+            if not _wait(2):
+                return
+            continue
+        try:
+            scan_all()
+            # maybe_open checks the position again under the lock, so a scan
+            # that finishes while a trade is still open cannot open another.
+            maybe_open()
+        except Exception as exc:
+            log.exception("scan")
+            with LOCK:
+                add_log("Fallo en el ciclo, el bot sigue: %s" % exc)
+                STATE["lastTickAt"] = _now()
+                save_state()
+        if not _wait(interval):
+            return
+
+
+def monitor_loop():
+    """SL/TP, then the trailing stop once it is active. Independent of the scan."""
+    while not STOP.is_set():
+        with LOCK:
+            running = STATE["running"]
+            has_pos = STATE["openPosition"] is not None
+        if not next_actions(running, has_pos)["monitor"]:
+            if not _wait(1):
+                return
+            continue
+        try:
+            monitor_position()
+        except Exception as exc:
+            log.exception("monitor")
+            with LOCK:
+                add_log("Fallo vigilando la posición, el bot sigue: %s" % exc)
+                save_state()
+        with LOCK:
+            still_open = STATE["openPosition"] is not None
+        if not _wait(MONITOR_SECONDS if still_open else 1):
+            return
 
 
 HTML_PATH = Path(__file__).resolve().parent / "static" / "index.html"
@@ -514,7 +828,7 @@ def api_start():
         STATE["running"] = True
         add_log("Bot iniciado en el servidor. Sigue aunque cierres esta página.")
         save_state()
-    KICK.set()
+    kick()
     return jsonify(public_state())
 
 
@@ -524,7 +838,7 @@ def api_stop():
         STATE["running"] = False
         add_log("Bot detenido.")
         save_state()
-    KICK.set()
+    kick()
     return jsonify(public_state())
 
 
@@ -587,10 +901,54 @@ def api_scan():
     return jsonify({"ok": True})
 
 
+@app.route("/api/close_position", methods=["POST"])
+def api_close_position():
+    """Close the open paper position at the current market price.
+
+    Same balance and history path as an SL/TP close. Reason is 'manual'.
+    """
+    if not _closing.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "ocupado"}), 409
+    try:
+        with LOCK:
+            pos = STATE["openPosition"]
+            if not pos:
+                return jsonify({"ok": False, "error": "sin_posicion"}), 409
+            pair = pos["pair"]
+        price = fetch_price(pair)
+        with LOCK:
+            pos = STATE["openPosition"]
+            if not pos or pos.get("pair") != pair:
+                return jsonify({"ok": False, "error": "sin_posicion"}), 409
+            if price is None or price <= 0:
+                add_log("No se pudo cerrar %s: sin precio de mercado." % pair)
+                save_state()
+                return jsonify({"ok": False, "error": "sin_precio"}), 503
+            close_position("manual", price)
+            save_state()
+        return jsonify(public_state())
+    finally:
+        _closing.release()
+
+
 def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    threading.Thread(target=loop, name="granmago-loop", daemon=True).start()
-    log.info("GranMago Scanner on 0.0.0.0:%s data=%s", PORT, DATA_DIR)
+    with LOCK:
+        add_log("Trailing: %s." % _trail_label())
+        if STATE["running"]:
+            add_log("Bot reanudado al arrancar el complemento.")
+        save_state()
+    threading.Thread(target=monitor_loop, name="granmago-monitor", daemon=True).start()
+    threading.Thread(target=scan_loop, name="granmago-scan", daemon=True).start()
+    log.info(
+        "GranMago Scanner %s on 0.0.0.0:%s data=%s trailing=%s activation_pct=%s distance=%s",
+        VERSION,
+        PORT,
+        DATA_DIR,
+        trailing_enabled(),
+        trailing_activation_pct(),
+        trailing_distance(),
+    )
     from waitress import serve
     serve(app, host="0.0.0.0", port=PORT, threads=4)
 

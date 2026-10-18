@@ -13,4 +13,13 @@ configuration:
     description: Paper balance used when you reset from the page.
   scan_seconds:
     name: Seconds between scans
-    description: An open position is marked every 20 seconds.
+    description: Full scan interval. An open position is still checked every 20 seconds and does not stop the scan.
+  trailing_enabled:
+    name: Trailing stop
+    description: When on, a profitable trade switches from the fixed stop and target to a trailing stop.
+  trailing_activation_pct:
+    name: Trailing activation %
+    description: Unrealized profit, as a percent of position notional, required before the trailing stop takes over.
+  trailing_distance:
+    name: Trailing distance
+    description: Trail distance as a fraction of the initial risk (entry to the original stop).
