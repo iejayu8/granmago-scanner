@@ -2,6 +2,8 @@
 """GranMago Scanner — paper trading loop for the Home Assistant add-on.
 
 The loop lives in this process. Closing the browser does not stop it.
+A full scan keeps running on the scan interval even while a position is
+open. The bot still holds one position at a time.
 """
 
 import json
@@ -20,6 +22,7 @@ PAIRS = [
     "DOGE-USDT", "AVAX-USDT", "LINK-USDT", "DOT-USDT", "LTC-USDT", "BCH-USDT",
 ]
 
+VERSION = "1.1.0"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 STATE_FILE = DATA_DIR / "state.json"
 PORT = int(os.environ.get("PORT", "8787"))
@@ -43,11 +46,13 @@ log = logging.getLogger("granmago")
 
 app = Flask(__name__)
 SESSION = requests.Session()
-SESSION.headers["User-Agent"] = "granmago-scanner/1.0"
+SESSION.headers["User-Agent"] = "granmago-scanner/%s" % VERSION
 
 LOCK = threading.Lock()
 SCAN_LOCK = threading.Lock()
-KICK = threading.Event()
+_closing = threading.Lock()
+_wake = threading.Condition()
+_kick_gen = 0
 STOP = threading.Event()
 
 
@@ -69,9 +74,65 @@ def _env_int(name, default):
         return int(default)
 
 
+def _sane_hold_hours(value, fallback=48):
+    """Non-negative hours. 0 disables the limit. Invalid values use fallback."""
+    try:
+        hours = int(float(value))
+    except (TypeError, ValueError):
+        return int(fallback)
+    if hours < 0:
+        return int(fallback)
+    return hours
+
+
+def _apply_hold_option(settings):
+    """Set maxHoldHours without touching the rest of the saved book.
+
+    The add-on option (MAX_HOLD_HOURS) wins when the supervisor provides it,
+    so a later change in the add-on config applies on restart. Files written
+    by 1.0.0 simply omit the key and keep the default.
+    """
+    env_raw = os.environ.get("MAX_HOLD_HOURS")
+    if env_raw is not None and str(env_raw).strip() != "":
+        settings["maxHoldHours"] = _sane_hold_hours(env_raw, 48)
+        return
+    settings["maxHoldHours"] = _sane_hold_hours(settings.get("maxHoldHours", 48), 48)
+
+
+def max_hold_hours():
+    settings = STATE.get("settings") if isinstance(STATE.get("settings"), dict) else {}
+    return _sane_hold_hours(settings.get("maxHoldHours", 48), 48)
+
+
+def kick():
+    """Wake the scan and monitor loops early (start, stop, new position)."""
+    global _kick_gen
+    with _wake:
+        _kick_gen += 1
+        _wake.notify_all()
+
+
+def _wait(seconds):
+    """Sleep up to `seconds`. Return False when the process is stopping.
+
+    A kick() returns early. Spurious condition wakeups wait out the remainder.
+    """
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    with _wake:
+        seen = _kick_gen
+        while not STOP.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            _wake.wait(timeout=remaining)
+            if _kick_gen != seen:
+                return not STOP.is_set()
+        return False
+
+
 def default_state():
     balance = _env_float("INITIAL_BALANCE", 10000)
-    return {
+    state = {
         "running": False,
         "balance": balance,
         "initialBalance": balance,
@@ -88,8 +149,11 @@ def default_state():
             "riskPct": _env_float("RISK_PCT", 2),
             "leverage": _env_int("LEVERAGE", 3),
             "scanSeconds": max(30, _env_int("SCAN_SECONDS", 90)),
+            "maxHoldHours": 48,
         },
     }
+    _apply_hold_option(state["settings"])
+    return state
 
 
 def load_state():
@@ -101,6 +165,7 @@ def load_state():
                 base.update({k: data[k] for k in base if k in data and k != "settings"})
                 if isinstance(data.get("settings"), dict):
                     base["settings"].update(data["settings"])
+            _apply_hold_option(base["settings"])
             base["busy"] = False
             return base
         except (OSError, json.JSONDecodeError) as exc:
@@ -388,6 +453,39 @@ def close_position(reason, price):
     STATE["openPosition"] = None
 
 
+def position_opened_at(pos):
+    """Parse the open time stored on a position. Missing or junk → None."""
+    if not isinstance(pos, dict):
+        return None
+    raw = pos.get("time")
+    if not raw:
+        return None
+    try:
+        opened = datetime.fromisoformat(str(raw))
+    except (TypeError, ValueError):
+        return None
+    if opened.tzinfo is None:
+        opened = opened.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    return opened
+
+
+def position_hold_expired(pos, now=None):
+    """True when the position has been open longer than max_hold_hours.
+
+    0 disables the limit. A missing open time does not close the position.
+    """
+    hours = max_hold_hours()
+    if hours <= 0 or not pos:
+        return False
+    opened = position_opened_at(pos)
+    if opened is None:
+        return False
+    current = now or datetime.now(timezone.utc).astimezone()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return (current - opened).total_seconds() > hours * 3600
+
+
 def monitor_position():
     with LOCK:
         pos = STATE["openPosition"]
@@ -421,11 +519,15 @@ def monitor_position():
             hit = "TP"
         if hit:
             close_position(hit, price)
+        elif position_hold_expired(pos):
+            close_position("timeout", price)
         STATE["lastTickAt"] = _now()
         save_state()
 
 
 def maybe_open():
+    """Open at most one position from the latest scan. No-op while one is open."""
+    opened = False
     with LOCK:
         if STATE["openPosition"] or not STATE["running"]:
             return
@@ -437,7 +539,26 @@ def maybe_open():
             open_from_result(best_s, "short")
         else:
             add_log("Ningún setup alcanza el umbral mínimo (75). Esperando...")
+        opened = STATE["openPosition"] is not None
         save_state()
+    if opened:
+        kick()
+
+
+def next_actions(running, has_position):
+    """What the background loops should do.
+
+    Scans stay on the scan interval whenever the bot is running, including
+    while a position is open, so the ranking in the UI keeps updating.
+    The 20s SL/TP check runs only when a position is open. Entering a new
+    trade is decided later by maybe_open(), which refuses a second position.
+    """
+    running = bool(running)
+    has_position = bool(has_position)
+    return {
+        "scan": running,
+        "monitor": running and has_position,
+    }
 
 
 def _fmt(price):
@@ -448,39 +569,60 @@ def _fmt(price):
     return "%.4f" % price
 
 
-def loop():
-    log.info("loop started, running=%s", STATE["running"])
-    if STATE["running"]:
-        add_log("Bot reanudado al arrancar el complemento.")
-        save_state()
+def _hold_label():
+    hours = max_hold_hours()
+    if hours <= 0:
+        return "desactivada"
+    return "%d h" % hours
+
+
+def scan_loop():
+    """Full market scan on the scan interval, whether or not a position is open."""
     while not STOP.is_set():
         with LOCK:
             running = STATE["running"]
             has_pos = STATE["openPosition"] is not None
             interval = max(30, int(STATE["settings"].get("scanSeconds") or 90))
-        if running and has_pos:
-            try:
-                monitor_position()
-            except Exception as exc:
-                log.exception("monitor")
-                with LOCK:
-                    add_log("Fallo vigilando la posición, el bot sigue: %s" % exc)
-                    save_state()
-            KICK.wait(MONITOR_SECONDS)
-        elif running:
-            try:
-                scan_all()
-                maybe_open()
-            except Exception as exc:
-                log.exception("scan")
-                with LOCK:
-                    add_log("Fallo en el ciclo, el bot sigue: %s" % exc)
-                    STATE["lastTickAt"] = _now()
-                    save_state()
-            KICK.wait(interval)
-        else:
-            KICK.wait(2)
-        KICK.clear()
+        if not next_actions(running, has_pos)["scan"]:
+            if not _wait(2):
+                return
+            continue
+        try:
+            scan_all()
+            # maybe_open checks the position again under the lock, so a scan
+            # that finishes while a trade is still open cannot open another.
+            maybe_open()
+        except Exception as exc:
+            log.exception("scan")
+            with LOCK:
+                add_log("Fallo en el ciclo, el bot sigue: %s" % exc)
+                STATE["lastTickAt"] = _now()
+                save_state()
+        if not _wait(interval):
+            return
+
+
+def monitor_loop():
+    """SL/TP (and max-hold) check every 20s. Independent of the scan."""
+    while not STOP.is_set():
+        with LOCK:
+            running = STATE["running"]
+            has_pos = STATE["openPosition"] is not None
+        if not next_actions(running, has_pos)["monitor"]:
+            if not _wait(1):
+                return
+            continue
+        try:
+            monitor_position()
+        except Exception as exc:
+            log.exception("monitor")
+            with LOCK:
+                add_log("Fallo vigilando la posición, el bot sigue: %s" % exc)
+                save_state()
+        with LOCK:
+            still_open = STATE["openPosition"] is not None
+        if not _wait(MONITOR_SECONDS if still_open else 1):
+            return
 
 
 HTML_PATH = Path(__file__).resolve().parent / "static" / "index.html"
@@ -514,7 +656,7 @@ def api_start():
         STATE["running"] = True
         add_log("Bot iniciado en el servidor. Sigue aunque cierres esta página.")
         save_state()
-    KICK.set()
+    kick()
     return jsonify(public_state())
 
 
@@ -524,7 +666,7 @@ def api_stop():
         STATE["running"] = False
         add_log("Bot detenido.")
         save_state()
-    KICK.set()
+    kick()
     return jsonify(public_state())
 
 
@@ -587,10 +729,49 @@ def api_scan():
     return jsonify({"ok": True})
 
 
+@app.route("/api/close_position", methods=["POST"])
+def api_close_position():
+    """Close the open paper position at the current market price.
+
+    Same balance and history path as an SL/TP close. Reason is 'manual'.
+    """
+    if not _closing.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "ocupado"}), 409
+    try:
+        with LOCK:
+            pos = STATE["openPosition"]
+            if not pos:
+                return jsonify({"ok": False, "error": "sin_posicion"}), 409
+            pair = pos["pair"]
+        price = fetch_price(pair)
+        with LOCK:
+            pos = STATE["openPosition"]
+            if not pos or pos.get("pair") != pair:
+                return jsonify({"ok": False, "error": "sin_posicion"}), 409
+            if price is None or price <= 0:
+                add_log("No se pudo cerrar %s: sin precio de mercado." % pair)
+                save_state()
+                return jsonify({"ok": False, "error": "sin_precio"}), 503
+            close_position("manual", price)
+            save_state()
+        return jsonify(public_state())
+    finally:
+        _closing.release()
+
+
 def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    threading.Thread(target=loop, name="granmago-loop", daemon=True).start()
-    log.info("GranMago Scanner on 0.0.0.0:%s data=%s", PORT, DATA_DIR)
+    with LOCK:
+        add_log("Permanencia máxima: %s." % _hold_label())
+        if STATE["running"]:
+            add_log("Bot reanudado al arrancar el complemento.")
+        save_state()
+    threading.Thread(target=monitor_loop, name="granmago-monitor", daemon=True).start()
+    threading.Thread(target=scan_loop, name="granmago-scan", daemon=True).start()
+    log.info(
+        "GranMago Scanner %s on 0.0.0.0:%s data=%s max_hold_hours=%s",
+        VERSION, PORT, DATA_DIR, max_hold_hours(),
+    )
     from waitress import serve
     serve(app, host="0.0.0.0", port=PORT, threads=4)
 

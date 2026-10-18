@@ -13,4 +13,7 @@ configuration:
     description: Balance de paper al resetear desde la página.
   scan_seconds:
     name: Segundos entre escaneos
-    description: Con una posición abierta el precio se mira cada 20 segundos.
+    description: Intervalo del escaneo completo. Con una posición abierta el precio se mira cada 20 segundos y el escaneo sigue.
+  max_hold_hours:
+    name: Horas máximas en posición
+    description: Cierra la posición de paper a mercado pasadas estas horas. 0 desactiva el límite.

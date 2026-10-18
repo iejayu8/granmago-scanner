@@ -148,6 +148,12 @@
       <div class="tab" data-tab="history">Historial</div>
     </div>
     <div id="tab-open">
+      <p id="openHint" style="display:none; color:var(--muted); font-size:0.8rem; margin:0 0 10px">
+        El escaneo continúa. Mientras esta posición siga abierta no se abre otra.
+      </p>
+      <div id="closeRow" style="display:none; margin-bottom:10px">
+        <button class="danger" id="btnClose" type="button">Cerrar posición</button>
+      </div>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Par</th><th>Lado</th><th>Entrada</th><th>Precio</th><th>SL</th><th>TP</th><th>PnL</th></tr></thead>
@@ -194,6 +200,13 @@ function scoreClass(n) {
 }
 
 let formDirty = false;
+let closeBusy = false;
+
+function motivo(reason) {
+  if (reason === "manual") return "Manual";
+  if (reason === "timeout") return "Tiempo máximo";
+  return reason == null ? "-" : String(reason);
+}
 ["riskPct", "leverage", "initBalance"].forEach((id) => {
   $(id).addEventListener("input", () => { formDirty = true; });
 });
@@ -258,6 +271,10 @@ function render(s) {
   $("log").innerHTML = (s.log || []).map((l) => `<div>${esc(l)}</div>`).join("");
 
   const p = s.openPosition;
+  $("openHint").style.display = p ? "block" : "none";
+  $("closeRow").style.display = p ? "block" : "none";
+  $("btnClose").disabled = closeBusy || !p;
+  $("btnClose").dataset.pair = p ? p.pair.replace("-USDT", "") : "";
   $("openTrades").innerHTML = p ? `<tr>
     <td>${p.pair.replace("-USDT", "")}</td><td>${String(p.side).toUpperCase()}</td>
     <td>${fmt(p.entry)}</td><td>${fmt(p.price)}</td><td>${fmt(p.sl)}</td><td>${fmt(p.tp)}</td>
@@ -268,7 +285,7 @@ function render(s) {
     <tr>
       <td>${t.time}</td><td>${String(t.pair).replace("-USDT", "")}</td><td>${String(t.side).toUpperCase()}</td>
       <td class="${t.pnl >= 0 ? "positive" : "negative"}">${(+t.pnl).toFixed(2)}</td>
-      <td>${t.reason}</td>
+      <td>${esc(motivo(t.reason))}</td>
     </tr>
   `).join("") || '<tr><td colspan="5" style="color:var(--muted)">Sin historial</td></tr>';
 }
@@ -310,6 +327,14 @@ async function post(path, body) {
 $("btnStart").onclick = () => post("/api/start", payload());
 $("btnStop").onclick = () => post("/api/stop");
 $("btnScan").onclick = () => post("/api/scan");
+$("btnClose").onclick = () => {
+  if (closeBusy || $("btnClose").disabled) return;
+  const pair = $("btnClose").dataset.pair || "la posición";
+  if (!confirm("¿Cerrar " + pair + " al precio de mercado? Quedará en el historial.")) return;
+  closeBusy = true;
+  $("btnClose").disabled = true;
+  post("/api/close_position").finally(() => { closeBusy = false; refresh(); });
+};
 $("btnReset").onclick = () => {
   if (!confirm("¿Resetear balance e historial? El bot no se detiene.")) return;
   post("/api/reset", payload());

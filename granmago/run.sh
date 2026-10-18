@@ -7,5 +7,6 @@ export RISK_PCT="$(bashio::config 'risk_pct')"
 export LEVERAGE="$(bashio::config 'leverage')"
 export INITIAL_BALANCE="$(bashio::config 'initial_balance')"
 export SCAN_SECONDS="$(bashio::config 'scan_seconds')"
+export MAX_HOLD_HOURS="$(bashio::config 'max_hold_hours')"
 
 exec python -u /app/server.py

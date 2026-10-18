@@ -18,9 +18,10 @@ El puerto 8787 no choca con HADomotics (8099).
 
 ## Qué hace
 
-- Vigila una posición abierta cada 20 segundos con el precio en vivo.
-- Si no hay posición, escanea BTC, ETH, SOL, XRP, BNB, ADA, DOGE, AVAX, LINK, DOT, LTC y BCH cada 90 segundos (configurable).
-- Entra en paper solo si el score llega a 75 y el sesgo semanal acompaña.
+- Vigila una posición abierta cada 20 segundos con el precio en vivo (stop, objetivo y tiempo máximo).
+- Escanea BTC, ETH, SOL, XRP, BNB, ADA, DOGE, AVAX, LINK, DOT, LTC y BCH cada 90 segundos (configurable), también con una posición abierta. Los scores se actualizan, pero no abre una segunda operación.
+- Entra en paper solo si no hay posición, el score llega a 75 y el sesgo semanal acompaña.
+- Cierra a mercado si la posición supera `max_hold_hours` (48 h por defecto; 0 lo desactiva) o si pulsas **Cerrar posición**.
 - Guarda el estado en `/data/state.json` del addon. Un reinicio del complemento no borra el balance ni la operación abierta, y si estaba en marcha se reanuda solo.
 
 ## Ajustes del complemento
@@ -30,5 +31,6 @@ El puerto 8787 no choca con HADomotics (8099).
 | risk_pct | 2 | % del balance arriesgado por operación |
 | leverage | 3 | Se guarda en la operación (el tamaño sale del riesgo y del stop) |
 | initial_balance | 10000 | Balance inicial de paper, solo al resetear |
-| scan_seconds | 90 | Segundos entre escaneos completos |
+| scan_seconds | 90 | Segundos entre escaneos completos (también con posición abierta) |
+| max_hold_hours | 48 | Horas máximas en una posición. 0 desactiva el cierre por tiempo |
 | log_level | info | Log del complemento |
