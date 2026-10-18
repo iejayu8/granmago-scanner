@@ -22,7 +22,7 @@ PAIRS = [
     "DOGE-USDT", "AVAX-USDT", "LINK-USDT", "DOT-USDT", "LTC-USDT", "BCH-USDT",
 ]
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 STATE_FILE = DATA_DIR / "state.json"
 PORT = int(os.environ.get("PORT", "8787"))
@@ -124,6 +124,10 @@ def _apply_runtime_options(settings):
         settings["trailingDistance"] = _sane_float(os.environ.get("TRAILING_DISTANCE"), 0.5)
     else:
         settings["trailingDistance"] = _sane_float(settings.get("trailingDistance", 0.5), 0.5)
+    if _env_set("ENTRY_THRESHOLD"):
+        settings["entryThreshold"] = _sane_threshold(os.environ.get("ENTRY_THRESHOLD"))
+    else:
+        settings["entryThreshold"] = _sane_threshold(settings.get("entryThreshold", 100))
 
 
 def _settings():
@@ -141,6 +145,23 @@ def trailing_activation_pct():
 
 def trailing_distance():
     return _sane_float(_settings().get("trailingDistance", 0.5), 0.5)
+
+
+def _sane_threshold(value, fallback=100):
+    """Integer entry score from 0 to 100. Invalid values use the fallback."""
+    try:
+        num = int(float(value))
+    except (TypeError, ValueError):
+        return int(fallback)
+    if num < 0:
+        return 0
+    if num > 100:
+        return 100
+    return num
+
+
+def entry_threshold():
+    return _sane_threshold(_settings().get("entryThreshold", 100), 100)
 
 
 def _as_price(value):
@@ -332,6 +353,7 @@ def default_state():
             "trailingEnabled": True,
             "trailingActivationPct": 1.0,
             "trailingDistance": 0.5,
+            "entryThreshold": 100,
         },
     }
     _apply_runtime_options(state["settings"])
@@ -491,10 +513,8 @@ def fetch_price(inst_id):
     return None
 
 
-def analyze_pair(pair):
-    c4 = fetch_candles(pair, "4H", 150)
-    c_d = fetch_candles(pair, "1D", 80)
-    c_w = fetch_candles(pair, "1W", 60)
+def score_market(pair, c4, c_d, c_w, threshold):
+    """Score one pair from candles already fetched. None when 4H history is short."""
     if len(c4) < 50:
         return None
     last = c4[-1]
@@ -531,9 +551,18 @@ def analyze_pair(pair):
         "ema50_4": ema50_4,
         "recentLow": recent_low,
         "recentHigh": recent_high,
-        "validLong": score_long >= 70 and bias == "ALCISTA",
-        "validShort": score_short >= 70 and bias == "BAJISTA",
+        "validLong": score_long >= threshold and bias == "ALCISTA",
+        "validShort": score_short >= threshold and bias == "BAJISTA",
     }
+
+
+def analyze_pair(pair, threshold=None):
+    if threshold is None:
+        threshold = entry_threshold()
+    c4 = fetch_candles(pair, "4H", 150)
+    c_d = fetch_candles(pair, "1D", 80)
+    c_w = fetch_candles(pair, "1W", 60)
+    return score_market(pair, c4, c_d, c_w, threshold)
 
 
 def scan_all():
@@ -542,13 +571,14 @@ def scan_all():
     try:
         with LOCK:
             add_log("Escaneo de %d pares..." % len(PAIRS))
+            threshold = entry_threshold()
             save_state()
         results = []
         for pair in PAIRS:
             if STOP.is_set():
                 break
             try:
-                row = analyze_pair(pair)
+                row = analyze_pair(pair, threshold)
             except Exception as exc:
                 log.warning("analyze %s: %s", pair, exc)
                 row = None
@@ -698,12 +728,13 @@ def maybe_open():
             return
         best_l = STATE["bestLong"]
         best_s = STATE["bestShort"]
-        if best_l and best_l["scoreLong"] >= 75:
+        threshold = entry_threshold()
+        if best_l and best_l["scoreLong"] >= threshold:
             open_from_result(best_l, "long")
-        elif best_s and best_s["scoreShort"] >= 75:
+        elif best_s and best_s["scoreShort"] >= threshold:
             open_from_result(best_s, "short")
         else:
-            add_log("Ningún setup alcanza el umbral mínimo (75). Esperando...")
+            add_log("Ningún setup alcanza el umbral de entrada (%d). Esperando..." % threshold)
         opened = STATE["openPosition"] is not None
         save_state()
     if opened:
@@ -934,6 +965,7 @@ def api_close_position():
 def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with LOCK:
+        add_log("Umbral de entrada: %d." % entry_threshold())
         add_log("Trailing: %s." % _trail_label())
         if STATE["running"]:
             add_log("Bot reanudado al arrancar el complemento.")
@@ -941,10 +973,11 @@ def main():
     threading.Thread(target=monitor_loop, name="granmago-monitor", daemon=True).start()
     threading.Thread(target=scan_loop, name="granmago-scan", daemon=True).start()
     log.info(
-        "GranMago Scanner %s on 0.0.0.0:%s data=%s trailing=%s activation_pct=%s distance=%s",
+        "GranMago Scanner %s on 0.0.0.0:%s data=%s entry_threshold=%s trailing=%s activation_pct=%s distance=%s",
         VERSION,
         PORT,
         DATA_DIR,
+        entry_threshold(),
         trailing_enabled(),
         trailing_activation_pct(),
         trailing_distance(),

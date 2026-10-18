@@ -23,3 +23,6 @@ configuration:
   trailing_distance:
     name: Trailing distance
     description: Trail distance as a fraction of the initial risk (entry to the original stop).
+  entry_threshold:
+    name: Entry threshold
+    description: Minimum score required to open a trade. 100 requires a perfect score.

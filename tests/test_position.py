@@ -335,20 +335,41 @@ class PositionTests(unittest.TestCase):
         self.assertEqual(server.STATE["balance"], 950.56)
         self.assertEqual(server.STATE["history"], [])
 
-    def test_maybe_open_still_uses_threshold_when_flat(self):
+    def test_score_can_reach_100(self):
+        perfect_long = server.score_setup("ALCISTA", True, True, True, 50, "long")
+        perfect_short = server.score_setup("BAJISTA", True, True, True, 55, "short")
+        self.assertEqual(perfect_long, 100)
+        self.assertEqual(perfect_short, 100)
+        # The extra 5 is capped. The four main conditions already sum to 100.
+        self.assertEqual(server.score_setup("ALCISTA", True, True, True, 70, "long"), 100)
+        self.assertEqual(server.score_setup("BAJISTA", True, True, True, 30, "short"), 100)
+        self.assertLess(server.score_setup("ALCISTA", False, True, True, 50, "long"), 100)
+        self.assertLess(server.score_setup("NEUTRAL", True, True, True, 50, "long"), 100)
+        self.assertLess(server.score_setup("BAJISTA", True, False, True, 55, "short"), 100)
+        self.assertLess(server.score_setup("BAJISTA", True, True, False, 55, "short"), 100)
+
+    def test_maybe_open_requires_score_100(self):
+        self.assertEqual(server.entry_threshold(), 100)
         server.STATE["openPosition"] = None
         server.STATE["bestLong"] = {
             "pair": "ETH-USDT",
             "price": 100.0,
-            "scoreLong": 74,
+            "scoreLong": 95,
             "recentLow": 98.0,
             "scoreShort": 0,
         }
-        server.STATE["bestShort"] = None
+        server.STATE["bestShort"] = {
+            "pair": "SOL-USDT",
+            "price": 100.0,
+            "scoreShort": 99,
+            "recentHigh": 102.0,
+            "scoreLong": 0,
+        }
         server.maybe_open()
         self.assertIsNone(server.STATE["openPosition"])
 
-        server.STATE["bestLong"]["scoreLong"] = 75
+        server.STATE["bestShort"] = None
+        server.STATE["bestLong"]["scoreLong"] = 100
         server.maybe_open()
         opened = server.STATE["openPosition"]
         self.assertEqual(opened["pair"], "ETH-USDT")
@@ -358,6 +379,27 @@ class PositionTests(unittest.TestCase):
         self.assertFalse(opened["trailingActive"])
         self.assertEqual(opened["bestPrice"], opened["entry"])
         self.assertEqual(server.STATE["balance"], 950.56)
+
+    def test_entry_threshold_option_is_respected(self):
+        server.STATE["settings"]["entryThreshold"] = 90
+        self.assertEqual(server.entry_threshold(), 90)
+        server.STATE["openPosition"] = None
+        server.STATE["bestLong"] = {
+            "pair": "ETH-USDT",
+            "price": 100.0,
+            "scoreLong": 89,
+            "recentLow": 98.0,
+            "scoreShort": 0,
+        }
+        server.STATE["bestShort"] = None
+        server.maybe_open()
+        self.assertIsNone(server.STATE["openPosition"])
+        server.STATE["bestLong"]["scoreLong"] = 90
+        server.maybe_open()
+        self.assertEqual(server.STATE["openPosition"]["pair"], "ETH-USDT")
+        self.assertEqual(server._sane_threshold(150), 100)
+        self.assertEqual(server._sane_threshold(-4), 0)
+        self.assertEqual(server._sane_threshold("nope"), 100)
 
     def test_next_actions_scan_while_position_open(self):
         self.assertEqual(server.next_actions(True, True), {"scan": True, "monitor": True})
@@ -425,6 +467,7 @@ class PositionTests(unittest.TestCase):
         self.assertTrue(loaded["settings"]["trailingEnabled"])
         self.assertEqual(loaded["settings"]["trailingActivationPct"], 1.0)
         self.assertEqual(loaded["settings"]["trailingDistance"], 0.5)
+        self.assertEqual(loaded["settings"]["entryThreshold"], 100)
 
     def test_trailing_option_from_env_overrides_saved_settings(self):
         os.environ["TRAILING_ENABLED"] = "false"

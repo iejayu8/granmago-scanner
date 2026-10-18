@@ -23,3 +23,6 @@ configuration:
   trailing_distance:
     name: Distancia del trailing
     description: Distancia del trailing como fracción del riesgo inicial (entrada al stop original).
+  entry_threshold:
+    name: Umbral de entrada
+    description: Puntuación mínima para abrir una operación. 100 exige el score máximo.
