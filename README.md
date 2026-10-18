@@ -18,11 +18,12 @@ El puerto 8787 no choca con HADomotics (8099).
 
 ## Qué hace
 
-- Vigila una posición abierta cada 20 segundos con el precio en vivo (stop, objetivo y tiempo máximo).
+- Vigila una posición abierta cada 20 segundos con el precio en vivo (stop, objetivo y, si toca, trailing).
 - Escanea BTC, ETH, SOL, XRP, BNB, ADA, DOGE, AVAX, LINK, DOT, LTC y BCH cada 90 segundos (configurable), también con una posición abierta. Los scores se actualizan, pero no abre una segunda operación.
 - Entra en paper solo si no hay posición, el score llega a 75 y el sesgo semanal acompaña.
-- Cierra a mercado si la posición supera `max_hold_hours` (48 h por defecto; 0 lo desactiva) o si pulsas **Cerrar posición**.
-- Guarda el estado en `/data/state.json` del addon. Un reinicio del complemento no borra el balance ni la operación abierta, y si estaba en marcha se reanuda solo.
+- Con el trailing activo (por defecto), cuando el beneficio no realizado llega al 1% del nocional se quitan el TP y el SL iniciales. A partir de ahí solo cierra el trailing, que se aprieta desde el mejor precio y no deja acabar en pérdida, o **Cerrar posición**.
+- Con `trailing_enabled` en false el stop y el objetivo siguen fijos, como en 1.0.0.
+- Guarda el estado en `/data/state.json` del addon. Un reinicio del complemento no borra el balance ni la operación abierta, y si estaba en marcha se reanuda solo. Una posición guardada sin campos de trailing se rellena y sigue abierta.
 
 ## Ajustes del complemento
 
@@ -32,5 +33,7 @@ El puerto 8787 no choca con HADomotics (8099).
 | leverage | 3 | Se guarda en la operación (el tamaño sale del riesgo y del stop) |
 | initial_balance | 10000 | Balance inicial de paper, solo al resetear |
 | scan_seconds | 90 | Segundos entre escaneos completos (también con posición abierta) |
-| max_hold_hours | 48 | Horas máximas en una posición. 0 desactiva el cierre por tiempo |
+| trailing_enabled | true | Trailing stop. En false, el SL y el TP no se mueven |
+| trailing_activation_pct | 1.0 | % del nocional de beneficio para armar el trailing |
+| trailing_distance | 0.5 | Fracción del riesgo inicial (|entrada − SL inicial|) que se deja desde el mejor precio |
 | log_level | info | Log del complemento |

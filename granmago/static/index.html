@@ -38,6 +38,8 @@
   th, td { padding: 8px 6px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
   th { color: var(--muted); font-weight: 500; }
   .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .trail-badge { display: inline-block; margin-left: 6px; background: #1f6feb; color: white; border-radius: 999px; padding: 2px 8px; font-size: 0.68rem; font-weight: 600; vertical-align: middle; }
+  s { color: var(--muted); }
   .score-high { color: var(--green); font-weight: 600; }
   .score-mid { color: var(--orange); }
   .score-low { color: var(--muted); }
@@ -156,7 +158,7 @@
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Par</th><th>Lado</th><th>Entrada</th><th>Precio</th><th>SL</th><th>TP</th><th>PnL</th></tr></thead>
+          <thead><tr><th>Par</th><th>Lado</th><th>Entrada</th><th>Precio</th><th>SL</th><th>TP</th><th>Mejor</th><th>PnL</th></tr></thead>
           <tbody id="openTrades"></tbody>
         </table>
       </div>
@@ -204,7 +206,7 @@ let closeBusy = false;
 
 function motivo(reason) {
   if (reason === "manual") return "Manual";
-  if (reason === "timeout") return "Tiempo máximo";
+  if (reason === "trailing") return "Trailing";
   return reason == null ? "-" : String(reason);
 }
 ["riskPct", "leverage", "initBalance"].forEach((id) => {
@@ -275,11 +277,18 @@ function render(s) {
   $("closeRow").style.display = p ? "block" : "none";
   $("btnClose").disabled = closeBusy || !p;
   $("btnClose").dataset.pair = p ? p.pair.replace("-USDT", "") : "";
+  const trailOn = !!(p && p.trailingActive);
+  const tpValue = p ? (p.initialTp != null ? p.initialTp : p.tp) : null;
+  const slCell = !p ? "" : (trailOn
+    ? `${fmt(p.sl)} <span class="trail-badge">Trailing activo</span>`
+    : fmt(p.sl));
+  const tpCell = !p ? "" : (trailOn ? `<s>${fmt(tpValue)}</s>` : fmt(p.tp));
   $("openTrades").innerHTML = p ? `<tr>
-    <td>${p.pair.replace("-USDT", "")}</td><td>${String(p.side).toUpperCase()}</td>
-    <td>${fmt(p.entry)}</td><td>${fmt(p.price)}</td><td>${fmt(p.sl)}</td><td>${fmt(p.tp)}</td>
+    <td>${esc(p.pair.replace("-USDT", ""))}</td><td>${esc(String(p.side).toUpperCase())}</td>
+    <td>${fmt(p.entry)}</td><td>${fmt(p.price)}</td><td>${slCell}</td><td>${tpCell}</td>
+    <td>${fmt(p.bestPrice)}</td>
     <td class="${(p.unrealized || 0) >= 0 ? "positive" : "negative"}">${(+p.unrealized || 0).toFixed(2)}</td>
-  </tr>` : '<tr><td colspan="7" style="color:var(--muted)">Sin posición</td></tr>';
+  </tr>` : '<tr><td colspan="8" style="color:var(--muted)">Sin posición</td></tr>';
 
   $("historyTrades").innerHTML = hist.slice(0, 30).map((t) => `
     <tr>

@@ -14,6 +14,12 @@ configuration:
   scan_seconds:
     name: Segundos entre escaneos
     description: Intervalo del escaneo completo. Con una posición abierta el precio se mira cada 20 segundos y el escaneo sigue.
-  max_hold_hours:
-    name: Horas máximas en posición
-    description: Cierra la posición de paper a mercado pasadas estas horas. 0 desactiva el límite.
+  trailing_enabled:
+    name: Trailing stop
+    description: Si está activo, una operación en beneficio pasa del stop y el objetivo fijos a un stop dinámico.
+  trailing_activation_pct:
+    name: Activación del trailing %
+    description: Beneficio no realizado, en porcentaje del nocional, para que el trailing tome el control.
+  trailing_distance:
+    name: Distancia del trailing
+    description: Distancia del trailing como fracción del riesgo inicial (entrada al stop original).

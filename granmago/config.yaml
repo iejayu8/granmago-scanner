@@ -24,11 +24,15 @@ options:
   leverage: 3
   initial_balance: 10000
   scan_seconds: 90
-  max_hold_hours: 48
+  trailing_enabled: true
+  trailing_activation_pct: 1.0
+  trailing_distance: 0.5
 schema:
   log_level: list(trace|debug|info|notice|warning|error|fatal)
   risk_pct: float
   leverage: int
   initial_balance: int
   scan_seconds: int
-  max_hold_hours: int
+  trailing_enabled: bool
+  trailing_activation_pct: float
+  trailing_distance: float
