@@ -38,5 +38,11 @@ export GRANMAGO_MIN_RR="$(bashio::config 'granmago_min_rr')"
 export GRANMAGO_STOP_PAD_PCT="$(bashio::config 'granmago_stop_pad_pct')"
 export GRANMAGO_STYLE="$(bashio::config 'granmago_style')"
 export GRANMAGO_SETUPS="$(bashio::config 'granmago_setups')"
+# JSON array from the add-on option. server.py also accepts a comma-separated list.
+# A missing key (an options file from before this option existed) leaves the
+# original 12 pairs in place.
+if bashio::config.exists 'pairs'; then
+  export PAIRS="$(bashio::config 'pairs')"
+fi
 
 exec python -u /app/server.py

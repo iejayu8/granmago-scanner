@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -20,10 +21,22 @@ import granmago_strategy
 import requests
 from flask import Flask, jsonify, request
 
-PAIRS = [
+# The 12-pair book shipped since 1.0.0. An empty or invalid pairs option
+# falls back to this list, so an upgrade does not start scanning new coins.
+DEFAULT_PAIRS = [
     "BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "BNB-USDT", "ADA-USDT",
     "DOGE-USDT", "AVAX-USDT", "LINK-USDT", "DOT-USDT", "LTC-USDT", "BCH-USDT",
 ]
+# Liquid USDT swaps used in the 1.5.0 walk-forward, frozen from 24h quote
+# volume on 23 Oct 2026 and listed on or before 23 Oct 2024. Not the default.
+LIQUID_PAIRS = DEFAULT_PAIRS + [
+    "ZEC-USDT", "PEPE-USDT", "1000BONK-USDT", "NEAR-USDT", "XMR-USDT",
+    "INJ-USDT", "SUI-USDT", "TAO-USDT", "IOST-USDT", "XLM-USDT",
+    "TRX-USDT", "HBAR-USDT", "ENA-USDT", "WLD-USDT", "AAVE-USDT", "QNT-USDT",
+]
+PAIRS = list(DEFAULT_PAIRS)
+_PAIR_RE = re.compile(r"^[A-Z0-9]+-USDT$")
+MAX_CONFIGURED_PAIRS = 40
 
 VERSION = "1.5.0"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
@@ -124,6 +137,51 @@ def _sane_float(value, fallback):
     return num
 
 
+def _pair_items(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    text = str(value).strip()
+    if not text or text.lower() in ("null", "none"):
+        return []
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            return parsed
+    return [part for part in re.split(r"[\s,]+", text) if part]
+
+
+def parse_pairs(value, fallback=None):
+    """USDT-swap symbols, uppercased, de-duplicated, capped.
+
+    An empty or fully invalid value uses the 12-pair default. That is what
+    an upgrade with no pairs option, and a blank option, both do.
+    """
+    if fallback is None:
+        fallback = list(DEFAULT_PAIRS)
+    out = []
+    seen = set()
+    for item in _pair_items(value):
+        text = str(item or "").strip().upper()
+        if not text or text in seen or _PAIR_RE.match(text) is None:
+            continue
+        seen.add(text)
+        out.append(text)
+        if len(out) >= MAX_CONFIGURED_PAIRS:
+            break
+    return out or list(fallback)
+
+
+def active_pairs():
+    """Pairs the scanner walks. Open positions outside this list stay monitored."""
+    settings = _settings()
+    return parse_pairs(settings.get("pairs"), DEFAULT_PAIRS)
+
+
 def _apply_runtime_options(settings):
     """Apply add-on options. A leftover max-hold field is ignored.
 
@@ -198,6 +256,10 @@ def _apply_runtime_options(settings):
         settings["granmagoSetups"] = granmago_strategy._setups_name(os.environ.get("GRANMAGO_SETUPS"))
     else:
         settings["granmagoSetups"] = granmago_strategy._setups_name(settings.get("granmagoSetups", "both"))
+    if _env_set("PAIRS"):
+        settings["pairs"] = parse_pairs(os.environ.get("PAIRS"))
+    else:
+        settings["pairs"] = parse_pairs(settings.get("pairs"), DEFAULT_PAIRS)
 
 
 def _option_bool(settings, env_name, key, default):
@@ -769,6 +831,7 @@ def default_state():
             "granmagoStopPadPct": 0.3,
             "granmagoStyle": "strict",
             "granmagoSetups": "both",
+            "pairs": list(DEFAULT_PAIRS),
         },
     }
     _apply_runtime_options(state["settings"])
@@ -1303,11 +1366,12 @@ def scan_all():
         return None
     try:
         with LOCK:
-            add_log("Escaneo de %d pares..." % len(PAIRS))
+            pairs = active_pairs()
+            add_log("Escaneo de %d pares..." % len(pairs))
             threshold = entry_threshold()
             save_state()
         results = []
-        for pair in PAIRS:
+        for pair in pairs:
             if STOP.is_set():
                 break
             try:
@@ -2333,6 +2397,10 @@ def main():
     with LOCK:
         add_log("Umbral de entrada: %d." % entry_threshold())
         add_log("Máximo de posiciones: %d (una por moneda)." % max_positions())
+        add_log("Universo: %d pares (%s)." % (
+            len(active_pairs()),
+            ", ".join(p.replace("-USDT", "") for p in active_pairs()),
+        ))
         add_log(
             "Riesgo %.2f%%, apalancamiento %d (opciones del complemento; pisan el estado al arrancar)."
             % (float(STATE["settings"].get("riskPct") or 0), _leverage())

@@ -107,3 +107,6 @@ configuration:
   granmago_setups:
     name: Gran Mago setups
     description: both takes sweeps and pullbacks. sweep takes only the sweep. pullback takes only the pullback.
+  pairs:
+    name: Pairs
+    description: USDT swaps to scan, one symbol per entry (for example BTC-USDT). The default is the original 12. Leave it unchanged on upgrade. The 28-pair liquid book from the 1.5.0 study is listed in the README. At most 40 symbols are used. An open position on a pair you remove stays monitored until it closes.

@@ -107,3 +107,6 @@ configuration:
   granmago_setups:
     name: Setups Gran Mago
     description: both toma barridos y retrocesos. sweep solo el barrido. pullback solo el retroceso.
+  pairs:
+    name: Pares
+    description: Swaps USDT que se escanean, un símbolo por línea (por ejemplo BTC-USDT). El defecto son los 12 de siempre. No lo cambies al actualizar. Los 28 pares líquidos del estudio de 1.5.0 están en el README. Se usan como máximo 40. Una posición abierta en un par que quites se sigue vigilando hasta que cierre.

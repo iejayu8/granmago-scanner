@@ -19,7 +19,7 @@ El puerto 8787 no choca con HADomotics (8099).
 ## Qué hace
 
 - Vigila cada posición abierta cada 20 segundos con el precio en vivo. El stop, el objetivo y el trailing de una moneda no mueven los de otra.
-- Escanea BTC, ETH, SOL, XRP, BNB, ADA, DOGE, AVAX, LINK, DOT, LTC y BCH cada 90 segundos (configurable), también con posiciones abiertas.
+- Escanea los pares de la opción `pairs` cada 90 segundos (configurable), también con posiciones abiertas. El defecto sigue siendo BTC, ETH, SOL, XRP, BNB, ADA, DOGE, AVAX, LINK, DOT, LTC y BCH.
 - En cada escaneo automático abre las monedas que llegan al umbral (100 por defecto) y aún no tienen posición, la de mejor score primero, hasta `max_positions` (5 por defecto). Varias pueden abrirse en el mismo escaneo. Nunca dos veces el mismo par, ni en el sentido contrario.
 - Un escaneo manual actualiza el ranking y no abre operaciones.
 - Con el trailing activo (por defecto), cuando el beneficio no realizado de **esa** posición llega al 1% de su nocional se quitan su TP y su SL iniciales. A partir de ahí solo la cierra su trailing, que se aprieta desde su mejor precio y no deja acabar en pérdida, o su botón **Cerrar**. `trailing_activation_r` por encima de 0 cambia esa activación a un múltiplo del riesgo inicial. `trailing_keep_tp` deja el objetivo puesto.
@@ -73,6 +73,7 @@ Por eso una **entrada nueva** se reduce al hueco que quede, o no se abre, cuando
 | granmago_stop_pad_pct | 0.3 | Margen mínimo del stop más allá de la mecha, en % del precio |
 | granmago_style | strict | `strict` (filtros originales) o `sweep` (barrido relajado) |
 | granmago_setups | both | `both`, `sweep` (solo setup A) o `pullback` (solo setup B) |
+| pairs | los 12 de siempre | Swaps USDT a escanear. Vacío o inválido vuelve a esos 12. Máximo 40 |
 | log_level | info | Log del complemento |
 
 ## Riesgo, apalancamiento y el estado guardado
@@ -106,6 +107,8 @@ El estocástico es 14, 3, 3 y solo veta: no hay largo con %K por encima de 80 ni
 El stop es un stop de precio más allá de la mecha barrida, a `max(0,5 × ATR de 14 velas de 4H, granmago_stop_pad_pct % del precio)`. Si un imbalance sin rellenar o una mecha grande atraviesa ese margen, el stop pasa al otro lado del hueco. Por encima del 8 % del precio la operación no se abre. En X la invalidación a veces es el cierre de 12H al otro lado de la mecha: aquí ese cierre solo impide promediar; la posición espera el stop de precio, porque el bot vigila cada tick. El objetivo es el clúster del swing diario anterior en la dirección del beneficio, un 0,1 % por dentro del extremo. No hay objetivo en R. `granmago_min_rr` en 0 no descarta un stop más ancho que el objetivo. Sus propias cifras (77 % de aciertos y profit factor 1,38) implican un beneficio medio de unas 0,4 veces la pérdida media, así que el filtro de 1,5 del apunte del curso queda apagado a propósito.
 
 No hay trailing en este modo. `granmago_momentum_exit` cierra cuando el estocástico está agotado y el histograma del squeeze pierde fuerza. A las `granmago_max_hold_bars` velas de confirmación (15 por defecto) se cierra por tiempo. `granmago_breakeven_r` en 0 no mueve el stop: él lo mencionó y no llegó a explicarlo.
+
+`pairs` es la lista que recorre el escaneo. El defecto, y lo que hace una actualización si no se toca la opción, son los 12 pares de arriba. Los 28 del walk-forward largo son esos 12 más ZEC, PEPE, 1000BONK, NEAR, XMR, INJ, SUI, TAO, IOST, XLM, TRX, HBAR, ENA, WLD, AAVE y QNT. No es el defecto. Un símbolo que no sea `BASE-USDT` se ignora. Si no queda ninguno válido se usan los 12. El tope es 40. `max_positions` sigue siendo el número de huecos (de 1 a 12), no el tamaño del universo. Quitar un par de la lista no cierra una posición que ya esté abierta: el bucle de 20 segundos la sigue vigilando.
 
 `granmago_style: sweep` cambia el setup A. El nivel barrido es el más extremo entre un pivote de cierre diario de los últimos 20 días (sigue siendo 5 y 5), un pivote de cierre de 4H de los últimos 30 bars de 4H, y el máximo o mínimo del día anterior. La confirmación es el cierre de vuelta al otro lado de ese precio, en las mismas velas de la variante. Una vela que no recupera el nivel cancela el barrido; no se espera a una vela posterior. La tendencia es el último cierre diario contra la EMA50, sin semanal y sin las dos velas de histéresis. El estocástico deja de vetar y pasa a confirmar: el largo necesita un cruce de %K por encima de 20 entre el barrido y la señal, y el corto un cruce por debajo de 80. El squeeze y el ADX se guardan en la señal (`sqzOk`, `adxOk`) y no impiden la entrada. El stop, el objetivo y el tope del 8 % no cambian. `granmago_setups: sweep` deja fuera el retroceso; `pullback` deja fuera el barrido. El defecto del complemento sigue siendo `strict` y `both`.
 

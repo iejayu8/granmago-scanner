@@ -44,14 +44,10 @@ FETCH_START = datetime(2023, 1, 12, 0, 0, tzinfo=backtest.timezone.utc)
 FOLD_START = datetime(2024, 1, 22, 0, 0, tzinfo=MADRID)
 FOLD_DAYS = 45
 
-# Frozen before this run. See the module docstring.
-EXTRA_PAIRS = [
-    "ZEC-USDT", "PEPE-USDT", "1000BONK-USDT", "NEAR-USDT", "XMR-USDT",
-    "INJ-USDT", "SUI-USDT", "TAO-USDT", "IOST-USDT", "XLM-USDT",
-    "TRX-USDT", "HBAR-USDT", "ENA-USDT", "WLD-USDT", "AAVE-USDT", "QNT-USDT",
-]
-CORE = list(server.PAIRS)
-EXTENDED = CORE + EXTRA_PAIRS
+# Frozen before this run. The same list now lives on the add-on as the
+# documented liquid book (server.LIQUID_PAIRS). It is not the live default.
+CORE = list(server.DEFAULT_PAIRS)
+EXTENDED = list(server.LIQUID_PAIRS)
 
 # name, kind, variant, setups, max_adds. Fixed before the run.
 RUNS = [

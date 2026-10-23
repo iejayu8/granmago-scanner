@@ -12,6 +12,7 @@
 - Promedios opcionales (`granmago_max_adds`, 0, 1 o 2) solo al tocar el extremo barrido y antes del stop. La primera entrada reserva el riesgo de los añadidos. Un cierre de confirmación al otro lado del extremo no añade más.
 - El riesgo por defecto sigue en 2 % y el apalancamiento en 3, que es lo que él publica para esta estrategia. No hay filtro de noticias: el curso y X se contradicen y aquí no hay calendario.
 - `granmago_style: sweep` relaja el setup A para que el barrido sea la entrada. El nivel puede ser un pivote diario de los últimos 20 días, un pivote de 4H de los últimos 30 bars o el máximo/mínimo del día anterior; si se barren varios, se usa el más extremo. El cierre tiene que volver al otro lado de ese precio en las velas de confirmación, y si una vela no lo recupera el barrido se cancela. La tendencia es solo el último cierre diario contra la EMA50. El estocástico confirma con un cruce fuera de 20 (largo) u 80 (corto) en vez de vetar. El squeeze y el ADX se anotan y no bloquean. `granmago_setups` elige `both`, `sweep` o `pullback`. El defecto sigue siendo `strict` y `both`.
+- `pairs` elige qué swaps USDT se escanean. El defecto sigue siendo BTC, ETH, SOL, XRP, BNB, ADA, DOGE, AVAX, LINK, DOT, LTC y BCH. El README lista los 28 pares líquidos del walk-forward (esos 12 más ZEC, PEPE, 1000BONK, NEAR, XMR, INJ, SUI, TAO, IOST, XLM, TRX, HBAR, ENA, WLD, AAVE y QNT). Una lista vacía o inválida vuelve a los 12. Como máximo 40 símbolos. Una posición ya abierta fuera de la lista se sigue vigilando.
 
 ## 1.4.0
 

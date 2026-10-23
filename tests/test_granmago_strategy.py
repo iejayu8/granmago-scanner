@@ -1,5 +1,6 @@
 """Course strategy: structure, vetoes, and paper fills. Scanner behaviour stays covered elsewhere."""
 
+import json
 import os
 import sys
 import tempfile
@@ -377,6 +378,48 @@ class GranmagoPaperTest(unittest.TestCase):
         server.STATE["settings"]["granmagoStyle"] = "strict"
         server.STATE["settings"]["granmagoSetups"] = "both"
         server._apply_runtime_options(server.STATE["settings"])
+
+    def test_pairs_option_defaults_to_the_original_twelve(self):
+        os.environ.pop("PAIRS", None)
+        os.environ.pop("STRATEGY", None)
+        os.environ.pop("GRANMAGO_STYLE", None)
+        os.environ.pop("FEE_PCT_PER_SIDE", None)
+        os.environ.pop("SLIPPAGE_PCT_PER_SIDE", None)
+        server.STATE["settings"].pop("pairs", None)
+        server.STATE["settings"]["strategy"] = "scanner"
+        server.STATE["settings"]["granmagoStyle"] = "strict"
+        server.STATE["settings"]["feePctPerSide"] = 0
+        server.STATE["settings"]["slippagePctPerSide"] = 0
+        server._apply_runtime_options(server.STATE["settings"])
+        self.assertEqual(server.active_pairs(), server.DEFAULT_PAIRS)
+        self.assertEqual(len(server.LIQUID_PAIRS), 28)
+        self.assertEqual(server.LIQUID_PAIRS[:12], server.DEFAULT_PAIRS)
+        self.assertEqual(server.strategy_mode(), "scanner")
+        self.assertEqual(server.granmago_style(), "strict")
+        self.assertEqual(server.fee_pct_per_side(), 0)
+        self.assertEqual(server.slippage_pct_per_side(), 0)
+        os.environ["PAIRS"] = json.dumps(server.LIQUID_PAIRS + ["btc-usdt", "NOT-A-PAIR", ""])
+        try:
+            server._apply_runtime_options(server.STATE["settings"])
+            self.assertEqual(server.active_pairs(), server.LIQUID_PAIRS)
+            self.assertEqual(server.strategy_mode(), "scanner")
+        finally:
+            os.environ.pop("PAIRS", None)
+        os.environ["PAIRS"] = "ETH-USDT, eth-usdt, SOL-USDT"
+        try:
+            server._apply_runtime_options(server.STATE["settings"])
+            self.assertEqual(server.active_pairs(), ["ETH-USDT", "SOL-USDT"])
+        finally:
+            os.environ.pop("PAIRS", None)
+        os.environ["PAIRS"] = "nope, ???"
+        try:
+            server._apply_runtime_options(server.STATE["settings"])
+            self.assertEqual(server.active_pairs(), server.DEFAULT_PAIRS)
+        finally:
+            os.environ.pop("PAIRS", None)
+        server.STATE["settings"].pop("pairs", None)
+        server._apply_runtime_options(server.STATE["settings"])
+        self.assertEqual(server.active_pairs(), server.DEFAULT_PAIRS)
 
     def test_first_entry_reserves_the_add_and_a_runner_does_not_trail(self):
         self.assertTrue(server.open_granmago(self._signal()))

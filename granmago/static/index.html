@@ -282,14 +282,18 @@ function render(s) {
       ? +s.settings.granmagoMaxAdds : 0;
     const style = String((s.settings && s.settings.granmagoStyle) || "strict");
     const setups = String((s.settings && s.settings.granmagoSetups) || "both");
+    const pairN = (s.settings && Array.isArray(s.settings.pairs) && s.settings.pairs.length)
+      ? s.settings.pairs.length : 12;
     $("entryRule").textContent = "Modo Gran Mago, variante " + variant
       + ", estilo " + style
       + (setups === "sweep" ? ", solo barridos" : setups === "pullback" ? ", solo retrocesos" : "")
       + (adds ? (", hasta " + adds + " promedios") : ", sin promediar")
-      + ". El score se muestra y no abre operaciones.";
+      + ". Escanea " + pairN + " pares. El score se muestra y no abre operaciones.";
   } else {
+    const pairN = (s.settings && Array.isArray(s.settings.pairs) && s.settings.pairs.length)
+      ? s.settings.pairs.length : 12;
     $("entryRule").textContent = "Umbral de entrada: " + entryThreshold
-      + ". Abre hasta " + maxPos + " monedas distintas, el mejor score primero.";
+      + ". Escanea " + pairN + " pares y abre hasta " + maxPos + " monedas distintas, el mejor score primero.";
   }
 
   const rows = s.lastScan || [];
