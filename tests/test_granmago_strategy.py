@@ -484,6 +484,177 @@ class GranmagoPaperTest(unittest.TestCase):
         self.assertEqual(server.STATE["history"][0]["reason"], "TP")
         self.assertGreater(server.STATE["history"][0]["pnl"], 0)
 
+    def test_new_exit_options_stay_off_unless_set(self):
+        self.assertEqual(server.granmago_target(), "swing")
+        self.assertEqual(server.granmago_trail_activate_r(), 0)
+        self.assertEqual(server.strategy_mode(), "granmago")
+        keys = (
+            "STRATEGY", "GRANMAGO_TARGET", "GRANMAGO_TRAIL_ACTIVATE_R",
+            "GRANMAGO_TRAIL_DISTANCE_R", "TREND_EMA_PERIOD", "TREND_ATR_MULT",
+        )
+        for key in keys:
+            os.environ.pop(key, None)
+        server.STATE["settings"]["strategy"] = "scanner"
+        server._apply_runtime_options(server.STATE["settings"])
+        self.assertEqual(server.strategy_mode(), "scanner")
+        self.assertEqual(server.granmago_target(), "swing")
+        self.assertEqual(server.granmago_trail_activate_r(), 0.0)
+        self.assertEqual(server.trend_ema_period(), 50)
+        self.assertEqual(server.trend_atr_mult(), 2.5)
+        os.environ["STRATEGY"] = "trend"
+        os.environ["GRANMAGO_TARGET"] = "NONE"
+        os.environ["GRANMAGO_TRAIL_ACTIVATE_R"] = "1"
+        os.environ["GRANMAGO_TRAIL_DISTANCE_R"] = "1"
+        os.environ["TREND_EMA_PERIOD"] = "40"
+        os.environ["TREND_ATR_MULT"] = "2.5"
+        try:
+            server._apply_runtime_options(server.STATE["settings"])
+            self.assertEqual(server.strategy_mode(), "trend")
+            self.assertEqual(server.granmago_target(), "none")
+            self.assertEqual(server.granmago_trail_activate_r(), 1.0)
+            self.assertEqual(server.trend_ema_period(), 40)
+        finally:
+            for key in keys:
+                os.environ.pop(key, None)
+        os.environ["STRATEGY"] = "not-a-mode"
+        try:
+            server._apply_runtime_options(server.STATE["settings"])
+            self.assertEqual(server.strategy_mode(), "scanner")
+        finally:
+            os.environ.pop("STRATEGY", None)
+
+    def test_course_trail_arms_at_one_r_and_does_not_use_the_scanner_floor(self):
+        server.STATE["settings"]["granmagoMaxAdds"] = 0
+        server.STATE["settings"]["granmagoTarget"] = "none"
+        server.STATE["settings"]["granmagoTrailActivateR"] = 1
+        server.STATE["settings"]["granmagoTrailDistanceR"] = 1
+        signal = self._signal()
+        signal["tp"] = 140.0
+        self.assertTrue(server.open_granmago(signal))
+        pos = server._find_position("BTC-USDT")
+        self.assertIsNone(pos["tp"])
+        self.assertFalse(pos["granmagoTrail"])
+        server._apply_mark(pos, 103.0)
+        pos = server._find_position("BTC-USDT")
+        self.assertFalse(pos["granmagoTrail"])
+        self.assertAlmostEqual(pos["sl"], 94.0)
+        self.assertIsNone(server._apply_mark(pos, 112.0))
+        pos = server._find_position("BTC-USDT")
+        self.assertTrue(pos["granmagoTrail"])
+        self.assertAlmostEqual(pos["sl"], 106.0)
+        reason = server._apply_mark(pos, 106.0)
+        self.assertEqual(reason, "trailing")
+        self.assertEqual(server.STATE["history"][0]["reason"], "trailing")
+
+    def test_removed_target_does_not_close_at_the_old_swing(self):
+        server.STATE["settings"]["granmagoMaxAdds"] = 0
+        server.STATE["settings"]["granmagoTarget"] = "none"
+        self.assertTrue(server.open_granmago(self._signal()))
+        pos = server._find_position("BTC-USDT")
+        self.assertIsNone(server._apply_mark(pos, 110.0))
+        self.assertIsNotNone(server._find_position("BTC-USDT"))
+
+    def test_trend_chandelier_tightens_and_a_flip_can_reverse(self):
+        server.STATE["settings"]["strategy"] = "trend"
+        server.STATE["settings"]["maxPositions"] = 1
+        server.STATE["trendSeen"] = {}
+        self.assertTrue(server.open_trend({
+            "pair": "BTC-USDT",
+            "side": "long",
+            "price": 100.0,
+            "sl": 94.0,
+            "closeMs": 1000,
+            "strength": 0.02,
+        }))
+        pos = server._find_position("BTC-USDT")
+        self.assertEqual(pos["strategy"], "trend")
+        self.assertIsNone(pos["tp"])
+        self.assertIsNone(server._apply_mark(pos, 110.0))
+        pos = server._find_position("BTC-USDT")
+        self.assertAlmostEqual(pos["sl"], 104.0)
+        self.assertIsNone(server._apply_mark(pos, 105.0))
+        pos = server._find_position("BTC-USDT")
+        self.assertAlmostEqual(pos["sl"], 104.0)
+        server._close_trend_flips([{
+            "pair": "BTC-USDT",
+            "trend": {"side": "short", "price": 95.0, "closeMs": 2000, "sl": 105.0, "strength": 0.03},
+        }])
+        self.assertEqual(server.STATE["history"][0]["reason"], "flip")
+        self.assertIsNone(server._find_position("BTC-USDT"))
+        server.STATE["lastScan"] = [
+            {"pair": "BTC-USDT", "trend": {"side": "long", "price": 100.0, "sl": 90.0, "strength": 0.01, "closeMs": 2000}},
+            {"pair": "ETH-USDT", "trend": {"side": "short", "price": 50.0, "sl": 53.0, "strength": 0.08, "closeMs": 2000}},
+        ]
+        server.maybe_open()
+        self.assertEqual(len(server.STATE["openPositions"]), 1)
+        self.assertEqual(server.STATE["openPositions"][0]["pair"], "ETH-USDT")
+        server.STATE["settings"]["maxPositions"] = 2
+        server.maybe_open()
+        self.assertEqual(len(server.STATE["openPositions"]), 1)
+
+    def test_a_full_trend_book_does_not_fill_the_same_bar_later(self):
+        server.STATE["settings"]["strategy"] = "trend"
+        server.STATE["settings"]["maxPositions"] = 1
+        server.STATE["trendSeen"] = {}
+        server.STATE["openPositions"] = [{
+            "pair": "SOL-USDT",
+            "side": "long",
+            "strategy": "trend",
+            "entry": 100.0,
+            "sl": 94.0,
+            "notional": 10.0,
+        }]
+        server.STATE["lastScan"] = [
+            {"pair": "ETH-USDT", "trend": {"side": "long", "price": 100.0, "sl": 94.0, "strength": 0.2, "closeMs": 50}},
+        ]
+        server.maybe_open()
+        self.assertEqual(server.STATE["trendSeen"].get("ETH-USDT"), 50)
+        server.STATE["openPositions"] = []
+        server.maybe_open()
+        self.assertEqual(server.STATE["openPositions"], [])
+
+    def test_trend_refuses_a_stop_wider_than_eight_percent(self):
+        server.STATE["settings"]["strategy"] = "trend"
+        self.assertFalse(server.open_trend({
+            "pair": "BTC-USDT",
+            "side": "long",
+            "price": 100.0,
+            "sl": 80.0,
+            "closeMs": 1000,
+        }))
+        self.assertEqual(server.STATE["openPositions"], [])
+
+
+class EmaTrendBarTest(unittest.TestCase):
+    def _candles(self, n=30, step=1.0):
+        rows = []
+        for i in range(n):
+            price = 100.0 + step * i
+            rows.append({
+                "ts": i * H4,
+                "o": price,
+                "h": price + 0.4,
+                "l": price - 0.4,
+                "c": price,
+            })
+        return rows
+
+    def test_last_bar_only_and_a_wide_stop_keeps_the_side(self):
+        candles = self._candles()
+        snap = g.ema_trend_bar(candles, period=5, atr_mult=2.5, bar_ms=H4)
+        self.assertEqual(snap["side"], "long")
+        self.assertLess(snap["sl"], snap["price"])
+        self.assertEqual(snap["closeMs"], candles[-1]["ts"] + H4)
+        prefix = g.ema_trend_bar(candles[:-1], period=5, atr_mult=2.5, bar_ms=H4)
+        candles[-1] = dict(candles[-1], c=1.0, h=1.0, l=1.0)
+        again = g.ema_trend_bar(candles[:-1], period=5, atr_mult=2.5, bar_ms=H4)
+        self.assertEqual(prefix["side"], again["side"])
+        self.assertAlmostEqual(prefix["ema"], again["ema"])
+        self.assertAlmostEqual(prefix["sl"], again["sl"])
+        wide = g.ema_trend_bar(self._candles(), period=5, atr_mult=100.0, bar_ms=H4)
+        self.assertEqual(wide["side"], "long")
+        self.assertIsNone(wide["sl"])
+
 
 if __name__ == "__main__":
     unittest.main()
