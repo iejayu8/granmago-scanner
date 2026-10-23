@@ -208,6 +208,119 @@ class StrategyStructureTest(unittest.TestCase):
         self.assertEqual(timed[0], "time")
 
 
+def _sweep_daily():
+    """Uptrend with a prior swing high, so a sweep has a target above price."""
+    daily = []
+    closes = []
+    for i in range(80):
+        if i < 36:
+            close = 100 + i * 0.8
+        elif i < 46:
+            close = 100 + 36 * 0.8 - (i - 36) * 1.2
+        else:
+            close = 100 + 36 * 0.8 - 10 * 1.2 + (i - 46) * 0.15
+        closes.append(close)
+        daily.append({"ts": i * DAY, "o": close, "h": close, "l": close, "c": close})
+    return daily, closes
+
+
+def _flat_4h(daily):
+    c4 = []
+    for candle in daily:
+        for k in range(6):
+            close = candle["c"]
+            c4.append({
+                "ts": candle["ts"] + k * H4,
+                "o": close, "h": close, "l": close, "c": close,
+            })
+    return c4
+
+
+def _with_pdl_sweep(c4, closes, depressed):
+    """Wick through day 59's low on the first 4H of day 60, then one close back above."""
+    level = closes[59]
+
+    def at(day, k):
+        return day * 6 + k
+
+    if depressed:
+        base = level
+        for day in (58, 59):
+            for k in range(5):
+                i = at(day, k)
+                c4[i]["o"] = c4[i]["h"] = c4[i]["c"] = base - 2
+                c4[i]["l"] = base - 2.2
+        c4[at(58, 0)]["h"] = base + 8
+    sweep = at(60, 0)
+    c4[sweep]["l"] = level - 1.5
+    c4[sweep]["h"] = level + 1.2
+    c4[sweep]["o"] = level - 1.0
+    c4[sweep]["c"] = level + 1.0
+    nxt = at(60, 1)
+    c4[nxt]["o"] = level + 0.8
+    c4[nxt]["h"] = level + 1.4
+    c4[nxt]["l"] = level + 0.4
+    c4[nxt]["c"] = level + 1.1
+    return c4
+
+
+class SweepModeTest(unittest.TestCase):
+    def test_previous_day_sweep_fires_without_squeeze_or_adx(self):
+        daily, closes = _sweep_daily()
+        c4 = _with_pdl_sweep(_flat_4h(daily), closes, depressed=True)
+        original = g.squeeze_allows
+        g.squeeze_allows = lambda *args, **kwargs: False
+        try:
+            signals, _bars = g.find_signals(
+                c4, daily, [], variant="a", style="sweep", setups="sweep",
+            )
+        finally:
+            g.squeeze_allows = original
+        self.assertEqual(len(signals), 1)
+        signal = signals[0]
+        self.assertEqual(signal["setup"], "A")
+        self.assertEqual(signal["side"], "long")
+        self.assertTrue(signal["stochConfirm"])
+        self.assertFalse(signal["sqzOk"])
+        self.assertFalse(signal["adxOk"])
+        self.assertLess(signal["sl"], signal["sweepExtreme"])
+        self.assertGreater(signal["tp"], signal["price"])
+
+    def test_sweep_requires_the_stochastic_cross(self):
+        daily, closes = _sweep_daily()
+        c4 = _with_pdl_sweep(_flat_4h(daily), closes, depressed=False)
+        signals, _bars = g.find_signals(
+            c4, daily, [], variant="a", style="sweep", setups="sweep",
+        )
+        self.assertEqual(signals, [])
+
+    def test_a_failed_reclaim_is_not_chased(self):
+        daily, closes = _sweep_daily()
+        c4 = _with_pdl_sweep(_flat_4h(daily), closes, depressed=True)
+        level = closes[59]
+        # The second 4H closes back through the low. Fail that close, then
+        # print two later closes above it. Sweep mode must not take them.
+        nxt = 60 * 6 + 1
+        c4[nxt]["o"] = c4[nxt]["h"] = c4[nxt]["c"] = level - 0.5
+        c4[nxt]["l"] = level - 0.8
+        for k in (2, 3):
+            j = 60 * 6 + k
+            c4[j]["o"] = c4[j]["h"] = c4[j]["c"] = level + 1
+            c4[j]["l"] = level + 0.5
+        signals, _bars = g.find_signals(
+            c4, daily, [], variant="a", style="sweep", setups="sweep",
+        )
+        self.assertEqual(signals, [])
+
+    def test_pullback_only_skips_the_sweep(self):
+        daily, closes = _sweep_daily()
+        c4 = _with_pdl_sweep(_flat_4h(daily), closes, depressed=True)
+        signals, _bars = g.find_signals(
+            c4, daily, [], variant="a", style="sweep", setups="pullback",
+        )
+        self.assertTrue(all(row["setup"] == "B" for row in signals))
+
+
 class GranmagoPaperTest(unittest.TestCase):
     def setUp(self):
         server.STATE.clear()
@@ -245,6 +358,25 @@ class GranmagoPaperTest(unittest.TestCase):
     def test_default_mode_is_the_scanner(self):
         server.STATE["settings"]["strategy"] = "scanner"
         self.assertEqual(server.strategy_mode(), "scanner")
+
+    def test_sweep_style_option_round_trip(self):
+        os.environ.pop("GRANMAGO_STYLE", None)
+        os.environ.pop("GRANMAGO_SETUPS", None)
+        server.STATE["settings"]["granmagoStyle"] = "strict"
+        server.STATE["settings"]["granmagoSetups"] = "both"
+        server._apply_runtime_options(server.STATE["settings"])
+        self.assertEqual(server.granmago_style(), "strict")
+        self.assertEqual(server.granmago_setups(), "both")
+        os.environ["GRANMAGO_STYLE"] = "sweep"
+        os.environ["GRANMAGO_SETUPS"] = "SWEEP"
+        server._apply_runtime_options(server.STATE["settings"])
+        self.assertEqual(server.granmago_style(), "sweep")
+        self.assertEqual(server.granmago_setups(), "sweep")
+        os.environ.pop("GRANMAGO_STYLE", None)
+        os.environ.pop("GRANMAGO_SETUPS", None)
+        server.STATE["settings"]["granmagoStyle"] = "strict"
+        server.STATE["settings"]["granmagoSetups"] = "both"
+        server._apply_runtime_options(server.STATE["settings"])
 
     def test_first_entry_reserves_the_add_and_a_runner_does_not_trail(self):
         self.assertTrue(server.open_granmago(self._signal()))

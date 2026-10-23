@@ -36,5 +36,7 @@ export GRANMAGO_MAX_HOLD_BARS="$(bashio::config 'granmago_max_hold_bars')"
 export GRANMAGO_BREAKEVEN_R="$(bashio::config 'granmago_breakeven_r')"
 export GRANMAGO_MIN_RR="$(bashio::config 'granmago_min_rr')"
 export GRANMAGO_STOP_PAD_PCT="$(bashio::config 'granmago_stop_pad_pct')"
+export GRANMAGO_STYLE="$(bashio::config 'granmago_style')"
+export GRANMAGO_SETUPS="$(bashio::config 'granmago_setups')"
 
 exec python -u /app/server.py

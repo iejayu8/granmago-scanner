@@ -71,6 +71,8 @@ Por eso una **entrada nueva** se reduce al hueco que quede, o no se abre, cuando
 | granmago_breakeven_r | 0 | Mueve el stop a la entrada al llegar a este R. 0 no lo mueve |
 | granmago_min_rr | 0 | Relación mínima objetivo/stop. 0 acepta un stop más ancho que el objetivo |
 | granmago_stop_pad_pct | 0.3 | Margen mínimo del stop más allá de la mecha, en % del precio |
+| granmago_style | strict | `strict` (filtros originales) o `sweep` (barrido relajado) |
+| granmago_setups | both | `both`, `sweep` (solo setup A) o `pullback` (solo setup B) |
 | log_level | info | Log del complemento |
 
 ## Riesgo, apalancamiento y el estado guardado
@@ -104,6 +106,8 @@ El estocástico es 14, 3, 3 y solo veta: no hay largo con %K por encima de 80 ni
 El stop es un stop de precio más allá de la mecha barrida, a `max(0,5 × ATR de 14 velas de 4H, granmago_stop_pad_pct % del precio)`. Si un imbalance sin rellenar o una mecha grande atraviesa ese margen, el stop pasa al otro lado del hueco. Por encima del 8 % del precio la operación no se abre. En X la invalidación a veces es el cierre de 12H al otro lado de la mecha: aquí ese cierre solo impide promediar; la posición espera el stop de precio, porque el bot vigila cada tick. El objetivo es el clúster del swing diario anterior en la dirección del beneficio, un 0,1 % por dentro del extremo. No hay objetivo en R. `granmago_min_rr` en 0 no descarta un stop más ancho que el objetivo. Sus propias cifras (77 % de aciertos y profit factor 1,38) implican un beneficio medio de unas 0,4 veces la pérdida media, así que el filtro de 1,5 del apunte del curso queda apagado a propósito.
 
 No hay trailing en este modo. `granmago_momentum_exit` cierra cuando el estocástico está agotado y el histograma del squeeze pierde fuerza. A las `granmago_max_hold_bars` velas de confirmación (15 por defecto) se cierra por tiempo. `granmago_breakeven_r` en 0 no mueve el stop: él lo mencionó y no llegó a explicarlo.
+
+`granmago_style: sweep` cambia el setup A. El nivel barrido es el más extremo entre un pivote de cierre diario de los últimos 20 días (sigue siendo 5 y 5), un pivote de cierre de 4H de los últimos 30 bars de 4H, y el máximo o mínimo del día anterior. La confirmación es el cierre de vuelta al otro lado de ese precio, en las mismas velas de la variante. Una vela que no recupera el nivel cancela el barrido; no se espera a una vela posterior. La tendencia es el último cierre diario contra la EMA50, sin semanal y sin las dos velas de histéresis. El estocástico deja de vetar y pasa a confirmar: el largo necesita un cruce de %K por encima de 20 entre el barrido y la señal, y el corto un cruce por debajo de 80. El squeeze y el ADX se guardan en la señal (`sqzOk`, `adxOk`) y no impiden la entrada. El stop, el objetivo y el tope del 8 % no cambian. `granmago_setups: sweep` deja fuera el retroceso; `pullback` deja fuera el barrido. El defecto del complemento sigue siendo `strict` y `both`.
 
 `granmago_max_adds` en 0 no promedia. En 1 o 2, la primera orden arriesga `risk_pct / (1 + añadidos)` y cada añadido el mismo importe, así el stop de todas las patas sigue siendo un solo `risk_pct`. El añadido solo entra si el precio toca el extremo barrido sin tocar el stop, y nunca después de un cierre de confirmación al otro lado de ese extremo.
 

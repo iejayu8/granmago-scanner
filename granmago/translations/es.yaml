@@ -101,3 +101,9 @@ configuration:
   granmago_stop_pad_pct:
     name: Margen del stop %
     description: El stop queda más allá de la mecha barrida al menos este porcentaje del precio, o medio ATR de 4H, el que sea mayor.
+  granmago_style:
+    name: Estilo Gran Mago
+    description: strict es el filtro original del curso (extremo de 30 días, veto del estocástico, squeeze y ADX). sweep es el modo de barrido relajado (swings recientes y el día anterior, solo la EMA50 diaria, cruce del estocástico, squeeze y ADX anotados pero no exigidos).
+  granmago_setups:
+    name: Setups Gran Mago
+    description: both toma barridos y retrocesos. sweep solo el barrido. pullback solo el retroceso.

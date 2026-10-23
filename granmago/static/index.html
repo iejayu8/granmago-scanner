@@ -280,7 +280,11 @@ function render(s) {
     const variant = String((s.settings && s.settings.granmagoVariant) || "a").toUpperCase();
     const adds = (s.settings && Number.isFinite(+s.settings.granmagoMaxAdds))
       ? +s.settings.granmagoMaxAdds : 0;
+    const style = String((s.settings && s.settings.granmagoStyle) || "strict");
+    const setups = String((s.settings && s.settings.granmagoSetups) || "both");
     $("entryRule").textContent = "Modo Gran Mago, variante " + variant
+      + ", estilo " + style
+      + (setups === "sweep" ? ", solo barridos" : setups === "pullback" ? ", solo retrocesos" : "")
       + (adds ? (", hasta " + adds + " promedios") : ", sin promediar")
       + ". El score se muestra y no abre operaciones.";
   } else {

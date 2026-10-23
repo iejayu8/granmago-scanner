@@ -129,26 +129,49 @@ def _fetch_page(url):
     raise RuntimeError("Blofin page failed %s (%s)" % (url, last))
 
 
-def fetch_blofin(inst_id, bar, start_ms, end_ms):
-    """Candles with open time in [start_ms, end_ms], oldest first. Blofin pages newest first."""
+def _covers_end(rows, end_ms):
+    """The last bar reaches the requested end. Used when history starts late."""
+    if not rows:
+        return False
+    span = max(MIN_MS, end_ms - rows[0]["ts"])
+    return rows[-1]["ts"] >= end_ms - max(span * 0.02, 4 * H4_MS)
+
+
+def fetch_blofin(inst_id, bar, start_ms, end_ms, allow_short=False):
+    """Candles with open time in [start_ms, end_ms], oldest first. Blofin pages newest first.
+
+    `allow_short` keeps a pair whose listing is after `start_ms`, as long as
+    the download reaches `end_ms` and stops on a short final page rather than
+    a stall in the middle.
+    """
     cache = CACHE_DIR / ("%s-%s.json" % (inst_id, bar))
     if cache.exists():
         payload = json.loads(cache.read_text(encoding="utf-8"))
         rows = [r for r in payload.get("rows", []) if start_ms <= r["ts"] <= end_ms]
         if _covers(rows, start_ms, end_ms):
             return rows
+        if allow_short and payload.get("short") and _covers_end(rows, end_ms):
+            return rows
         cache.unlink()
     found = {}
     cursor = None
     pages = 0
     stalls = 0
-    # 1m history for half a year is about 900 pages of 300. The cap has to sit above that.
-    while pages < 2000:
+    # 1m history for half a year is about 900 pages of 300. Three years of
+    # 15m is about 450. The cap sits above both.
+    while pages < 6000:
         params = {"instId": inst_id, "bar": bar, "limit": "300"}
         if cursor is not None:
             params["after"] = str(cursor)
         url = BLOFIN + "?" + urllib.parse.urlencode(params)
-        body = _fetch_page(url)
+        try:
+            body = _fetch_page(url)
+        except RuntimeError:
+            # An empty page after the retries is the start of listed history,
+            # not a hole, once some bars are already in hand.
+            if allow_short and found:
+                break
+            raise
         pages += 1
         if pages == 1 or pages % 100 == 0:
             print("  %s %s page %d" % (inst_id, bar, pages), flush=True)
@@ -172,6 +195,8 @@ def fetch_blofin(inst_id, bar, start_ms, end_ms):
         if len(batch) < 300 or (cursor is not None and oldest >= cursor):
             stalls += 1
             if stalls >= 4:
+                if allow_short and found:
+                    break
                 raise RuntimeError("pagination stalled for %s %s at %s" % (inst_id, bar, oldest))
             time.sleep(1.0 * stalls)
             continue
@@ -179,14 +204,17 @@ def fetch_blofin(inst_id, bar, start_ms, end_ms):
         cursor = oldest
         time.sleep(0.05)
     rows = parse_blofin(list(found.values()))
-    if not _covers(rows, start_ms, end_ms):
+    short = not _covers(rows, start_ms, end_ms)
+    if short and not (allow_short and _covers_end(rows, end_ms)):
         raise RuntimeError("incomplete %s %s: %d bars %s → %s" % (
             inst_id, bar, len(rows),
             madrid(rows[0]["ts"]) if rows else "-",
             madrid(rows[-1]["ts"]) if rows else "-",
         ))
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache.write_text(json.dumps({"start": start_ms, "end": end_ms, "rows": rows}), encoding="utf-8")
+    cache.write_text(json.dumps({
+        "start": start_ms, "end": end_ms, "short": short, "rows": rows,
+    }), encoding="utf-8")
     return rows
 
 

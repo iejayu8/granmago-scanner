@@ -101,3 +101,9 @@ configuration:
   granmago_stop_pad_pct:
     name: Stop pad %
     description: The stop sits beyond the swept wick by at least this percent of price, or by half of the 4H ATR, whichever is wider.
+  granmago_style:
+    name: Gran Mago style
+    description: strict is the original course gate (30-day extreme, stochastic veto, squeeze and ADX). sweep is the relaxed sweep-first mode (recent swings and the previous day, daily EMA50 only, stochastic cross, squeeze and ADX recorded but not required).
+  granmago_setups:
+    name: Gran Mago setups
+    description: both takes sweeps and pullbacks. sweep takes only the sweep. pullback takes only the pullback.

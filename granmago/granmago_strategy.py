@@ -63,6 +63,27 @@ Chosen readings, where the sources disagree:
   does not change the idea. There is no calendar in this repo to do it
   faithfully, so it is not implemented.
 - Countertrend is off. The repeated scalping re-entry is not implemented.
+
+`style="sweep"` is the relaxed reading. It is not the default.
+
+- The level is whichever of these the bar actually wicks through, and the
+  most extreme one when several are swept together: a daily close-pivot
+  (still 5 and 5) from the last 20 days, the latest 4H close-pivots from
+  the last 30 bars of 4H, and the previous day's high or low. It does not
+  have to be the single unswept extreme of 30 days. The confirm is a close
+  back through that same price. A bar that does not reclaim cancels the
+  sweep. A later bar is not chased.
+- Trend is the last closed daily close against the daily EMA50. One close.
+  The weekly EMA is not consulted.
+- Stochastic 14, 3, 3 is a confirmation, not a veto: a long needs %K to
+  have crossed up through 20 between the sweep and the signal bar, and a
+  short needs a cross down through 80. Sitting above 80 does not by itself
+  block the long. On the six-month cache that cross almost never landed on
+  a prompt reclaim of the single 30-day extreme (2 of 14). It is required
+  anyway, because that is the confirmation he describes, and the wider
+  levels are what give it trades.
+- Squeeze and ADX are recorded (`sqzOk`, `adxOk`) and do not block.
+- Stop, target, minimum R and the 8% ceiling are the strict-mode ones.
 """
 
 import math
@@ -78,6 +99,10 @@ PIVOT_RIGHT = 5
 # never revisited. 90 days left that origin unswept and blocked every nearer
 # sweep, so setup A never armed. 30 daily bars is the range used here.
 PIVOT_LOOKBACK_MS = 30 * DAY_MS
+# Sweep-first mode. These widths were fixed from the gate counts, not from
+# profit: 20 daily bars is the recent range, and 30 bars of 4H is five days.
+SWEEP_DAILY_LOOKBACK_MS = 20 * DAY_MS
+SWEEP_4H_LOOKBACK_MS = 30 * H4_MS
 TOUCH_TOL = 0.002
 TOUCH_PAD = 0.003
 MIN_TOUCHES = 3
@@ -741,7 +766,253 @@ def _bar_snapshot(confirm, index, spec, k_series, hist):
     }
 
 
-def find_signals(c4, daily, weekly, variant="a", min_rr=0.0, stop_pad_pct=DEFAULT_STOP_PAD_PCT, filters=True):
+def _style_name(style):
+    text = str(style or "strict").strip().lower()
+    if text in ("strict", "sweep"):
+        return text
+    return "strict"
+
+
+def _setups_name(setups):
+    text = str(setups or "both").strip().lower()
+    if text in ("both", "sweep", "pullback"):
+        return text
+    return "both"
+
+
+def _same_price(left, right):
+    scale = max(1.0, abs(left), abs(right))
+    return abs(left - right) <= scale * 1e-8
+
+
+def daily_ema_side(daily, averages, at_ms):
+    """'long' or 'short' from the last daily close against its EMA50. No hysteresis."""
+    side = None
+    for candle, value in zip(daily, averages):
+        try:
+            closed = int(candle["ts"]) + DAY_MS
+        except (TypeError, ValueError, KeyError):
+            continue
+        if closed > at_ms:
+            break
+        if value is None:
+            continue
+        close = float(candle["c"])
+        if close > value:
+            side = "long"
+        elif close < value:
+            side = "short"
+        else:
+            side = None
+    return side
+
+
+def stoch_crossed(k_series, start, end, side):
+    """Slow %K left 20 upward (long) or 80 downward (short) inside the window."""
+    if end < 1:
+        return False
+    last = min(end, len(k_series) - 1)
+    for j in range(max(1, start), last + 1):
+        prev = k_series[j - 1]
+        cur = k_series[j]
+        if prev is None or cur is None:
+            continue
+        if side == "long" and prev <= 20.0 and cur > 20.0:
+            return True
+        if side == "short" and prev >= 80.0 and cur < 80.0:
+            return True
+    return False
+
+
+def bar_pivots(candles, kind, left, right, bar_ms):
+    """Close pivots whose `known_ms` is one bar after the right-hand confirmation."""
+    out = []
+    n = len(candles)
+    for i in range(left, n - right):
+        price = float(candles[i]["c"])
+        window = [float(candles[j]["c"]) for j in range(i - left, i + right + 1)]
+        if kind == "low":
+            if price != min(window) or window.index(price) != left:
+                continue
+        elif price != max(window) or window.index(price) != left:
+            continue
+        out.append({
+            "ts": int(candles[i]["ts"]),
+            "price": price,
+            "known_ms": int(candles[i + right]["ts"]) + bar_ms,
+        })
+    return out
+
+
+def _previous_day_level(daily, bar_ts, side):
+    """Yesterday's low for a long, yesterday's high for a short. None if unknown."""
+    day_open = int(bar_ts) - (int(bar_ts) % DAY_MS)
+    prev = None
+    for candle in daily:
+        try:
+            ts = int(candle["ts"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if ts + DAY_MS <= day_open:
+            prev = candle
+        else:
+            break
+    if prev is None:
+        return None
+    return float(prev["l"] if side == "long" else prev["h"])
+
+
+def _pierced(bar, level, side):
+    if level is None:
+        return False
+    if side == "long":
+        return float(bar["l"]) < level
+    return float(bar["h"]) > level
+
+
+def _keep_setups(signals, setups):
+    if setups == "sweep":
+        return [row for row in signals if row["setup"] == "A"]
+    if setups == "pullback":
+        return [row for row in signals if row["setup"] == "B"]
+    return signals
+
+
+def _find_sweep(c4, daily, weekly, variant, min_rr, stop_pad_pct, filters, setups):
+    """Setup A from a recent swing or the previous day, confirmed and not chased.
+
+    `weekly` is accepted so the call matches `find_signals`. Sweep mode does
+    not read it.
+    """
+    del weekly
+    spec = variant_spec(variant)
+    c4 = list(c4 or [])
+    daily = list(daily or [])
+    if spec["confirm_ms"] == H12_MS:
+        confirm = aggregate_12h(c4)
+    else:
+        confirm = c4
+    bars = {}
+    if len(confirm) < 30 or len(daily) < EMA_PERIOD + PIVOT_RIGHT + 2:
+        return [], bars
+    daily_ema = ema_series([float(c["c"]) for c in daily])
+    k_series = stoch_k_series(confirm)
+    hist = squeeze_hist(confirm)
+    adx = adx_series(confirm)
+    atr_s = atr_series(c4)
+    high_pivots = close_pivots(daily, "high")
+    low_pivots = close_pivots(daily, "low")
+    daily_levels = {}
+    h4_levels = {}
+    for side in spec["sides"]:
+        kind = "low" if side == "long" else "high"
+        daily_levels[side] = bar_pivots(daily, kind, PIVOT_LEFT, PIVOT_RIGHT, DAY_MS)
+        h4_levels[side] = bar_pivots(c4, kind, PIVOT_LEFT, PIVOT_RIGHT, H4_MS)
+
+    signals = []
+    for side in spec["sides"]:
+        armed = None
+        sweep_i = None
+        extreme = None
+        streak = 0
+        for i, bar in enumerate(confirm):
+            close_ms = int(bar["ts"]) + spec["confirm_ms"]
+            if side == spec["sides"][0]:
+                bars[close_ms] = _bar_snapshot(confirm, i, spec, k_series, hist)
+            bar_ts = int(bar["ts"])
+            candidates = []
+            for level in daily_levels[side]:
+                if level["known_ms"] > bar_ts or bar_ts - level["ts"] > SWEEP_DAILY_LOOKBACK_MS:
+                    continue
+                if _pierced(bar, level["price"], side):
+                    candidates.append(level["price"])
+            for level in h4_levels[side]:
+                if level["known_ms"] > bar_ts or bar_ts - level["ts"] > SWEEP_4H_LOOKBACK_MS:
+                    continue
+                if _pierced(bar, level["price"], side):
+                    candidates.append(level["price"])
+            prev_day = _previous_day_level(daily, bar_ts, side)
+            if _pierced(bar, prev_day, side):
+                candidates.append(prev_day)
+            wick = float(bar["l"] if side == "long" else bar["h"])
+            if candidates:
+                chosen = min(candidates) if side == "long" else max(candidates)
+                if armed is None or not _same_price(armed, chosen):
+                    armed = chosen
+                    sweep_i = i
+                    extreme = wick
+                    streak = 0
+                elif extreme is not None:
+                    extreme = min(extreme, wick) if side == "long" else max(extreme, wick)
+            elif armed is not None and extreme is not None:
+                extreme = min(extreme, wick) if side == "long" else max(extreme, wick)
+
+            took = False
+            if armed is not None and sweep_i is not None and extreme is not None:
+                reclaimed = float(bar["c"]) > armed if side == "long" else float(bar["c"]) < armed
+                if not reclaimed:
+                    armed = None
+                    sweep_i = None
+                    extreme = None
+                    streak = 0
+                else:
+                    streak += 1
+                    if streak >= spec["confirm_bars"]:
+                        took = True
+                        crossed = stoch_crossed(k_series, sweep_i, i, side)
+                        trend = daily_ema_side(daily, daily_ema, close_ms)
+                        if trend == side and (not filters or crossed) and setups != "pullback":
+                            signal = _pack_signal(
+                                spec, side, "A", confirm, i, extreme, armed, c4, atr_s,
+                                k_series, hist, adx, daily, min_rr, stop_pad_pct,
+                            )
+                            if signal is not None:
+                                signal["style"] = "sweep"
+                                signal["stochConfirm"] = crossed
+                                signal["sqzOk"] = squeeze_allows(hist, i, side)
+                                signal["adxOk"] = adx_turning_up(adx, i)
+                                signals.append(signal)
+                        armed = None
+                        sweep_i = None
+                        extreme = None
+                        streak = 0
+
+            if took or armed is not None or setups == "sweep":
+                continue
+            if daily_ema_side(daily, daily_ema, close_ms) != side:
+                continue
+            pullback = _setup_b_extreme(
+                confirm, i, spec["confirm_bars"], side, daily, daily_ema,
+                high_pivots, low_pivots, close_ms, bar_ts,
+            )
+            if pullback is None:
+                continue
+            b_extreme, b_level = pullback
+            signal = _pack_signal(
+                spec, side, "B", confirm, i, b_extreme, b_level, c4, atr_s,
+                k_series, hist, adx, daily, min_rr, stop_pad_pct,
+            )
+            if signal is None:
+                continue
+            signal["style"] = "sweep"
+            signal["stochConfirm"] = False
+            signal["sqzOk"] = squeeze_allows(hist, i, side)
+            signal["adxOk"] = adx_turning_up(adx, i)
+            signals.append(signal)
+
+    signals.sort(key=lambda row: (row["closeMs"], row["side"], row["setup"]))
+    kept = []
+    seen = set()
+    for signal in signals:
+        key = (signal["closeMs"], signal["side"])
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(signal)
+    return kept, bars
+
+
+def find_signals(c4, daily, weekly, variant="a", min_rr=0.0, stop_pad_pct=DEFAULT_STOP_PAD_PCT, filters=True, style="strict", setups="both"):
     """Every confirmation-bar signal in the series, oldest first.
 
     Candles must already be closed. A pivot, an EMA state and an indicator
@@ -751,7 +1022,14 @@ def find_signals(c4, daily, weekly, variant="a", min_rr=0.0, stop_pad_pct=DEFAUL
 
     Returns (signals, bars_by_close_ms). The bar map feeds the momentum and
     time exits without a second indicator pass.
+
+    `style="sweep"` uses the relaxed sweep-first rules. `setups` is
+    `both`, `sweep` (setup A only) or `pullback` (setup B only).
     """
+    if _style_name(style) == "sweep":
+        return _find_sweep(
+            c4, daily, weekly, variant, min_rr, stop_pad_pct, filters, _setups_name(setups),
+        )
     spec = variant_spec(variant)
     c4 = list(c4 or [])
     daily = list(daily or [])
@@ -882,7 +1160,7 @@ def find_signals(c4, daily, weekly, variant="a", min_rr=0.0, stop_pad_pct=DEFAUL
             continue
         seen.add(key)
         kept.append(signal)
-    return kept, bars
+    return _keep_setups(kept, _setups_name(setups)), bars
 
 
 def _setup_b_extreme(confirm, index, need, side, daily, daily_ema, high_pivots, low_pivots, close_ms, bar_ts):

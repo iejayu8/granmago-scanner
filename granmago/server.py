@@ -190,6 +190,14 @@ def _apply_runtime_options(settings):
     _option_float(settings, "GRANMAGO_BREAKEVEN_R", "granmagoBreakevenR", 0.0)
     _option_float(settings, "GRANMAGO_MIN_RR", "granmagoMinRr", 0.0)
     _option_float(settings, "GRANMAGO_STOP_PAD_PCT", "granmagoStopPadPct", 0.3)
+    if _env_set("GRANMAGO_STYLE"):
+        settings["granmagoStyle"] = granmago_strategy._style_name(os.environ.get("GRANMAGO_STYLE"))
+    else:
+        settings["granmagoStyle"] = granmago_strategy._style_name(settings.get("granmagoStyle", "strict"))
+    if _env_set("GRANMAGO_SETUPS"):
+        settings["granmagoSetups"] = granmago_strategy._setups_name(os.environ.get("GRANMAGO_SETUPS"))
+    else:
+        settings["granmagoSetups"] = granmago_strategy._setups_name(settings.get("granmagoSetups", "both"))
 
 
 def _option_bool(settings, env_name, key, default):
@@ -332,6 +340,14 @@ def strategy_mode():
 
 def granmago_variant():
     return _sane_variant(_settings().get("granmagoVariant", "a"))
+
+
+def granmago_style():
+    return granmago_strategy._style_name(_settings().get("granmagoStyle", "strict"))
+
+
+def granmago_setups():
+    return granmago_strategy._setups_name(_settings().get("granmagoSetups", "both"))
 
 
 def granmago_max_adds():
@@ -751,6 +767,8 @@ def default_state():
             "granmagoBreakevenR": 0.0,
             "granmagoMinRr": 0.0,
             "granmagoStopPadPct": 0.3,
+            "granmagoStyle": "strict",
+            "granmagoSetups": "both",
         },
     }
     _apply_runtime_options(state["settings"])
@@ -1233,6 +1251,8 @@ def _attach_granmago(row, c4, c_d, c_w):
         variant=granmago_variant(),
         min_rr=granmago_min_rr(),
         stop_pad_pct=granmago_stop_pad_pct(),
+        style=granmago_style(),
+        setups=granmago_setups(),
     )
     row["granmago"] = None
     if row.get("pair"):
@@ -2334,9 +2354,11 @@ def main():
         add_log("Trailing: %s." % _trail_label())
         if strategy_mode() == "granmago":
             add_log(
-                "Estrategia Gran Mago variante %s, promedios %d, salida por agotamiento %s, máximo %d velas."
+                "Estrategia Gran Mago variante %s, estilo %s, setups %s, promedios %d, salida por agotamiento %s, máximo %d velas."
                 % (
                     granmago_variant().upper(),
+                    granmago_style(),
+                    granmago_setups(),
                     granmago_max_adds(),
                     "sí" if granmago_momentum_exit() else "no",
                     granmago_max_hold_bars(),

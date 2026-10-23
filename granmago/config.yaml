@@ -53,6 +53,8 @@ options:
   granmago_breakeven_r: 0
   granmago_min_rr: 0
   granmago_stop_pad_pct: 0.3
+  granmago_style: strict
+  granmago_setups: both
 schema:
   log_level: list(trace|debug|info|notice|warning|error|fatal)
   risk_pct: float
@@ -88,3 +90,5 @@ schema:
   granmago_breakeven_r: float
   granmago_min_rr: float
   granmago_stop_pad_pct: float
+  granmago_style: list(strict|sweep)
+  granmago_setups: list(both|sweep|pullback)
