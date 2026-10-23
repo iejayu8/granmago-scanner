@@ -1,5 +1,5 @@
 name: GranMago Scanner
-version: "1.3.0"
+version: "1.4.0"
 slug: granmago
 description: Paper trading del scanner GranMago. El bot corre en el servidor aunque cierres la página.
 url: https://github.com/iejayu8/granmago-scanner
@@ -29,6 +29,22 @@ options:
   trailing_distance: 0.5
   entry_threshold: 100
   max_positions: 5
+  fee_pct_per_side: 0
+  slippage_pct_per_side: 0
+  take_profit_r: 1.7
+  partial_tp_r: 0
+  partial_tp_fraction: 0.5
+  partial_move_breakeven: true
+  stop_mode: swing
+  stop_atr_period: 14
+  stop_atr_mult: 2
+  trailing_activation_r: 0
+  trailing_keep_tp: false
+  pair_cooldown_minutes: 0
+  max_same_direction_risk_r: 0
+  regime_filter: off
+  regime_adx_min: 20
+  regime_er_min: 0.2
 schema:
   log_level: list(trace|debug|info|notice|warning|error|fatal)
   risk_pct: float
@@ -40,3 +56,19 @@ schema:
   trailing_distance: float
   entry_threshold: int(0,100)
   max_positions: int(1,12)
+  fee_pct_per_side: float
+  slippage_pct_per_side: float
+  take_profit_r: float
+  partial_tp_r: float
+  partial_tp_fraction: float
+  partial_move_breakeven: bool
+  stop_mode: list(swing|atr)
+  stop_atr_period: int(2,100)
+  stop_atr_mult: float
+  trailing_activation_r: float
+  trailing_keep_tp: bool
+  pair_cooldown_minutes: int(0,10080)
+  max_same_direction_risk_r: float
+  regime_filter: list(off|slope|adx|er|slope_adx|slope_er)
+  regime_adx_min: float
+  regime_er_min: float

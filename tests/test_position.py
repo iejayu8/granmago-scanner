@@ -577,16 +577,24 @@ class PositionTests(unittest.TestCase):
         self.assertLessEqual(first["notional"] + second["notional"], 2000)
 
     def test_score_can_reach_100(self):
+        # 100 requires the stoch bonus. Without it the same setup is 95, not
+        # another 100. The old cap made those two identical, and with them
+        # thresholds 90, 95 and 100. 90 still matches 95: nothing scores 90–94.
         perfect_long = server.score_setup("ALCISTA", True, True, True, 50, "long")
         perfect_short = server.score_setup("BAJISTA", True, True, True, 55, "short")
         self.assertEqual(perfect_long, 100)
         self.assertEqual(perfect_short, 100)
-        self.assertEqual(server.score_setup("ALCISTA", True, True, True, 70, "long"), 100)
-        self.assertEqual(server.score_setup("BAJISTA", True, True, True, 30, "short"), 100)
-        self.assertLess(server.score_setup("ALCISTA", False, True, True, 50, "long"), 100)
+        self.assertEqual(server.score_setup("ALCISTA", True, True, True, 70, "long"), 95)
+        self.assertEqual(server.score_setup("BAJISTA", True, True, True, 30, "short"), 95)
+        self.assertEqual(server.score_setup("ALCISTA", True, True, False, 50, "long"), 80)
+        self.assertLess(server.score_setup("ALCISTA", False, True, True, 50, "long"), 90)
         self.assertLess(server.score_setup("NEUTRAL", True, True, True, 50, "long"), 100)
         self.assertLess(server.score_setup("BAJISTA", True, False, True, 55, "short"), 100)
         self.assertLess(server.score_setup("BAJISTA", True, True, False, 55, "short"), 100)
+        self.assertEqual(
+            server.score_setup("ALCISTA", True, True, True, 50, "long"),
+            30 + 25 + 20 + 20 + 5,
+        )
 
     def test_maybe_open_requires_score_100(self):
         self.assertEqual(server.entry_threshold(), 100)
@@ -834,6 +842,232 @@ class PositionTests(unittest.TestCase):
         self.assertNotIn("maxHoldHours", loaded["settings"])
         self.assertEqual(loaded["balance"], 950.56)
         self.assertEqual(loaded["openPositions"], [])
+
+    def test_risk_and_leverage_options_override_saved_state(self):
+        os.environ["RISK_PCT"] = "1"
+        os.environ["LEVERAGE"] = "5"
+        try:
+            server.STATE_FILE.write_text(json.dumps({
+                "balance": 950.56,
+                "history": [],
+                "settings": {"riskPct": 2, "leverage": 3},
+            }), encoding="utf-8")
+            loaded = server.load_state()
+        finally:
+            os.environ.pop("RISK_PCT", None)
+            os.environ.pop("LEVERAGE", None)
+        self.assertEqual(loaded["settings"]["riskPct"], 1.0)
+        self.assertEqual(loaded["settings"]["leverage"], 5)
+        self.assertEqual(loaded["balance"], 950.56)
+
+    def test_saved_risk_survives_when_the_addon_does_not_set_it(self):
+        os.environ.pop("RISK_PCT", None)
+        os.environ.pop("LEVERAGE", None)
+        server.STATE_FILE.write_text(json.dumps({
+            "balance": 950.56,
+            "history": [],
+            "settings": {"riskPct": 1.5, "leverage": 4},
+        }), encoding="utf-8")
+        loaded = server.load_state()
+        self.assertEqual(loaded["settings"]["riskPct"], 1.5)
+        self.assertEqual(loaded["settings"]["leverage"], 4)
+
+    def test_trailing_in_r_does_not_use_the_percent_and_can_keep_tp(self):
+        server.STATE["settings"]["trailingActivationR"] = 1.0
+        server.STATE["settings"]["trailingKeepTp"] = True
+        server.STATE["settings"]["trailingDistance"] = 0.25
+        _arm(100.0, "long", 90.0, 117.0, notional=1000.0)
+        # 101 is +1% of notional and only +0.1R. The R rule must not arm there.
+        _tick(101.0)
+        pos = _one()
+        self.assertFalse(pos["trailingActive"])
+        self.assertEqual(pos["tp"], 117.0)
+        self.assertEqual(pos["sl"], 90.0)
+
+        _tick(110.0)
+        pos = _one()
+        self.assertTrue(pos["trailingActive"])
+        self.assertEqual(pos["tp"], 117.0)
+        self.assertAlmostEqual(pos["initialSl"], 90.0)
+        # Distance is 0.25 * 10. Stop = max(100, 110 - 2.5).
+        self.assertAlmostEqual(pos["sl"], 107.5)
+
+        _tick(117.0)
+        self.assertEqual(server.STATE["openPositions"], [])
+        self.assertEqual(server.STATE["history"][0]["reason"], "TP")
+        self.assertEqual(server.STATE["history"][0]["exit"], 117.0)
+        self.assertAlmostEqual(server.STATE["history"][0]["initialSl"], 90.0)
+        self.assertIsNotNone(server.STATE["history"][0]["rMultiple"])
+
+    def test_partial_then_breakeven_records_r(self):
+        server.STATE["settings"]["trailingEnabled"] = False
+        server.STATE["settings"]["partialTpR"] = 1.0
+        server.STATE["settings"]["partialTpFraction"] = 0.5
+        server.STATE["settings"]["partialMoveBreakeven"] = True
+        _arm(100.0, "long", 90.0, 117.0, notional=1000.0)
+        _tick(109.0)
+        self.assertFalse(_one()["partialTaken"])
+        self.assertEqual(server.STATE["history"], [])
+
+        _tick(110.0)
+        pos = _one()
+        self.assertTrue(pos["partialTaken"])
+        self.assertAlmostEqual(pos["notional"], 500.0)
+        self.assertAlmostEqual(pos["sl"], 100.0)
+        leg = server.STATE["history"][0]
+        self.assertEqual(leg["reason"], "partial")
+        self.assertAlmostEqual(leg["exit"], 110.0)
+        self.assertAlmostEqual(leg["initialSl"], 90.0)
+        self.assertAlmostEqual(leg["pnl"], 50.0)
+        self.assertAlmostEqual(leg["rMultiple"], 1.0)
+        self.assertIsNone(leg["tradePnl"])
+
+        _tick(100.0)
+        self.assertEqual(server.STATE["openPositions"], [])
+        done = server.STATE["history"][0]
+        self.assertEqual(done["reason"], "breakeven")
+        self.assertAlmostEqual(done["pnl"], 0.0)
+        self.assertAlmostEqual(done["tradePnl"], 50.0)
+        self.assertAlmostEqual(done["tradeR"], 0.5)
+        self.assertAlmostEqual(done["initialRiskAmt"], 100.0)
+
+    def test_take_profit_r_and_atr_stop(self):
+        server.STATE["balance"] = 1000
+        server.STATE["settings"]["riskPct"] = 2
+        server.STATE["settings"]["leverage"] = 5
+        server.STATE["settings"]["takeProfitR"] = 2.5
+        server.STATE["settings"]["stopMode"] = "atr"
+        server.STATE["settings"]["stopAtrMult"] = 2
+        res = _signal("ETH-USDT", "long", 100, price=100.0)
+        res["atr"] = 1.5
+        self.assertTrue(server.open_from_result(res, "long"))
+        pos = _one()
+        self.assertAlmostEqual(pos["initialRiskDist"], 3.0)
+        self.assertAlmostEqual(pos["sl"], 97.0)
+        self.assertAlmostEqual(pos["initialSl"], 97.0)
+        self.assertAlmostEqual(pos["tp"], 100.0 + 7.5)
+        self.assertEqual(pos["stopMode"], "atr")
+
+    def test_fees_and_slippage_change_fill_and_r(self):
+        server.STATE["balance"] = 1000
+        server.STATE["initialBalance"] = 1000
+        server.STATE["settings"]["riskPct"] = 2
+        server.STATE["settings"]["leverage"] = 5
+        server.STATE["settings"]["feePctPerSide"] = 0.06
+        server.STATE["settings"]["slippagePctPerSide"] = 0.02
+        res = _signal("ETH-USDT", "long", 100, price=100.0)
+        self.assertTrue(server.open_from_result(res, "long"))
+        pos = _one()
+        self.assertAlmostEqual(pos["entry"], 100.0 * 1.0002)
+        self.assertGreater(pos["entryFee"], 0)
+        self.assertLess(server.STATE["balance"], 1000)
+        balance_open = server.STATE["balance"]
+        server.close_position("manual", 100.0, "ETH-USDT")
+        hist = server.STATE["history"][0]
+        self.assertAlmostEqual(hist["exit"], 100.0 * 0.9998)
+        self.assertGreater(hist["fees"], 0)
+        self.assertLess(hist["pnl"], 0)
+        self.assertAlmostEqual(hist["initialSl"], pos["initialSl"])
+        self.assertGreater(hist["riskAmt"], 0)
+        self.assertAlmostEqual(hist["rMultiple"], hist["pnl"] / hist["riskAmt"], places=4)
+        self.assertAlmostEqual(hist["tradePnl"], hist["pnl"])
+        self.assertLess(server.STATE["balance"], balance_open)
+
+    def test_zero_fees_leave_the_old_close_math(self):
+        self.assertEqual(server.fee_pct_per_side(), 0.0)
+        self.assertEqual(server.slippage_pct_per_side(), 0.0)
+        server.STATE["openPositions"] = [_book()]
+        server.close_position("SL", 170.0, "SOL-USDT")
+        self.assertEqual(server.STATE["balance"], round(950.56 + _pnl(_book(), 170.0), 2))
+        self.assertEqual(server.STATE["history"][0]["fees"], 0)
+
+    def test_pair_cooldown_blocks_the_same_coin(self):
+        server.STATE["settings"]["pairCooldownMinutes"] = 60
+        server._clock = lambda: 1_000_000.0
+        try:
+            server.STATE["lastScan"] = [_signal("ETH-USDT", "long", 100)]
+            server.maybe_open()
+            self.assertEqual(len(server.STATE["openPositions"]), 1)
+            server.close_position("manual", _one()["entry"], "ETH-USDT")
+            server.STATE["lastScan"] = [_signal("ETH-USDT", "long", 100)]
+            server.maybe_open()
+            self.assertEqual(server.STATE["openPositions"], [])
+            server._clock = lambda: 1_000_000.0 + 60 * 60 - 1
+            server.maybe_open()
+            self.assertEqual(server.STATE["openPositions"], [])
+            server._clock = lambda: 1_000_000.0 + 60 * 60
+            server.maybe_open()
+            self.assertEqual(_one()["pair"], "ETH-USDT")
+        finally:
+            server._clock = None
+
+    def test_same_direction_risk_cap(self):
+        server.STATE["balance"] = 1000
+        server.STATE["settings"]["riskPct"] = 2
+        server.STATE["settings"]["leverage"] = 10
+        server.STATE["settings"]["maxPositions"] = 5
+        server.STATE["settings"]["maxSameDirectionRiskR"] = 2
+        server.STATE["lastScan"] = [
+            _signal("ETH-USDT", "long", 100, price=100),
+            _signal("BTC-USDT", "long", 100, price=100),
+            _signal("SOL-USDT", "short", 100, price=100),
+            _signal("ADA-USDT", "long", 100, price=100),
+        ]
+        server.maybe_open()
+        sides = [(p["pair"], p["side"]) for p in server.STATE["openPositions"]]
+        self.assertEqual(sides, [
+            ("ETH-USDT", "long"),
+            ("BTC-USDT", "long"),
+            ("SOL-USDT", "short"),
+        ])
+
+    def test_regime_slope_blocks_shorts_in_a_rising_market(self):
+        self.assertTrue(server.regime_allows({"emaSlope": 0.01, "adx": 30, "er": 0.5}, "long"))
+        server.STATE["settings"]["regimeFilter"] = "slope"
+        self.assertFalse(server.regime_allows({"emaSlope": 0.02}, "short"))
+        self.assertTrue(server.regime_allows({"emaSlope": 0.02}, "long"))
+        self.assertFalse(server.regime_allows({"emaSlope": -0.02}, "long"))
+        self.assertTrue(server.regime_allows({"emaSlope": 0.0}, "short"))
+        self.assertFalse(server.regime_allows({}, "short"))
+
+        rising = _signal("ETH-USDT", "short", 100, price=100)
+        rising["emaSlope"] = 0.03
+        server.STATE["lastScan"] = [rising]
+        server.maybe_open()
+        self.assertEqual(server.STATE["openPositions"], [])
+
+        server.STATE["settings"]["regimeFilter"] = "adx"
+        server.STATE["settings"]["regimeAdxMin"] = 20
+        chop = _signal("ETH-USDT", "short", 100, price=100)
+        chop["adx"] = 12
+        chop["emaSlope"] = -0.05
+        server.STATE["lastScan"] = [chop]
+        server.maybe_open()
+        self.assertEqual(server.STATE["openPositions"], [])
+        chop["adx"] = 25
+        server.STATE["lastScan"] = [chop]
+        server.maybe_open()
+        self.assertEqual(_one()["pair"], "ETH-USDT")
+
+    def test_efficiency_ratio_and_adx_directions(self):
+        trend = []
+        for i in range(80):
+            price = 100 + i * 0.8
+            trend.append({"ts": i, "o": price - 0.2, "h": price + 0.3, "l": price - 0.3, "c": price})
+        chop = []
+        for i in range(80):
+            price = 100 + (1 if i % 2 == 0 else -1)
+            chop.append({"ts": i, "o": price, "h": price + 1, "l": price - 1, "c": price})
+        self.assertGreater(server.efficiency_ratio(trend, 20), 0.8)
+        self.assertLess(server.efficiency_ratio(chop, 20), 0.15)
+        self.assertGreater(server.average_directional_index(trend, 14), 25)
+        self.assertLess(
+            server.average_directional_index(chop, 14),
+            server.average_directional_index(trend, 14),
+        )
+        self.assertIsNotNone(server.average_true_range(trend, 14))
+        slope = server.ema_slope([c["c"] for c in trend], 20, 5)
+        self.assertGreater(slope, 0)
 
 
 if __name__ == "__main__":

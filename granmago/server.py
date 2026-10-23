@@ -23,7 +23,7 @@ PAIRS = [
     "DOGE-USDT", "AVAX-USDT", "LINK-USDT", "DOT-USDT", "LTC-USDT", "BCH-USDT",
 ]
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 STATE_FILE = DATA_DIR / "state.json"
 PORT = int(os.environ.get("PORT", "8787"))
@@ -55,10 +55,26 @@ _closing = threading.Lock()
 _wake = threading.Condition()
 _kick_gen = 0
 STOP = threading.Event()
+# Backtests set this to a callable returning epoch seconds. Live trading leaves it unset.
+_clock = None
+
+
+def now_epoch():
+    if _clock is not None:
+        return float(_clock())
+    return time.time()
 
 
 def _now():
+    if _clock is not None:
+        return datetime.fromtimestamp(now_epoch(), timezone.utc).astimezone().isoformat(timespec="seconds")
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def _history_time():
+    if _clock is not None:
+        return datetime.fromtimestamp(now_epoch(), timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
 def _env_float(name, default):
@@ -109,22 +125,19 @@ def _sane_float(value, fallback):
 def _apply_runtime_options(settings):
     """Apply add-on options. A leftover max-hold field is ignored.
 
-    Positions close only by the stop, the target, the trailing stop, or a
-    manual close. There is no time limit.
+    Positions close only by the stop, the target, the trailing stop, a
+    partial target, or a manual close. There is no time limit.
+
+    When the add-on exports an option (run.sh), that value replaces the copy
+    saved in state.json. The page can change risk and leverage until the next
+    restart; the next start applies the add-on values again.
     """
     settings.pop("maxHoldHours", None)
-    if _env_set("TRAILING_ENABLED"):
-        settings["trailingEnabled"] = _as_bool(os.environ.get("TRAILING_ENABLED"), True)
-    else:
-        settings["trailingEnabled"] = _as_bool(settings.get("trailingEnabled"), True)
-    if _env_set("TRAILING_ACTIVATION_PCT"):
-        settings["trailingActivationPct"] = _sane_float(os.environ.get("TRAILING_ACTIVATION_PCT"), 1.0)
-    else:
-        settings["trailingActivationPct"] = _sane_float(settings.get("trailingActivationPct", 1.0), 1.0)
-    if _env_set("TRAILING_DISTANCE"):
-        settings["trailingDistance"] = _sane_float(os.environ.get("TRAILING_DISTANCE"), 0.5)
-    else:
-        settings["trailingDistance"] = _sane_float(settings.get("trailingDistance", 0.5), 0.5)
+    _option_bool(settings, "TRAILING_ENABLED", "trailingEnabled", True)
+    _option_float(settings, "TRAILING_ACTIVATION_PCT", "trailingActivationPct", 1.0)
+    _option_float(settings, "TRAILING_DISTANCE", "trailingDistance", 0.5)
+    _option_float(settings, "TRAILING_ACTIVATION_R", "trailingActivationR", 0.0)
+    _option_bool(settings, "TRAILING_KEEP_TP", "trailingKeepTp", False)
     if _env_set("ENTRY_THRESHOLD"):
         settings["entryThreshold"] = _sane_threshold(os.environ.get("ENTRY_THRESHOLD"))
     else:
@@ -133,6 +146,61 @@ def _apply_runtime_options(settings):
         settings["maxPositions"] = _sane_max_positions(os.environ.get("MAX_POSITIONS"))
     else:
         settings["maxPositions"] = _sane_max_positions(settings.get("maxPositions", 5))
+    if _env_set("RISK_PCT"):
+        settings["riskPct"] = _sane_risk_pct(os.environ.get("RISK_PCT"))
+    else:
+        settings["riskPct"] = _sane_risk_pct(settings.get("riskPct", 2))
+    if _env_set("LEVERAGE"):
+        settings["leverage"] = _sane_leverage(os.environ.get("LEVERAGE"))
+    else:
+        settings["leverage"] = _sane_leverage(settings.get("leverage", 3))
+    _option_float(settings, "FEE_PCT_PER_SIDE", "feePctPerSide", 0.0)
+    _option_float(settings, "SLIPPAGE_PCT_PER_SIDE", "slippagePctPerSide", 0.0)
+    _option_float(settings, "TAKE_PROFIT_R", "takeProfitR", 1.7)
+    _option_float(settings, "PARTIAL_TP_R", "partialTpR", 0.0)
+    _option_float(settings, "PARTIAL_TP_FRACTION", "partialTpFraction", 0.5)
+    _option_bool(settings, "PARTIAL_MOVE_BREAKEVEN", "partialMoveBreakeven", True)
+    if _env_set("STOP_MODE"):
+        settings["stopMode"] = _sane_stop_mode(os.environ.get("STOP_MODE"))
+    else:
+        settings["stopMode"] = _sane_stop_mode(settings.get("stopMode", "swing"))
+    _option_int(settings, "STOP_ATR_PERIOD", "stopAtrPeriod", 14, 2, 100)
+    _option_float(settings, "STOP_ATR_MULT", "stopAtrMult", 2.0)
+    _option_int(settings, "PAIR_COOLDOWN_MINUTES", "pairCooldownMinutes", 0, 0, 10080)
+    _option_float(settings, "MAX_SAME_DIRECTION_RISK_R", "maxSameDirectionRiskR", 0.0)
+    if _env_set("REGIME_FILTER"):
+        settings["regimeFilter"] = _sane_regime(os.environ.get("REGIME_FILTER"))
+    else:
+        settings["regimeFilter"] = _sane_regime(settings.get("regimeFilter", "off"))
+    _option_float(settings, "REGIME_ADX_MIN", "regimeAdxMin", 20.0)
+    _option_float(settings, "REGIME_ER_MIN", "regimeErMin", 0.2)
+
+
+def _option_bool(settings, env_name, key, default):
+    if _env_set(env_name):
+        settings[key] = _as_bool(os.environ.get(env_name), default)
+    else:
+        settings[key] = _as_bool(settings.get(key), default)
+
+
+def _option_float(settings, env_name, key, default):
+    if _env_set(env_name):
+        settings[key] = _sane_float(os.environ.get(env_name), default)
+    else:
+        settings[key] = _sane_float(settings.get(key, default), default)
+
+
+def _option_int(settings, env_name, key, default, low, high):
+    raw = os.environ.get(env_name) if _env_set(env_name) else settings.get(key, default)
+    try:
+        num = int(float(raw))
+    except (TypeError, ValueError):
+        num = int(default)
+    if num < low:
+        num = low
+    if num > high:
+        num = high
+    settings[key] = num
 
 
 def _settings():
@@ -150,6 +218,118 @@ def trailing_activation_pct():
 
 def trailing_distance():
     return _sane_float(_settings().get("trailingDistance", 0.5), 0.5)
+
+
+def trailing_activation_r():
+    """R multiple that arms the trail. 0 keeps the percent-of-notional rule."""
+    return _sane_float(_settings().get("trailingActivationR", 0.0), 0.0)
+
+
+def trailing_keep_tp():
+    return _as_bool(_settings().get("trailingKeepTp"), False)
+
+
+def fee_pct_per_side():
+    return _sane_float(_settings().get("feePctPerSide", 0.0), 0.0)
+
+
+def slippage_pct_per_side():
+    return _sane_float(_settings().get("slippagePctPerSide", 0.0), 0.0)
+
+
+def take_profit_r():
+    return _sane_float(_settings().get("takeProfitR", 1.7), 1.7)
+
+
+def partial_tp_r():
+    return _sane_float(_settings().get("partialTpR", 0.0), 0.0)
+
+
+def partial_tp_fraction():
+    raw = _sane_float(_settings().get("partialTpFraction", 0.5), 0.5)
+    if raw > 1:
+        return 1.0
+    return raw
+
+
+def partial_move_breakeven():
+    return _as_bool(_settings().get("partialMoveBreakeven"), True)
+
+
+def stop_mode():
+    return _sane_stop_mode(_settings().get("stopMode", "swing"))
+
+
+def stop_atr_period():
+    try:
+        period = int(float(_settings().get("stopAtrPeriod", 14)))
+    except (TypeError, ValueError):
+        period = 14
+    return min(100, max(2, period))
+
+
+def stop_atr_mult():
+    return _sane_float(_settings().get("stopAtrMult", 2.0), 2.0)
+
+
+def pair_cooldown_minutes():
+    try:
+        minutes = int(float(_settings().get("pairCooldownMinutes", 0)))
+    except (TypeError, ValueError):
+        return 0
+    return min(10080, max(0, minutes))
+
+
+def max_same_direction_risk_r():
+    return _sane_float(_settings().get("maxSameDirectionRiskR", 0.0), 0.0)
+
+
+def regime_filter():
+    return _sane_regime(_settings().get("regimeFilter", "off"))
+
+
+def regime_adx_min():
+    return _sane_float(_settings().get("regimeAdxMin", 20.0), 20.0)
+
+
+def regime_er_min():
+    return _sane_float(_settings().get("regimeErMin", 0.2), 0.2)
+
+
+def _sane_risk_pct(value, fallback=2.0):
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return float(fallback)
+    if num <= 0 or num > 100:
+        return float(fallback)
+    return num
+
+
+def _sane_leverage(value, fallback=3):
+    try:
+        num = int(float(value))
+    except (TypeError, ValueError):
+        return int(fallback)
+    if num < 1:
+        return 1
+    if num > 50:
+        return 50
+    return num
+
+
+def _sane_stop_mode(value):
+    text = str(value or "swing").strip().lower()
+    if text in ("atr", "swing"):
+        return text
+    return "swing"
+
+
+def _sane_regime(value):
+    text = str(value or "off").strip().lower()
+    if text in ("off", "slope", "adx", "er", "slope_adx", "slope_er"):
+        return text
+    return "off"
 
 
 def _sane_threshold(value, fallback=100):
@@ -211,7 +391,41 @@ def ensure_position_fields(pos):
         # entry and the current price is more favourable. A stale last mark
         # is not treated as the best price since entry.
         pos["bestPrice"] = _as_price(pos.get("entry"))
+    entry = _as_price(pos.get("entry"))
+    initial_sl = _as_price(pos.get("initialSl"))
+    if _as_price(pos.get("initialRiskDist")) is None and entry is not None and initial_sl is not None:
+        pos["initialRiskDist"] = abs(entry - initial_sl)
+    if pos.get("initialRiskAmt") is None:
+        risk = pos.get("riskAmt")
+        notional = _as_price(pos.get("notional"))
+        if risk is None and entry and initial_sl and notional:
+            risk = notional * abs(entry - initial_sl) / entry
+        if risk is not None:
+            try:
+                pos["initialRiskAmt"] = float(risk)
+            except (TypeError, ValueError):
+                pass
+    if pos.get("openRiskAmt") is None and pos.get("initialRiskAmt") is not None:
+        try:
+            pos["openRiskAmt"] = float(pos["initialRiskAmt"])
+        except (TypeError, ValueError):
+            pass
+    if pos.get("entryFee") is None:
+        pos["entryFee"] = 0.0
+    if pos.get("partialTaken") is None:
+        pos["partialTaken"] = False
+    if pos.get("tradeId") is None:
+        pos["tradeId"] = _next_trade_id()
     return pos
+
+
+def _next_trade_id():
+    try:
+        n = int(STATE.get("tradeSeq") or 0) + 1
+    except (TypeError, ValueError):
+        n = 1
+    STATE["tradeSeq"] = n
+    return n
 
 
 def position_pnl(pos, price):
@@ -283,14 +497,16 @@ def tighten_stop(pos):
 
 
 def activate_trailing(pos):
-    """Drop the fixed target and replace the protective stop with the trail.
+    """Replace the protective stop with the trail.
 
     The original stop stays stored as initialSl so the distance is stable.
     The live stop is always a price; the position is never left unprotected.
+    The fixed target is removed unless trailing_keep_tp is on.
     """
     if pos.get("initialTp") is None and pos.get("tp") is not None:
         pos["initialTp"] = pos["tp"]
-    pos["tp"] = None
+    if not trailing_keep_tp():
+        pos["tp"] = None
     pos["trailingActive"] = True
     tighten_stop(pos)
     if _as_price(pos.get("sl")) is None:
@@ -301,14 +517,76 @@ def activate_trailing(pos):
             pos["sl"] = restored
 
 
+def price_r(pos, price):
+    """Open profit in R from the initial stop distance. Independent of size."""
+    entry = _as_price(pos.get("entry"))
+    dist = _as_price(pos.get("initialRiskDist"))
+    mark = _as_price(price)
+    if entry is None or dist is None or mark is None or dist <= 0:
+        return None
+    if pos.get("side") == "long":
+        return (mark - entry) / dist
+    return (entry - mark) / dist
+
+
 def trailing_should_activate(pos, price):
     if not trailing_enabled() or pos.get("trailingActive"):
         return False
+    r_needed = trailing_activation_r()
+    if r_needed > 0:
+        reached = price_r(pos, price)
+        return reached is not None and reached >= r_needed
     pnl = position_pnl(pos, price)
     notional = _as_price(pos.get("notional"))
     if pnl is None or notional is None:
         return False
     return pnl >= notional * (trailing_activation_pct() / 100.0)
+
+
+def trailing_activation_price(pos):
+    """Price at which the trail arms. None when it is off or already armed."""
+    if not trailing_enabled() or pos.get("trailingActive"):
+        return None
+    entry = _as_price(pos.get("entry"))
+    if entry is None:
+        return None
+    r_needed = trailing_activation_r()
+    if r_needed > 0:
+        dist = _as_price(pos.get("initialRiskDist"))
+        if dist is None or dist <= 0:
+            return None
+        if pos.get("side") == "long":
+            return entry + dist * r_needed
+        return entry - dist * r_needed
+    pct = trailing_activation_pct()
+    if pct <= 0:
+        return None
+    move = pct / 100.0
+    if pos.get("side") == "long":
+        return entry * (1.0 + move)
+    return entry * (1.0 - move)
+
+
+def partial_target_price(pos):
+    """Limit price of the partial target. None when the partial is off or already filled."""
+    r_needed = partial_tp_r()
+    if r_needed <= 0 or pos.get("partialTaken") or partial_tp_fraction() <= 0:
+        return None
+    entry = _as_price(pos.get("entry"))
+    dist = _as_price(pos.get("initialRiskDist"))
+    if entry is None or dist is None or dist <= 0:
+        return None
+    if pos.get("side") == "long":
+        return entry + dist * r_needed
+    return entry - dist * r_needed
+
+
+def _partial_hit(pos, price):
+    level = partial_target_price(pos)
+    if level is None:
+        return False
+    reached = price_r(pos, price)
+    return reached is not None and reached + 1e-9 >= partial_tp_r()
 
 
 def _stop_hit(side, price, sl):
@@ -368,6 +646,8 @@ def default_state():
         "lastTickAt": None,
         "lastScanAt": None,
         "busy": False,
+        "cooldowns": {},
+        "tradeSeq": 0,
         "settings": {
             "riskPct": _env_float("RISK_PCT", 2),
             "leverage": _env_int("LEVERAGE", 3),
@@ -375,8 +655,24 @@ def default_state():
             "trailingEnabled": True,
             "trailingActivationPct": 1.0,
             "trailingDistance": 0.5,
+            "trailingActivationR": 0.0,
+            "trailingKeepTp": False,
             "entryThreshold": 100,
             "maxPositions": 5,
+            "feePctPerSide": 0.0,
+            "slippagePctPerSide": 0.0,
+            "takeProfitR": 1.7,
+            "partialTpR": 0.0,
+            "partialTpFraction": 0.5,
+            "partialMoveBreakeven": True,
+            "stopMode": "swing",
+            "stopAtrPeriod": 14,
+            "stopAtrMult": 2.0,
+            "pairCooldownMinutes": 0,
+            "maxSameDirectionRiskR": 0.0,
+            "regimeFilter": "off",
+            "regimeAdxMin": 20.0,
+            "regimeErMin": 0.2,
         },
     }
     _apply_runtime_options(state["settings"])
@@ -552,12 +848,169 @@ def stochastic(candles, period=14, k_smooth=3, d_smooth=3):
     return {"k": round(k, 1), "d": round(d, 1)}
 
 
+def _true_ranges(candles):
+    ranges = []
+    for i in range(1, len(candles)):
+        prev = candles[i - 1]["c"]
+        high = candles[i]["h"]
+        low = candles[i]["l"]
+        ranges.append(max(high - low, abs(high - prev), abs(low - prev)))
+    return ranges
+
+
+def _wilder(values, period):
+    if len(values) < period:
+        return []
+    smoothed = [sum(values[:period]) / period]
+    for value in values[period:]:
+        smoothed.append((smoothed[-1] * (period - 1) + value) / period)
+    return smoothed
+
+
+def average_true_range(candles, period=14):
+    """Wilder ATR. None when the candle history is shorter than the period."""
+    try:
+        period = int(period)
+    except (TypeError, ValueError):
+        period = 14
+    if period < 2 or len(candles) < period + 1:
+        return None
+    smoothed = _wilder(_true_ranges(candles), period)
+    if not smoothed:
+        return None
+    return smoothed[-1]
+
+
+def average_directional_index(candles, period=14):
+    """Wilder ADX. None when history is too short. Range is 0 to 100."""
+    try:
+        period = int(period)
+    except (TypeError, ValueError):
+        period = 14
+    if period < 2 or len(candles) < (2 * period) + 1:
+        return None
+    plus_dm = []
+    minus_dm = []
+    for i in range(1, len(candles)):
+        up = candles[i]["h"] - candles[i - 1]["h"]
+        down = candles[i - 1]["l"] - candles[i]["l"]
+        plus_dm.append(up if up > down and up > 0 else 0.0)
+        minus_dm.append(down if down > up and down > 0 else 0.0)
+    atr_s = _wilder(_true_ranges(candles), period)
+    plus_s = _wilder(plus_dm, period)
+    minus_s = _wilder(minus_dm, period)
+    dx = []
+    for atr_value, plus, minus in zip(atr_s, plus_s, minus_s):
+        if atr_value <= 0:
+            dx.append(0.0)
+            continue
+        plus_di = 100.0 * plus / atr_value
+        minus_di = 100.0 * minus / atr_value
+        denom = plus_di + minus_di
+        dx.append(0.0 if denom <= 0 else 100.0 * abs(plus_di - minus_di) / denom)
+    adx_s = _wilder(dx, period)
+    if not adx_s:
+        return None
+    return adx_s[-1]
+
+
+def efficiency_ratio(candles, period=20):
+    """Kaufman efficiency ratio over `period` closes. 1 is a straight line, 0 is chop."""
+    try:
+        period = int(period)
+    except (TypeError, ValueError):
+        period = 20
+    if period < 2 or len(candles) < period + 1:
+        return None
+    closes = [c["c"] for c in candles[-(period + 1):]]
+    change = abs(closes[-1] - closes[0])
+    path = 0.0
+    for i in range(1, len(closes)):
+        path += abs(closes[i] - closes[i - 1])
+    if path <= 0:
+        return 0.0
+    return change / path
+
+
+def ema_slope(values, period, lookback):
+    """Fractional change of an EMA versus the same EMA `lookback` bars earlier.
+
+    Positive means the average is rising. None when the series is too short.
+    """
+    try:
+        period = int(period)
+        lookback = int(lookback)
+    except (TypeError, ValueError):
+        return None
+    if period < 2 or lookback < 1 or not values or len(values) < period + lookback:
+        return None
+    now = ema(values, period)
+    prev = ema(values[:-lookback], period)
+    if now is None or prev is None or prev == 0:
+        return None
+    return (now - prev) / prev
+
+
+def regime_allows(row, side):
+    """True when the configured regime filter lets this side open.
+
+    off: always. slope: the daily EMA50 must not point against the trade
+    (flat is allowed). adx / er: the 4H trend strength must clear the minimum.
+    Combinations require both. Missing inputs fail closed when that filter is on.
+    """
+    mode = regime_filter()
+    if mode == "off":
+        return True
+    if not isinstance(row, dict):
+        return False
+    if mode in ("slope", "slope_adx", "slope_er"):
+        slope = row.get("emaSlope")
+        try:
+            slope = float(slope)
+        except (TypeError, ValueError):
+            return False
+        if side == "long" and slope < 0:
+            return False
+        if side == "short" and slope > 0:
+            return False
+    if mode in ("adx", "slope_adx"):
+        try:
+            adx_value = float(row.get("adx"))
+        except (TypeError, ValueError):
+            return False
+        if adx_value < regime_adx_min():
+            return False
+    if mode in ("er", "slope_er"):
+        try:
+            er_value = float(row.get("er"))
+        except (TypeError, ValueError):
+            return False
+        if er_value < regime_er_min():
+            return False
+    return True
+
+
 def score_setup(bias, near_ema, stoch_ok, daily_align, stoch_value, side):
+    """Score from 0 to 100. 100 requires every component, including the stoch bonus.
+
+    The previous weights summed to 105 and were then capped at 100, so a full
+    setup with the bonus and one without it both became 100. Thresholds 90,
+    95 and 100 therefore selected the same trades. Bias is 30 points (it was
+    35) so the existing +5 bonus fits inside 100:
+
+    - 100: bias, near EMA, daily alignment, stoch band and the stoch bonus
+    - 95: the same setup without the bonus
+    - 80: one of daily alignment or the stoch band is missing, bonus present
+    - 75: the near-EMA component is missing, or a 20-point component and the bonus
+
+    Nothing scores 90–94 or 81–94, so a threshold of 90 still matches 95.
+    100 and 95 do not match. The comparison stays >= threshold.
+    """
     score = 0
     if side == "long" and bias == "ALCISTA":
-        score += 35
+        score += 30
     if side == "short" and bias == "BAJISTA":
-        score += 35
+        score += 30
     if near_ema:
         score += 25
     if daily_align:
@@ -568,7 +1021,7 @@ def score_setup(bias, near_ema, stoch_ok, daily_align, stoch_value, side):
         score += 5
     if side == "short" and stoch_value > 40:
         score += 5
-    return min(100, score)
+    return score
 
 
 def fetch_json(url):
@@ -656,6 +1109,10 @@ def score_market(pair, c4, c_d, c_w, threshold):
     score_short = score_setup(bias, near and not above, stoch_short, daily_short, stoch["k"], "short")
     recent_low = min(c["l"] for c in c4[-10:])
     recent_high = max(c["h"] for c in c4[-10:])
+    # Daily EMA50 over five daily bars is the higher-timeframe slope. 4H ADX,
+    # efficiency ratio and ATR describe the entry timeframe. They are attached
+    # even when the regime filter and the ATR stop are off, so a scan can show
+    # them and a backtest can reuse one pass.
     return {
         "pair": pair,
         "price": last["c"],
@@ -669,6 +1126,10 @@ def score_market(pair, c4, c_d, c_w, threshold):
         "ema50_4": ema50_4,
         "recentLow": recent_low,
         "recentHigh": recent_high,
+        "atr": average_true_range(c4, stop_atr_period()),
+        "adx": average_directional_index(c4, 14),
+        "er": efficiency_ratio(c4, 20),
+        "emaSlope": ema_slope([c["c"] for c in c_d], 50, 5),
         "validLong": score_long >= threshold and bias == "ALCISTA",
         "validShort": score_short >= threshold and bias == "BAJISTA",
     }
@@ -727,26 +1188,143 @@ def scan_all():
         SCAN_LOCK.release()
 
 
+def _swing_distance(entry, side, res):
+    if side == "long":
+        return entry - float(res["recentLow"]) * 0.996
+    return float(res["recentHigh"]) * 1.004 - entry
+
+
+def _stop_distance(entry, side, res):
+    """Price distance from the fill to the stop. None when it is wider than 8%."""
+    if stop_mode() == "atr":
+        atr_value = _as_price(res.get("atr"))
+        mult = stop_atr_mult()
+        if atr_value is None or mult <= 0:
+            add_log("ATR no disponible en %s, se usa el swing." % res.get("pair"))
+            sl_dist = _swing_distance(entry, side, res)
+        else:
+            sl_dist = atr_value * mult
+    else:
+        sl_dist = _swing_distance(entry, side, res)
+    if sl_dist <= entry * 0.004:
+        sl_dist = entry * 0.012
+    if sl_dist > entry * 0.08:
+        return None
+    return sl_dist
+
+
+def _slip_price(side, price, closing):
+    """Worse fill. A long buys higher and sells lower; a short does the opposite."""
+    px = _as_price(price)
+    if px is None:
+        return None
+    slip = slippage_pct_per_side() / 100.0
+    if slip <= 0:
+        return px
+    worse_up = (closing and side == "short") or ((not closing) and side == "long")
+    if worse_up:
+        return px * (1.0 + slip)
+    return px * (1.0 - slip)
+
+
+def _fee_amount(notional):
+    pct = fee_pct_per_side() / 100.0
+    if pct <= 0:
+        return 0.0
+    try:
+        return max(0.0, float(notional)) * pct
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _unit_risk():
+    try:
+        return float(STATE["balance"]) * float(STATE["settings"]["riskPct"]) / 100.0
+    except (TypeError, ValueError, KeyError):
+        return 0.0
+
+
+def directional_risk_ok(side, new_risk):
+    """False when this entry would push same-direction open risk over the cap.
+
+    The cap is a multiple of one full trade (balance × risk_pct). 0 disables
+    it. Risk already open is the original risk of each position, so a trailed
+    or partial winner still counts until it is fully closed.
+    """
+    cap = max_same_direction_risk_r()
+    if cap <= 0:
+        return True
+    unit = _unit_risk()
+    if unit <= 0:
+        return False
+    used = 0.0
+    for pos in _positions():
+        if not isinstance(pos, dict) or pos.get("side") != side:
+            continue
+        try:
+            used += max(0.0, float(pos.get("initialRiskAmt") or 0.0))
+        except (TypeError, ValueError):
+            continue
+    try:
+        extra = max(0.0, float(new_risk))
+    except (TypeError, ValueError):
+        return False
+    return used + extra <= cap * unit + 1e-6
+
+
+def cooldown_active(pair, at=None):
+    minutes = pair_cooldown_minutes()
+    if minutes <= 0 or not pair:
+        return False
+    cool = STATE.get("cooldowns")
+    if not isinstance(cool, dict):
+        return False
+    until = cool.get(pair)
+    if until is None:
+        return False
+    try:
+        until = float(until)
+    except (TypeError, ValueError):
+        return False
+    now = now_epoch() if at is None else float(at)
+    return now < until
+
+
+def _remember_cooldown(pair):
+    minutes = pair_cooldown_minutes()
+    if minutes <= 0 or not pair:
+        return
+    cool = STATE.get("cooldowns")
+    if not isinstance(cool, dict):
+        cool = {}
+        STATE["cooldowns"] = cool
+    cool[pair] = now_epoch() + minutes * 60.0
+
+
 def open_from_result(res, side):
     """Append one paper trade. False when the pair is taken or the size is refused.
 
     risk_pct is applied to the current realized balance, same as a single
     trade. If this notional would push the book past balance × leverage,
     the new trade is shrunk to the room that is left, or skipped at zero.
+    Entry price is worsened by slippage. The taker fee is taken from the
+    balance immediately. Both are zero unless the add-on options set them.
     """
     pair = res.get("pair")
     if not pair or _find_position(pair):
         if pair:
             add_log("Ya hay posición en %s, no se duplica." % pair)
         return False
-    entry = res["price"]
-    if side == "long":
-        sl_dist = entry - res["recentLow"] * 0.996
-    else:
-        sl_dist = res["recentHigh"] * 1.004 - entry
-    if sl_dist <= entry * 0.004:
-        sl_dist = entry * 0.012
-    if sl_dist > entry * 0.08:
+    if cooldown_active(pair):
+        return False
+    if not regime_allows(res, side):
+        return False
+    signal = _as_price(res.get("price"))
+    if signal is None:
+        return False
+    entry = _slip_price(side, signal, closing=False)
+    sl_dist = _stop_distance(entry, side, res)
+    if sl_dist is None:
         add_log("SL demasiado amplio en %s" % pair)
         return False
     risk_pct = float(STATE["settings"]["riskPct"]) / 100
@@ -768,19 +1346,39 @@ def open_from_result(res, side):
             "Tamaño de %s limitado a %.2f USDT de nocional (tope balance × apalancamiento)."
             % (pair, notional)
         )
+    if not directional_risk_ok(side, risk_amt):
+        add_log(
+            "Riesgo %s en la misma dirección ya está en el tope (%.2f R)."
+            % (side, max_same_direction_risk_r())
+        )
+        return False
     sl = entry - sl_dist if side == "long" else entry + sl_dist
-    tp = entry + sl_dist * 1.7 if side == "long" else entry - sl_dist * 1.7
+    tp_r = take_profit_r()
+    if tp_r > 0:
+        tp = entry + sl_dist * tp_r if side == "long" else entry - sl_dist * tp_r
+    else:
+        tp = None
+    entry_fee = _fee_amount(notional)
+    if entry_fee:
+        STATE["balance"] = round(float(STATE["balance"]) - entry_fee, 2)
     score = res["scoreLong"] if side == "long" else res["scoreShort"]
+    risk_amt = round(risk_amt, 2)
     _positions().append({
         "pair": pair,
         "side": side,
         "entry": entry,
+        "signalPrice": signal,
         "sl": sl,
         "tp": tp,
         "notional": notional,
+        "initialNotional": notional,
         "notionalCapped": capped,
         "leverage": lev,
-        "riskAmt": round(risk_amt, 2),
+        "riskAmt": risk_amt,
+        "initialRiskAmt": risk_amt,
+        "openRiskAmt": risk_amt,
+        "initialRiskDist": sl_dist,
+        "entryFee": entry_fee,
         "time": _now(),
         "unrealized": 0,
         "price": entry,
@@ -788,6 +1386,9 @@ def open_from_result(res, side):
         "initialTp": tp,
         "bestPrice": entry,
         "trailingActive": False,
+        "partialTaken": False,
+        "tradeId": _next_trade_id(),
+        "stopMode": stop_mode(),
     })
     add_log(
         "ENTRADA AUTO %s %s @ %s (score %s) [%d/%d]"
@@ -796,8 +1397,47 @@ def open_from_result(res, side):
     return True
 
 
-def close_position(reason, price, pair=None):
-    """Close one open pair. With a single position, the pair can be omitted."""
+def _open_risk_amt(pos):
+    if pos.get("openRiskAmt") is not None:
+        try:
+            return max(0.0, float(pos["openRiskAmt"]))
+        except (TypeError, ValueError):
+            pass
+    for key in ("initialRiskAmt", "riskAmt"):
+        if pos.get(key) is None:
+            continue
+        try:
+            return max(0.0, float(pos[key]))
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def _move_stop_to_breakeven(pos):
+    """Tighten the live stop to the entry. Never loosens it."""
+    entry = _as_price(pos.get("entry"))
+    current = _as_price(pos.get("sl"))
+    if entry is None or current is None:
+        return False
+    if pos.get("side") == "long":
+        updated = max(current, entry)
+    else:
+        updated = min(current, entry)
+    if abs(updated - current) <= 1e-12:
+        return False
+    pos["sl"] = updated
+    return True
+
+
+def close_position(reason, price, pair=None, fraction=1.0):
+    """Close one open pair, or a fraction of it. With a single position, the pair can be omitted.
+
+    `price` is the market print. Slippage worsens the fill and the taker fee
+    is charged on the closed notional. The entry fee was already taken from
+    the balance; the history row subtracts this leg's share so its PnL matches
+    the balance change of the round trip. A fraction below 1 leaves the rest
+    open and does not start the pair cooldown.
+    """
     positions = _positions()
     if pair is None:
         if len(positions) != 1:
@@ -811,57 +1451,152 @@ def close_position(reason, price, pair=None):
     if idx is None:
         return None
     pos = positions[idx]
+    try:
+        fraction = float(fraction)
+    except (TypeError, ValueError):
+        fraction = 1.0
+    if fraction <= 0:
+        return None
+    if fraction > 1:
+        fraction = 1.0
+    entry = _as_price(pos.get("entry"))
+    notional = _as_price(pos.get("notional"))
+    fill = _slip_price(pos.get("side"), price, closing=True)
+    if entry is None or notional is None or fill is None or entry <= 0:
+        return None
+    if fraction < 1 and notional * (1.0 - fraction) < 0.01:
+        fraction = 1.0
+    closed_notional = notional * fraction
     if pos["side"] == "long":
-        pnl_pct = (price - pos["entry"]) / pos["entry"]
+        pnl_pct = (fill - entry) / entry
     else:
-        pnl_pct = (pos["entry"] - price) / pos["entry"]
-    pnl = pnl_pct * pos["notional"]
-    STATE["balance"] = round(STATE["balance"] + pnl, 2)
+        pnl_pct = (entry - fill) / entry
+    gross = pnl_pct * closed_notional
+    exit_fee = _fee_amount(closed_notional)
+    try:
+        entry_fee_total = float(pos.get("entryFee") or 0.0)
+    except (TypeError, ValueError):
+        entry_fee_total = 0.0
+    entry_fee_share = entry_fee_total * fraction
+    net = gross - exit_fee - entry_fee_share
+    net_rounded = round(net, 2)
+    STATE["balance"] = round(float(STATE["balance"]) + gross - exit_fee, 2)
+    try:
+        initial_risk = float(pos.get("initialRiskAmt") or pos.get("riskAmt") or 0.0)
+    except (TypeError, ValueError):
+        initial_risk = 0.0
+    open_risk = _open_risk_amt(pos)
+    risk_share = open_risk * fraction
+    r_mult = None if risk_share <= 0 else round(net_rounded / risk_share, 4)
+    closed_pnls = pos.get("closedPnls")
+    if not isinstance(closed_pnls, list):
+        closed_pnls = []
+    closed_pnls.append(net_rounded)
+    pos["closedPnls"] = closed_pnls
+    trade_pnl = round(sum(closed_pnls), 2)
+    full_close = fraction >= 1 - 1e-12
+    trade_r = None
+    if full_close and initial_risk > 0:
+        trade_r = round(trade_pnl / initial_risk, 4)
     STATE["history"].insert(0, {
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "time": _history_time(),
         "pair": pos["pair"],
         "side": pos["side"],
         "entry": pos["entry"],
-        "exit": price,
-        "pnl": round(pnl, 2),
+        "exit": fill,
+        "pnl": net_rounded,
         "reason": reason,
+        "initialSl": pos.get("initialSl"),
+        "riskAmt": round(risk_share, 4),
+        "initialRiskAmt": round(initial_risk, 4) if initial_risk else None,
+        "rMultiple": r_mult,
+        "tradePnl": trade_pnl if full_close else None,
+        "tradeR": trade_r,
+        "fees": round(exit_fee + entry_fee_share, 4),
+        "notional": round(closed_notional, 2),
+        "tradeId": pos.get("tradeId"),
     })
     del STATE["history"][200:]
-    add_log("CERRADA %s %s → PnL %.2f USDT" % (pos["pair"], reason, pnl))
-    del positions[idx]
+    add_log("CERRADA %s %s → PnL %.2f USDT" % (pos["pair"], reason, net_rounded))
+    if fraction >= 1 - 1e-12:
+        _remember_cooldown(pos.get("pair"))
+        del positions[idx]
+    else:
+        pos["notional"] = round(notional * (1.0 - fraction), 2)
+        pos["entryFee"] = entry_fee_total * (1.0 - fraction)
+        pos["openRiskAmt"] = open_risk * (1.0 - fraction)
+        if pos.get("riskAmt") is not None:
+            try:
+                pos["riskAmt"] = round(float(pos["riskAmt"]) * (1.0 - fraction), 2)
+            except (TypeError, ValueError):
+                pass
+        pos["partialTaken"] = True
+        if partial_move_breakeven():
+            _move_stop_to_breakeven(pos)
     return pos
 
 
+def _stop_reason(pos):
+    if pos.get("trailingActive"):
+        return "trailing"
+    if pos.get("partialTaken"):
+        entry = _as_price(pos.get("entry"))
+        sl = _as_price(pos.get("sl"))
+        if entry is not None and sl is not None and abs(sl - entry) <= max(1e-8, abs(entry) * 1e-8):
+            return "breakeven"
+    return "SL"
+
+
 def _apply_mark(pos, price):
-    """SL, TP or trailing for one position. The caller holds LOCK."""
+    """SL, partial, TP or trailing for one position. The caller holds LOCK.
+
+    Returns the exit reason, or 'partial' when a slice was closed and the
+    rest is still open, or None. A stop is always checked first. A print that
+    reaches the full target also fills a pending partial at the partial price
+    before the remainder is closed at this print.
+    """
     ensure_position_fields(pos)
     pair = pos["pair"]
     side = pos["side"]
-    pnl = position_pnl(pos, price)
-    pos["price"] = price
+    mark = _as_price(price)
+    if mark is None:
+        return None
+    pnl = position_pnl(pos, mark)
+    pos["price"] = mark
     if pnl is not None:
         pos["unrealized"] = round(pnl, 2)
-    update_best_price(pos, price)
+    update_best_price(pos, mark)
+    if _stop_hit(side, mark, pos.get("sl")):
+        reason = _stop_reason(pos)
+        close_position(reason, mark, pair)
+        return reason
+    if _partial_hit(pos, mark):
+        level = partial_target_price(pos)
+        close_position("partial", level if level is not None else mark, pair, fraction=partial_tp_fraction())
+        if _find_position(pair) is None:
+            return "partial"
+        pos = _find_position(pair)
+    if _target_hit(side, mark, pos.get("tp")):
+        close_position("TP", mark, pair)
+        return "TP"
     if pos.get("trailingActive"):
         moved = tighten_stop(pos)
         if moved:
             add_log("Trailing %s SL → %s (mejor %s)" % (pair, _fmt(pos["sl"]), _fmt(pos["bestPrice"])))
-        if _stop_hit(side, price, pos.get("sl")):
-            close_position("trailing", price, pair)
-    else:
-        # Fixed stop and target, unchanged, until the trail takes over.
-        if _stop_hit(side, price, pos.get("sl")):
-            close_position("SL", price, pair)
-        elif _target_hit(side, price, pos.get("tp")):
-            close_position("TP", price, pair)
-        elif trailing_should_activate(pos, price):
-            activate_trailing(pos)
-            add_log(
-                "Trailing activo en %s. SL %s (mejor %s)"
-                % (pair, _fmt(pos["sl"]), _fmt(pos["bestPrice"]))
-            )
-            if _stop_hit(side, price, pos.get("sl")):
-                close_position("trailing", price, pair)
+        if _stop_hit(side, mark, pos.get("sl")):
+            close_position("trailing", mark, pair)
+            return "trailing"
+        return None
+    if trailing_should_activate(pos, mark):
+        activate_trailing(pos)
+        add_log(
+            "Trailing activo en %s. SL %s (mejor %s)"
+            % (pair, _fmt(pos["sl"]), _fmt(pos["bestPrice"]))
+        )
+        if _stop_hit(side, mark, pos.get("sl")):
+            close_position("trailing", mark, pair)
+            return "trailing"
+    return None
 
 
 def _monitor_one(pair):
@@ -922,11 +1657,21 @@ def maybe_open():
             add_log("Ningún setup alcanza el umbral de entrada (%d). Esperando..." % threshold)
             save_state()
             return
+        blocked = []
         for _score, row, side in candidates:
             if len(_positions()) >= limit:
                 break
+            pair = row.get("pair")
+            if pair and cooldown_active(pair):
+                blocked.append("%s cooldown" % str(pair).replace("-USDT", ""))
+                continue
+            if not regime_allows(row, side):
+                blocked.append("%s régimen" % str(pair).replace("-USDT", ""))
+                continue
             if open_from_result(row, side):
                 opened = True
+        if blocked:
+            add_log("Filtro: %s." % ", ".join(blocked[:8]))
         save_state()
     if opened:
         kick()
@@ -960,9 +1705,15 @@ def _fmt(price):
 def _trail_label():
     if not trailing_enabled():
         return "desactivado, SL y TP fijos"
-    return "se activa al %s%% del nocional, distancia %s del riesgo inicial" % (
-        _fmt_num(trailing_activation_pct()),
+    if trailing_activation_r() > 0:
+        armed = "se activa a %sR" % _fmt_num(trailing_activation_r())
+    else:
+        armed = "se activa al %s%% del nocional" % _fmt_num(trailing_activation_pct())
+    kept = "el TP se mantiene" if trailing_keep_tp() else "al activarse se quita el TP"
+    return "%s, distancia %s del riesgo inicial, %s" % (
+        armed,
         _fmt_num(trailing_distance()),
+        kept,
     )
 
 
@@ -1162,6 +1913,24 @@ def main():
     with LOCK:
         add_log("Umbral de entrada: %d." % entry_threshold())
         add_log("Máximo de posiciones: %d (una por moneda)." % max_positions())
+        add_log(
+            "Riesgo %.2f%%, apalancamiento %d (opciones del complemento; pisan el estado al arrancar)."
+            % (float(STATE["settings"].get("riskPct") or 0), _leverage())
+        )
+        add_log(
+            "Costes paper: comisión %.4f%% + slippage %.4f%% por lado."
+            % (fee_pct_per_side(), slippage_pct_per_side())
+        )
+        add_log("Stop %s, TP %sR, parcial %sR." % (
+            stop_mode(),
+            _fmt_num(take_profit_r()),
+            _fmt_num(partial_tp_r()) if partial_tp_r() > 0 else "off",
+        ))
+        add_log("Régimen: %s. Cooldown %d min. Tope misma dirección %sR." % (
+            regime_filter(),
+            pair_cooldown_minutes(),
+            _fmt_num(max_same_direction_risk_r()) if max_same_direction_risk_r() > 0 else "off",
+        ))
         add_log("Trailing: %s." % _trail_label())
         if STATE["running"]:
             add_log("Bot reanudado al arrancar el complemento.")
@@ -1169,15 +1938,21 @@ def main():
     threading.Thread(target=monitor_loop, name="granmago-monitor", daemon=True).start()
     threading.Thread(target=scan_loop, name="granmago-scan", daemon=True).start()
     log.info(
-        "GranMago Scanner %s on 0.0.0.0:%s data=%s entry_threshold=%s max_positions=%s trailing=%s activation_pct=%s distance=%s",
+        "GranMago Scanner %s on 0.0.0.0:%s data=%s entry_threshold=%s max_positions=%s risk_pct=%s leverage=%s trailing=%s activation_pct=%s activation_r=%s distance=%s fees=%s slip=%s regime=%s",
         VERSION,
         PORT,
         DATA_DIR,
         entry_threshold(),
         max_positions(),
+        _settings().get("riskPct"),
+        _leverage(),
         trailing_enabled(),
         trailing_activation_pct(),
+        trailing_activation_r(),
         trailing_distance(),
+        fee_pct_per_side(),
+        slippage_pct_per_side(),
+        regime_filter(),
     )
     from waitress import serve
     serve(app, host="0.0.0.0", port=PORT, threads=4)

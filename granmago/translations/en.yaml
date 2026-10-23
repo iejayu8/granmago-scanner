@@ -29,3 +29,51 @@ configuration:
   max_positions:
     name: Max positions
     description: How many trades can be open at once, each on a different coin. From 1 to 12.
+  fee_pct_per_side:
+    name: Fee % per side
+    description: Taker fee charged on entry and on exit, in percent of notional. 0 keeps the old paper accounting. Blofin taker is about 0.06.
+  slippage_pct_per_side:
+    name: Slippage % per side
+    description: Adverse fill, in percent, applied to the entry and the exit. 0 disables it. 0.02 is a small market-order assumption.
+  take_profit_r:
+    name: Take profit (R)
+    description: Target distance as a multiple of the initial stop distance. 1.7 is the previous fixed target. 0 disables the target.
+  partial_tp_r:
+    name: Partial take profit (R)
+    description: Close part of the position at this R multiple. 0 disables the partial.
+  partial_tp_fraction:
+    name: Partial fraction
+    description: Fraction of the position closed at the partial target. 0.5 closes half.
+  partial_move_breakeven:
+    name: Breakeven after partial
+    description: Move the stop to the entry after the partial fills.
+  stop_mode:
+    name: Stop mode
+    description: swing uses the last 10 candles of 4H. atr uses ATR(4H) times the multiplier.
+  stop_atr_period:
+    name: ATR period
+    description: ATR period on 4H candles when the stop mode is atr.
+  stop_atr_mult:
+    name: ATR multiplier
+    description: Stop distance is this many ATRs when the stop mode is atr.
+  trailing_activation_r:
+    name: Trailing activation (R)
+    description: Arm the trail after this multiple of the initial risk. 0 keeps the percent-of-notional activation.
+  trailing_keep_tp:
+    name: Keep the target
+    description: When on, arming the trail does not cancel the take profit.
+  pair_cooldown_minutes:
+    name: Cooldown per pair
+    description: Minutes to wait before opening the same coin again. 0 disables it.
+  max_same_direction_risk_r:
+    name: Same-direction risk cap (R)
+    description: Maximum open risk, in units of one full trade, for all longs or all shorts. 0 disables the cap.
+  regime_filter:
+    name: Regime filter
+    description: off keeps every signal. slope blocks trades against the daily EMA50 slope. adx and er skip chop. slope_adx and slope_er require both.
+  regime_adx_min:
+    name: Minimum ADX
+    description: Used when the regime filter includes adx. Entries need 4H ADX at or above this value.
+  regime_er_min:
+    name: Minimum efficiency ratio
+    description: Used when the regime filter includes er. Entries need a 4H Kaufman ER at or above this value.
