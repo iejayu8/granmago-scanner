@@ -1,5 +1,5 @@
 name: GranMago Scanner
-version: "1.4.0"
+version: "1.5.0"
 slug: granmago
 description: Paper trading del scanner GranMago. El bot corre en el servidor aunque cierres la página.
 url: https://github.com/iejayu8/granmago-scanner
@@ -45,6 +45,14 @@ options:
   regime_filter: off
   regime_adx_min: 20
   regime_er_min: 0.2
+  strategy: scanner
+  granmago_variant: a
+  granmago_max_adds: 0
+  granmago_momentum_exit: true
+  granmago_max_hold_bars: 15
+  granmago_breakeven_r: 0
+  granmago_min_rr: 0
+  granmago_stop_pad_pct: 0.3
 schema:
   log_level: list(trace|debug|info|notice|warning|error|fatal)
   risk_pct: float
@@ -72,3 +80,11 @@ schema:
   regime_filter: list(off|slope|adx|er|slope_adx|slope_er)
   regime_adx_min: float
   regime_er_min: float
+  strategy: list(scanner|granmago)
+  granmago_variant: list(a|b)
+  granmago_max_adds: int(0,2)
+  granmago_momentum_exit: bool
+  granmago_max_hold_bars: int(0,40)
+  granmago_breakeven_r: float
+  granmago_min_rr: float
+  granmago_stop_pad_pct: float

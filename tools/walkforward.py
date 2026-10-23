@@ -378,6 +378,16 @@ def replay(name, settings, signals, market, clock, t0, t1):
         len(summary["open"]),
         unreal,
     )
+    win_r = [t["r"] for t in variant.trades if t.get("r") is not None and t.get("pnl") is not None and t["pnl"] > 0]
+    loss_r = [t["r"] for t in variant.trades if t.get("r") is not None and t.get("pnl") is not None and t["pnl"] < 0]
+    avg_win = (sum(win_r) / len(win_r)) if win_r else None
+    avg_loss = (sum(loss_r) / len(loss_r)) if loss_r else None
+    ratio = None
+    if avg_win is not None and avg_loss not in (None, 0):
+        ratio = avg_win / abs(avg_loss)
+    metrics["avg_win_r"] = None if avg_win is None else round(avg_win, 4)
+    metrics["avg_loss_r"] = None if avg_loss is None else round(avg_loss, 4)
+    metrics["win_loss_ratio"] = None if ratio is None else round(ratio, 4)
     metrics["name"] = name
     metrics["reasons"] = summary["reasons"]
     return metrics

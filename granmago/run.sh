@@ -28,5 +28,13 @@ export MAX_SAME_DIRECTION_RISK_R="$(bashio::config 'max_same_direction_risk_r')"
 export REGIME_FILTER="$(bashio::config 'regime_filter')"
 export REGIME_ADX_MIN="$(bashio::config 'regime_adx_min')"
 export REGIME_ER_MIN="$(bashio::config 'regime_er_min')"
+export STRATEGY="$(bashio::config 'strategy')"
+export GRANMAGO_VARIANT="$(bashio::config 'granmago_variant')"
+export GRANMAGO_MAX_ADDS="$(bashio::config 'granmago_max_adds')"
+export GRANMAGO_MOMENTUM_EXIT="$(bashio::config 'granmago_momentum_exit')"
+export GRANMAGO_MAX_HOLD_BARS="$(bashio::config 'granmago_max_hold_bars')"
+export GRANMAGO_BREAKEVEN_R="$(bashio::config 'granmago_breakeven_r')"
+export GRANMAGO_MIN_RR="$(bashio::config 'granmago_min_rr')"
+export GRANMAGO_STOP_PAD_PCT="$(bashio::config 'granmago_stop_pad_pct')"
 
 exec python -u /app/server.py

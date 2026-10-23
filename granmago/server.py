@@ -15,6 +15,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import granmago_strategy
+
 import requests
 from flask import Flask, jsonify, request
 
@@ -23,7 +25,7 @@ PAIRS = [
     "DOGE-USDT", "AVAX-USDT", "LINK-USDT", "DOT-USDT", "LTC-USDT", "BCH-USDT",
 ]
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 STATE_FILE = DATA_DIR / "state.json"
 PORT = int(os.environ.get("PORT", "8787"))
@@ -174,6 +176,20 @@ def _apply_runtime_options(settings):
         settings["regimeFilter"] = _sane_regime(settings.get("regimeFilter", "off"))
     _option_float(settings, "REGIME_ADX_MIN", "regimeAdxMin", 20.0)
     _option_float(settings, "REGIME_ER_MIN", "regimeErMin", 0.2)
+    if _env_set("STRATEGY"):
+        settings["strategy"] = _sane_strategy(os.environ.get("STRATEGY"))
+    else:
+        settings["strategy"] = _sane_strategy(settings.get("strategy", "scanner"))
+    if _env_set("GRANMAGO_VARIANT"):
+        settings["granmagoVariant"] = _sane_variant(os.environ.get("GRANMAGO_VARIANT"))
+    else:
+        settings["granmagoVariant"] = _sane_variant(settings.get("granmagoVariant", "a"))
+    _option_int(settings, "GRANMAGO_MAX_ADDS", "granmagoMaxAdds", 0, 0, 2)
+    _option_bool(settings, "GRANMAGO_MOMENTUM_EXIT", "granmagoMomentumExit", True)
+    _option_int(settings, "GRANMAGO_MAX_HOLD_BARS", "granmagoMaxHoldBars", 15, 0, 40)
+    _option_float(settings, "GRANMAGO_BREAKEVEN_R", "granmagoBreakevenR", 0.0)
+    _option_float(settings, "GRANMAGO_MIN_RR", "granmagoMinRr", 0.0)
+    _option_float(settings, "GRANMAGO_STOP_PAD_PCT", "granmagoStopPadPct", 0.3)
 
 
 def _option_bool(settings, env_name, key, default):
@@ -294,6 +310,60 @@ def regime_adx_min():
 
 def regime_er_min():
     return _sane_float(_settings().get("regimeErMin", 0.2), 0.2)
+
+
+def _sane_strategy(value):
+    text = str(value or "scanner").strip().lower()
+    if text in ("scanner", "granmago"):
+        return text
+    return "scanner"
+
+
+def _sane_variant(value):
+    text = str(value or "a").strip().lower()
+    if text in ("a", "b"):
+        return text
+    return "a"
+
+
+def strategy_mode():
+    return _sane_strategy(_settings().get("strategy", "scanner"))
+
+
+def granmago_variant():
+    return _sane_variant(_settings().get("granmagoVariant", "a"))
+
+
+def granmago_max_adds():
+    try:
+        adds = int(float(_settings().get("granmagoMaxAdds", 0)))
+    except (TypeError, ValueError):
+        return 0
+    return min(2, max(0, adds))
+
+
+def granmago_momentum_exit():
+    return _as_bool(_settings().get("granmagoMomentumExit"), True)
+
+
+def granmago_max_hold_bars():
+    try:
+        bars = int(float(_settings().get("granmagoMaxHoldBars", 15)))
+    except (TypeError, ValueError):
+        return 15
+    return min(40, max(0, bars))
+
+
+def granmago_breakeven_r():
+    return _sane_float(_settings().get("granmagoBreakevenR", 0.0), 0.0)
+
+
+def granmago_min_rr():
+    return _sane_float(_settings().get("granmagoMinRr", 0.0), 0.0)
+
+
+def granmago_stop_pad_pct():
+    return _sane_float(_settings().get("granmagoStopPadPct", 0.3), 0.3)
 
 
 def _sane_risk_pct(value, fallback=2.0):
@@ -673,6 +743,14 @@ def default_state():
             "regimeFilter": "off",
             "regimeAdxMin": 20.0,
             "regimeErMin": 0.2,
+            "strategy": "scanner",
+            "granmagoVariant": "a",
+            "granmagoMaxAdds": 0,
+            "granmagoMomentumExit": True,
+            "granmagoMaxHoldBars": 15,
+            "granmagoBreakevenR": 0.0,
+            "granmagoMinRr": 0.0,
+            "granmagoStopPadPct": 0.3,
         },
     }
     _apply_runtime_options(state["settings"])
@@ -1135,13 +1213,69 @@ def score_market(pair, c4, c_d, c_w, threshold):
     }
 
 
+# Last closed confirmation bar per pair. Not persisted. Used for the momentum
+# and time exits of an open course trade. The scan row only keeps a fresh signal.
+_GRANMAGO_BARS = {}
+
+
+def _attach_granmago(row, c4, c_d, c_w):
+    """Latest course signal, if the just-closed bar is an entry. None otherwise."""
+    if strategy_mode() != "granmago" or not row:
+        return row
+    now_ms = int(now_epoch() * 1000)
+    closed_4h = granmago_strategy.drop_forming(c4, granmago_strategy.H4_MS, now_ms)
+    closed_d = granmago_strategy.drop_forming(c_d, granmago_strategy.DAY_MS, now_ms)
+    closed_w = granmago_strategy.drop_forming(c_w, granmago_strategy.WEEK_MS, now_ms)
+    signals, bars = granmago_strategy.find_signals(
+        closed_4h,
+        closed_d,
+        closed_w,
+        variant=granmago_variant(),
+        min_rr=granmago_min_rr(),
+        stop_pad_pct=granmago_stop_pad_pct(),
+    )
+    row["granmago"] = None
+    if row.get("pair"):
+        _GRANMAGO_BARS[row["pair"]] = bars
+    if signals and bars:
+        latest = signals[-1]
+        # Only the bar that just closed. An older signal is not chased.
+        if latest["closeMs"] == max(bars):
+            row["granmago"] = latest
+    return row
+
+
+def _close_granmago_signals():
+    """Momentum or time exit on the last closed confirmation bar. Caller holds LOCK."""
+    if strategy_mode() != "granmago":
+        return
+    for pos in list(_positions()):
+        if not isinstance(pos, dict) or pos.get("strategy") != "granmago":
+            continue
+        bars = _GRANMAGO_BARS.get(pos.get("pair")) or {}
+        if not bars:
+            continue
+        last_ms = max(bars)
+        decision = granmago_strategy.exit_decision(pos, bars[last_ms])
+        if decision is None:
+            continue
+        reason, price = decision
+        close_position(reason, price, pos.get("pair"))
+
+
 def analyze_pair(pair, threshold=None):
     if threshold is None:
         threshold = entry_threshold()
-    c4 = fetch_candles(pair, "4H", 150)
-    c_d = fetch_candles(pair, "1D", 80)
-    c_w = fetch_candles(pair, "1W", 60)
-    return score_market(pair, c4, c_d, c_w, threshold)
+    if strategy_mode() == "granmago":
+        c4 = fetch_candles(pair, "4H", 300)
+        c_d = fetch_candles(pair, "1D", 220)
+        c_w = fetch_candles(pair, "1W", 80)
+    else:
+        c4 = fetch_candles(pair, "4H", 150)
+        c_d = fetch_candles(pair, "1D", 80)
+        c_w = fetch_candles(pair, "1W", 60)
+    row = score_market(pair, c4, c_d, c_w, threshold)
+    return _attach_granmago(row, c4, c_d, c_w)
 
 
 def scan_all():
@@ -1165,9 +1299,14 @@ def scan_all():
                 results.append(row)
             time.sleep(0.3)
         results.sort(key=lambda r: max(r["scoreLong"], r["scoreShort"]), reverse=True)
-        best_l = sorted((r for r in results if r["validLong"]), key=lambda r: r["scoreLong"], reverse=True)
-        best_s = sorted((r for r in results if r["validShort"]), key=lambda r: r["scoreShort"], reverse=True)
+        if strategy_mode() == "granmago":
+            best_l = [r for r in results if isinstance(r.get("granmago"), dict) and r["granmago"].get("side") == "long"]
+            best_s = [r for r in results if isinstance(r.get("granmago"), dict) and r["granmago"].get("side") == "short"]
+        else:
+            best_l = sorted((r for r in results if r["validLong"]), key=lambda r: r["scoreLong"], reverse=True)
+            best_s = sorted((r for r in results if r["validShort"]), key=lambda r: r["scoreShort"], reverse=True)
         with LOCK:
+            _close_granmago_signals()
             STATE["lastScan"] = results
             STATE["bestLong"] = best_l[0] if best_l else None
             STATE["bestShort"] = best_s[0] if best_s else None
@@ -1389,12 +1528,248 @@ def open_from_result(res, side):
         "partialTaken": False,
         "tradeId": _next_trade_id(),
         "stopMode": stop_mode(),
+        "strategy": "scanner",
     })
     add_log(
         "ENTRADA AUTO %s %s @ %s (score %s) [%d/%d]"
         % (side.upper(), pair, _fmt(entry), score, len(_positions()), max_positions())
     )
     return True
+
+
+def open_granmago(sig):
+    """Open one course trade from a signal dict. False when it cannot be sized.
+
+    The stop and the target come from the signal, not from the scanner's
+    swing or R multiple. With adds enabled, this fill risks 1/(1+adds) of
+    risk_pct so the reserved adds can still lose the rest at the same stop.
+    Trailing is not used on these positions.
+    """
+    if not isinstance(sig, dict):
+        return False
+    pair = sig.get("pair")
+    side = sig.get("side")
+    if side not in ("long", "short") or not pair or _find_position(pair):
+        if pair and _find_position(pair):
+            add_log("Ya hay posición en %s, no se duplica." % pair)
+        return False
+    if cooldown_active(pair):
+        return False
+    if not regime_allows(sig, side):
+        return False
+    signal = _as_price(sig.get("price"))
+    stop = _as_price(sig.get("sl"))
+    target = _as_price(sig.get("tp"))
+    if signal is None or stop is None or target is None:
+        return False
+    entry = _slip_price(side, signal, closing=False)
+    if entry is None:
+        return False
+    if side == "long" and not (stop < entry < target):
+        return False
+    if side == "short" and not (target < entry < stop):
+        return False
+    dist = abs(entry - stop)
+    if dist > entry * 0.08:
+        add_log("SL demasiado amplio en %s" % pair)
+        return False
+    adds = granmago_max_adds()
+    legs = 1 + adds
+    risk_pct = float(STATE["settings"]["riskPct"]) / 100.0
+    full_risk = STATE["balance"] * risk_pct
+    leg_risk = full_risk / legs
+    if leg_risk <= 0:
+        return False
+    notional = round(leg_risk / (dist / entry), 2)
+    room = _notional_room()
+    capped = False
+    if room <= 0 or notional > room:
+        capped = True
+        notional = math.floor(max(0.0, room) * 100 + 1e-9) / 100.0
+        if notional <= 0:
+            add_log("Sin hueco de nocional para %s (tope balance × apalancamiento)." % pair)
+            return False
+        leg_risk = notional * (dist / entry)
+        add_log(
+            "Tamaño de %s limitado a %.2f USDT de nocional (tope balance × apalancamiento)."
+            % (pair, notional)
+        )
+    if not directional_risk_ok(side, leg_risk):
+        add_log(
+            "Riesgo %s en la misma dirección ya está en el tope (%.2f R)."
+            % (side, max_same_direction_risk_r())
+        )
+        return False
+    entry_fee = _fee_amount(notional)
+    if entry_fee:
+        STATE["balance"] = round(float(STATE["balance"]) - entry_fee, 2)
+    leg_risk = round(leg_risk, 2)
+    add_budget = round(full_risk / legs, 2) if adds else 0.0
+    _positions().append({
+        "pair": pair,
+        "side": side,
+        "entry": entry,
+        "signalPrice": signal,
+        "sl": stop,
+        "tp": target,
+        "notional": notional,
+        "initialNotional": notional,
+        "notionalCapped": capped,
+        "leverage": _leverage(),
+        "riskAmt": leg_risk,
+        "initialRiskAmt": leg_risk,
+        "openRiskAmt": leg_risk,
+        "initialRiskDist": dist,
+        "entryFee": entry_fee,
+        "time": _now(),
+        "unrealized": 0,
+        "price": entry,
+        "initialSl": stop,
+        "initialTp": target,
+        "bestPrice": entry,
+        "trailingActive": False,
+        "partialTaken": False,
+        "tradeId": _next_trade_id(),
+        "stopMode": "granmago",
+        "strategy": "granmago",
+        "setup": sig.get("setup"),
+        "variant": sig.get("variant") or granmago_variant(),
+        "addPrice": _as_price(sig.get("addPrice")),
+        "sweepExtreme": _as_price(sig.get("sweepExtreme")),
+        "addsDone": 0,
+        "maxAdds": adds,
+        "addBudget": add_budget,
+        "addBlocked": False,
+        "confirmMs": sig.get("confirmMs"),
+        "closeMs": sig.get("closeMs"),
+        "momentumExit": granmago_momentum_exit(),
+        "maxHoldBars": granmago_max_hold_bars(),
+        "breakevenR": granmago_breakeven_r(),
+        "granmagoBe": False,
+    })
+    add_log(
+        "ENTRADA GRANMAGO %s %s %s @ %s SL %s TP %s [%d/%d]"
+        % (
+            str(sig.get("setup") or ""),
+            side.upper(),
+            pair,
+            _fmt(entry),
+            _fmt(stop),
+            _fmt(target),
+            len(_positions()),
+            max_positions(),
+        )
+    )
+    return True
+
+
+def _maybe_add(pos, mark):
+    """One extra fill at the swept extreme. The stop does not move."""
+    if pos.get("addBlocked"):
+        return False
+    try:
+        done = int(pos.get("addsDone") or 0)
+        allowed = int(pos.get("maxAdds") or 0)
+    except (TypeError, ValueError):
+        return False
+    if done >= allowed:
+        return False
+    side = pos.get("side")
+    if not granmago_strategy.add_distance_ok(side, mark, pos.get("addPrice"), pos.get("sl")):
+        return False
+    try:
+        budget = float(pos.get("addBudget") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if budget <= 0:
+        return False
+    fill = _slip_price(side, pos.get("addPrice"), closing=False)
+    stop = _as_price(pos.get("sl"))
+    if fill is None or stop is None:
+        return False
+    if side == "long" and fill <= stop:
+        return False
+    if side == "short" and fill >= stop:
+        return False
+    dist = abs(fill - stop)
+    if dist <= 0:
+        return False
+    notional = round(budget / (dist / fill), 2)
+    room = _notional_room()
+    if room <= 0:
+        return False
+    if notional > room:
+        notional = math.floor(max(0.0, room) * 100 + 1e-9) / 100.0
+    if notional <= 0:
+        return False
+    leg_risk = notional * (dist / fill)
+    old_notional = float(pos.get("notional") or 0.0)
+    old_entry = float(pos.get("entry") or 0.0)
+    if old_notional <= 0 or old_entry <= 0:
+        return False
+    new_notional = old_notional + notional
+    pos["entry"] = (old_notional * old_entry + notional * fill) / new_notional
+    pos["notional"] = round(new_notional, 2)
+    pos["initialNotional"] = pos["notional"]
+    fee = _fee_amount(notional)
+    if fee:
+        STATE["balance"] = round(float(STATE["balance"]) - fee, 2)
+        try:
+            pos["entryFee"] = float(pos.get("entryFee") or 0.0) + fee
+        except (TypeError, ValueError):
+            pos["entryFee"] = fee
+    pos["addsDone"] = done + 1
+    try:
+        pos["initialRiskAmt"] = round(float(pos.get("initialRiskAmt") or 0.0) + leg_risk, 2)
+    except (TypeError, ValueError):
+        pos["initialRiskAmt"] = round(leg_risk, 2)
+    try:
+        pos["openRiskAmt"] = round(float(pos.get("openRiskAmt") or 0.0) + leg_risk, 2)
+    except (TypeError, ValueError):
+        pos["openRiskAmt"] = round(leg_risk, 2)
+    pos["riskAmt"] = pos["openRiskAmt"]
+    pos["initialRiskDist"] = abs(pos["entry"] - stop)
+    add_log(
+        "PROMEDIO %s %s @ %s (entrada media %s, %d/%d)"
+        % (side.upper(), pos.get("pair"), _fmt(fill), _fmt(pos["entry"]), pos["addsDone"], allowed)
+    )
+    return True
+
+
+def _apply_granmago_mark(pos, mark):
+    """Hard stop, optional add, optional breakeven, then the swing target.
+
+    No trailing and no scanner partial. A stop is checked before an add, so
+    a print through both the extreme and the stop does not average in.
+    """
+    pair = pos["pair"]
+    side = pos["side"]
+    pnl = position_pnl(pos, mark)
+    pos["price"] = mark
+    if pnl is not None:
+        pos["unrealized"] = round(pnl, 2)
+    update_best_price(pos, mark)
+    if _stop_hit(side, mark, pos.get("sl")):
+        close_position("SL", mark, pair)
+        return "SL"
+    _maybe_add(pos, mark)
+    if _find_position(pair) is None:
+        return "SL"
+    pos = _find_position(pair)
+    try:
+        be_r = float(pos.get("breakevenR") or 0.0)
+    except (TypeError, ValueError):
+        be_r = 0.0
+    if be_r > 0 and not pos.get("granmagoBe"):
+        reached = price_r(pos, mark)
+        if reached is not None and reached >= be_r:
+            if _move_stop_to_breakeven(pos):
+                pos["granmagoBe"] = True
+                add_log("Breakeven GranMago %s SL → %s" % (pair, _fmt(pos["sl"])))
+    if _target_hit(side, mark, pos.get("tp")):
+        close_position("TP", mark, pair)
+        return "TP"
+    return None
 
 
 def _open_risk_amt(pos):
@@ -1561,6 +1936,8 @@ def _apply_mark(pos, price):
     mark = _as_price(price)
     if mark is None:
         return None
+    if pos.get("strategy") == "granmago":
+        return _apply_granmago_mark(pos, mark)
     pnl = position_pnl(pos, mark)
     pos["price"] = mark
     if pnl is not None:
@@ -1624,10 +2001,12 @@ def monitor_position():
 
 
 def maybe_open():
-    """Fill free slots from the latest scan, best score first.
+    """Fill free slots from the latest scan.
 
-    One position per coin, long or short, never both. A manual scan does
-    not call this. Nothing is opened while the bot is stopped.
+    Scanner mode ranks by score. Gran Mago mode opens the course signal on
+    the bar that just closed and ignores the score. One position per coin,
+    long or short, never both. A manual scan does not call this. Nothing
+    is opened while the bot is stopped.
     """
     opened = False
     with LOCK:
@@ -1636,43 +2015,64 @@ def maybe_open():
         limit = max_positions()
         if len(_positions()) >= limit:
             return
-        threshold = entry_threshold()
         rows = STATE.get("lastScan") or []
         occupied = {p.get("pair") for p in _positions() if isinstance(p, dict)}
-        candidates = []
-        seen = set()
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            pair = row.get("pair")
-            if not pair or pair in occupied or pair in seen:
-                continue
-            side, score = _qualifying_side(row, threshold)
-            if side is None:
-                continue
-            seen.add(pair)
-            candidates.append((score, row, side))
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        if not candidates:
-            add_log("Ningún setup alcanza el umbral de entrada (%d). Esperando..." % threshold)
+        if strategy_mode() == "granmago":
+            fresh = False
+            for row in rows:
+                if len(_positions()) >= limit:
+                    break
+                if not isinstance(row, dict):
+                    continue
+                sig = row.get("granmago")
+                pair = row.get("pair")
+                if not isinstance(sig, dict) or not pair or pair in occupied:
+                    continue
+                fresh = True
+                payload = dict(sig)
+                payload["pair"] = pair
+                if open_granmago(payload):
+                    opened = True
+                    occupied.add(pair)
+            if not fresh:
+                add_log("Ningún setup Gran Mago en el cierre de vela. Esperando...")
             save_state()
-            return
-        blocked = []
-        for _score, row, side in candidates:
-            if len(_positions()) >= limit:
-                break
-            pair = row.get("pair")
-            if pair and cooldown_active(pair):
-                blocked.append("%s cooldown" % str(pair).replace("-USDT", ""))
-                continue
-            if not regime_allows(row, side):
-                blocked.append("%s régimen" % str(pair).replace("-USDT", ""))
-                continue
-            if open_from_result(row, side):
-                opened = True
-        if blocked:
-            add_log("Filtro: %s." % ", ".join(blocked[:8]))
-        save_state()
+        else:
+            threshold = entry_threshold()
+            candidates = []
+            seen = set()
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                pair = row.get("pair")
+                if not pair or pair in occupied or pair in seen:
+                    continue
+                side, score = _qualifying_side(row, threshold)
+                if side is None:
+                    continue
+                seen.add(pair)
+                candidates.append((score, row, side))
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            if not candidates:
+                add_log("Ningún setup alcanza el umbral de entrada (%d). Esperando..." % threshold)
+                save_state()
+                return
+            blocked = []
+            for _score, row, side in candidates:
+                if len(_positions()) >= limit:
+                    break
+                pair = row.get("pair")
+                if pair and cooldown_active(pair):
+                    blocked.append("%s cooldown" % str(pair).replace("-USDT", ""))
+                    continue
+                if not regime_allows(row, side):
+                    blocked.append("%s régimen" % str(pair).replace("-USDT", ""))
+                    continue
+                if open_from_result(row, side):
+                    opened = True
+            if blocked:
+                add_log("Filtro: %s." % ", ".join(blocked[:8]))
+            save_state()
     if opened:
         kick()
 
@@ -1932,6 +2332,18 @@ def main():
             _fmt_num(max_same_direction_risk_r()) if max_same_direction_risk_r() > 0 else "off",
         ))
         add_log("Trailing: %s." % _trail_label())
+        if strategy_mode() == "granmago":
+            add_log(
+                "Estrategia Gran Mago variante %s, promedios %d, salida por agotamiento %s, máximo %d velas."
+                % (
+                    granmago_variant().upper(),
+                    granmago_max_adds(),
+                    "sí" if granmago_momentum_exit() else "no",
+                    granmago_max_hold_bars(),
+                )
+            )
+        else:
+            add_log("Estrategia: scanner de score. El modo Gran Mago está apagado.")
         if STATE["running"]:
             add_log("Bot reanudado al arrancar el complemento.")
         save_state()

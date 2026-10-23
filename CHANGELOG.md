@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.5.0
+
+- Modo de estrategia seleccionable. `strategy: scanner` (el defecto) deja el bot de 1.4.0 igual. `strategy: granmago` entra y sale con las reglas del curso de Gran Mago, no con el score.
+- Variante `a`: largos y cortos, confirmación con dos cierres de 4H, sin promediar. Variante `b`: solo largos, confirmación con un cierre de 12H (las velas de 12H salen de tres velas de 4H de Blofin, 00:00 y 12:00 UTC).
+- Tendencia por la EMA50 semanal y diaria. Si se contradicen, manda la diaria. Hacen falta dos cierres seguidos al otro lado de la media para cambiar de fase.
+- Setup A: barrido del pivote de cierre diario más extremo aún no barrido (5 velas a cada lado, ventana de 30 días) y los cierres de confirmación al otro lado del nivel con más toques (±0,2 %). Una ventana de 90 días dejaba el origen de la tendencia sin barrer y bloqueaba el setup. Setup B: retroceso a favor de tendencia hacia la EMA50 diaria, un máximo/mínimo roto, un imbalance de tres velas o el 50 % de una mecha grande. No se persigue una vela posterior.
+- Estocástico 14, 3, 3 como veto (no hay largo con %K > 80 ni corto con %K < 20). El squeeze es el de LazyBear (BB 20/2, KC 20/1,5 sobre la media del true range) y el ADX(14) tiene que estar subiendo. El detalle está en el README.
+- El stop queda más allá del extremo barrido, con margen `max(0,5 × ATR14 de 4H, granmago_stop_pad_pct)`. El objetivo es el clúster del swing diario anterior, un 0,1 % por dentro. `granmago_min_rr` en 0 no exige una relación mínima, porque en sus cifras el beneficio medio es menor que la pérdida media.
+- Salida opcional por agotamiento del estocástico y del squeeze (`granmago_momentum_exit`, activa) y por tiempo a las 15 velas de confirmación. Sin trailing en este modo. El breakeven (`granmago_breakeven_r`) sale en 0.
+- Promedios opcionales (`granmago_max_adds`, 0, 1 o 2) solo al tocar el extremo barrido y antes del stop. La primera entrada reserva el riesgo de los añadidos. Un cierre de confirmación al otro lado del extremo no añade más.
+- El riesgo por defecto sigue en 2 % y el apalancamiento en 3, que es lo que él publica para esta estrategia. No hay filtro de noticias: el curso y X se contradicen y aquí no hay calendario.
+
 ## 1.4.0
 
 - Comisión taker y slippage en el paper y en el backtest (`fee_pct_per_side`, `slippage_pct_per_side`). Por defecto 0, así que el balance de una instalación actual no cambia hasta que se pongan. El taker de Blofin ronda 0,06 % y un slippage de 0,02 % por lado es el supuesto usado en la evaluación.

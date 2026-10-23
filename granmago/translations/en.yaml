@@ -77,3 +77,27 @@ configuration:
   regime_er_min:
     name: Minimum efficiency ratio
     description: Used when the regime filter includes er. Entries need a 4H Kaufman ER at or above this value.
+  strategy:
+    name: Strategy
+    description: scanner keeps the score entries. granmago uses the course rules (sweep or pullback, stochastic veto, squeeze). The scanner stays available.
+  granmago_variant:
+    name: Gran Mago variant
+    description: a is longs and shorts confirmed by two 4H closes. b is longs only, confirmed by one 12H close.
+  granmago_max_adds:
+    name: Averaging adds
+    description: Extra fills at the swept extreme, 0, 1 or 2. The first entry is sized so every leg stopped out is still one risk percent. 0 does not average.
+  granmago_momentum_exit:
+    name: Momentum exit
+    description: Close a course trade when the stochastic is exhausted and the squeeze histogram is rolling over.
+  granmago_max_hold_bars:
+    name: Maximum hold (bars)
+    description: Close a course trade after this many confirmation candles. 15 is about two and a half days on 4H and a week on 12H. 0 disables the time exit.
+  granmago_breakeven_r:
+    name: Gran Mago breakeven (R)
+    description: Move the course stop to the entry after this many R. 0 leaves the stop where it was placed. The course never specified this.
+  granmago_min_rr:
+    name: Minimum reward to risk
+    description: Skip a course signal whose target is closer than this multiple of the stop. 0 keeps every target, including a stop wider than the target.
+  granmago_stop_pad_pct:
+    name: Stop pad %
+    description: The stop sits beyond the swept wick by at least this percent of price, or by half of the 4H ATR, whichever is wider.

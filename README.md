@@ -63,6 +63,14 @@ Por eso una **entrada nueva** se reduce al hueco que quede, o no se abre, cuando
 | regime_filter | off | `off`, `slope`, `adx`, `er`, `slope_adx` o `slope_er` |
 | regime_adx_min | 20 | ADX mínimo de 4H cuando el filtro usa adx |
 | regime_er_min | 0.2 | Efficiency ratio mínimo de 4H cuando el filtro usa er |
+| strategy | scanner | `scanner` (score de 1.4.0) o `granmago` (reglas del curso) |
+| granmago_variant | a | `a`: largos y cortos, dos cierres de 4H. `b`: solo largos, un cierre de 12H |
+| granmago_max_adds | 0 | Añadidos en el extremo barrido. 0, 1 o 2. 0 no promedia |
+| granmago_momentum_exit | true | Cierra si el estocástico y el squeeze se agotan |
+| granmago_max_hold_bars | 15 | Velas de confirmación antes de salir por tiempo. 0 lo quita |
+| granmago_breakeven_r | 0 | Mueve el stop a la entrada al llegar a este R. 0 no lo mueve |
+| granmago_min_rr | 0 | Relación mínima objetivo/stop. 0 acepta un stop más ancho que el objetivo |
+| granmago_stop_pad_pct | 0.3 | Margen mínimo del stop más allá de la mecha, en % del precio |
 | log_level | info | Log del complemento |
 
 ## Riesgo, apalancamiento y el estado guardado
@@ -79,4 +87,24 @@ Con comisión y slippage en 0 el paper se comporta como en 1.3.0. Para acercarlo
 
 El score 100 ya no es el mismo conjunto que 95. 100 exige el bonus de estocástico (largo con %K < 60, corto con %K > 40). 95 es el setup completo sin ese bonus. No hay puntuaciones entre 81 y 94, así que un umbral de 90 abre lo mismo que 95.
 
-`regime_filter` en `off` no descarta señales. `slope` mira la EMA50 diaria contra su valor de hace 5 días: no abre cortos si esa media sube ni largos si baja. `adx` exige ADX(14) de 4H ≥ `regime_adx_min`. `er` exige el efficiency ratio de Kaufman de 20 velas de 4H ≥ `regime_er_min`. Las combinaciones exigen las dos cosas. Si falta el dato, esa entrada no se abre.
+`regime_filter` en `off` no descarta señales. `slope` mira la EMA50 diaria contra su valor de hace 5 días: no abre cortos si esa media sube ni largos si baja. `adx` exige ADX(14) de 4H ≥ `regime_adx_min`. `er` exige el efficiency ratio de Kaufman de 20 velas de 4H ≥ `regime_er_min`. Las combinaciones exigen las dos cosas. Si falta el dato, esa entrada no se abre. Con `strategy: granmago` ese filtro sigue aplicando si se enciende; la tendencia del curso es otra y no depende de él.
+
+## Modo Gran Mago
+
+`strategy: scanner` es el defecto y no cambia las entradas de 1.4.0. `strategy: granmago` deja de abrir por score. El escaneo sigue calculando el score para la tabla, pero la orden sale de las reglas del curso y de lo que él publica en X.
+
+La variante `a` opera los dos lados y espera **dos cierres de 4H**. La variante `b` solo abre largos y espera **un cierre de 12H**. La vela de 12H son tres velas de 4H de Blofin: 00, 04 y 08 UTC, o 12, 16 y 20 UTC. No se entra a mitad de vela ni en una vela posterior si la de confirmación ya pasó.
+
+La fase la marcan la EMA50 semanal y la diaria. Si no coinciden, manda la diaria. Un solo cierre al otro lado de la media no cambia la fase; hacen falta dos seguidos.
+
+El setup A barre el mínimo o máximo diario importante (pivote de cierres, cinco velas a cada lado, el más extremo de los últimos 30 días que aún no se haya barrido) y espera los cierres de vuelta al nivel donde más mínimos o máximos de la vela de confirmación coinciden, con una tolerancia del 0,2 % y al menos tres toques. Si no hay ese racimo, el nivel es el propio pivote. La ventana es de 30 días porque 90 dejaba sin barrer el origen de la tendencia y ese mínimo viejo impedía cualquier barrido más cercano: el extremo que cuenta es el del rango que se ve. El setup B es el retroceso a favor de tendencia: la mecha toca la EMA50 diaria, un swing ya roto, un imbalance de tres velas o el 50 % de una mecha grande, y luego vienen los mismos cierres. Mientras el setup A está armado no se toma el B.
+
+El estocástico es 14, 3, 3 y solo veta: no hay largo con %K por encima de 80 ni corto con %K por debajo de 20. La zona media no bloquea. El filtro de impulso aproxima el script «SQZ ADX» de TradingView, que no publica parámetros, con el Squeeze Momentum de LazyBear: Bandas de Bollinger 20 y 2, Canal de Keltner 20 y 1,5 veces la media simple del true range, histograma = regresión lineal de `cierre − media(media(máximo 20, mínimo 20), media del cierre 20)`. Para un largo hace falta el histograma negativo y subiendo, o cruzando por encima de cero, y el ADX(14) de Wilder subiendo respecto a la vela anterior (`adx > adx[1]`). El corto es el espejo. Esos indicadores se miran en la vela de confirmación (4H o 12H), no en diario.
+
+El stop es un stop de precio más allá de la mecha barrida, a `max(0,5 × ATR de 14 velas de 4H, granmago_stop_pad_pct % del precio)`. Si un imbalance sin rellenar o una mecha grande atraviesa ese margen, el stop pasa al otro lado del hueco. Por encima del 8 % del precio la operación no se abre. En X la invalidación a veces es el cierre de 12H al otro lado de la mecha: aquí ese cierre solo impide promediar; la posición espera el stop de precio, porque el bot vigila cada tick. El objetivo es el clúster del swing diario anterior en la dirección del beneficio, un 0,1 % por dentro del extremo. No hay objetivo en R. `granmago_min_rr` en 0 no descarta un stop más ancho que el objetivo. Sus propias cifras (77 % de aciertos y profit factor 1,38) implican un beneficio medio de unas 0,4 veces la pérdida media, así que el filtro de 1,5 del apunte del curso queda apagado a propósito.
+
+No hay trailing en este modo. `granmago_momentum_exit` cierra cuando el estocástico está agotado y el histograma del squeeze pierde fuerza. A las `granmago_max_hold_bars` velas de confirmación (15 por defecto) se cierra por tiempo. `granmago_breakeven_r` en 0 no mueve el stop: él lo mencionó y no llegó a explicarlo.
+
+`granmago_max_adds` en 0 no promedia. En 1 o 2, la primera orden arriesga `risk_pct / (1 + añadidos)` y cada añadido el mismo importe, así el stop de todas las patas sigue siendo un solo `risk_pct`. El añadido solo entra si el precio toca el extremo barrido sin tocar el stop, y nunca después de un cierre de confirmación al otro lado de ese extremo.
+
+El riesgo del 2 % y el apalancamiento 3 ya eran el defecto del complemento y coinciden con lo que él escribe en X («máx 2 % y x3»). El filtro de noticias no está: el curso dice no operar con datos y en X dice que el IPC no le cambia la idea, y no hay un calendario fiable en el complemento. La contratendencia y el scalping de varios intentos tampoco se programan.

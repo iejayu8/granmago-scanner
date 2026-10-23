@@ -351,12 +351,21 @@ def mark(pair, price):
 
 def _forward_levels(pos, p0, p1):
     levels = []
-    for level in (
+    extras = [
         server._as_price(pos.get("sl")),
         server._as_price(pos.get("tp")),
         partial_level(pos),
         activation_price(pos),
-    ):
+    ]
+    if pos.get("strategy") == "granmago":
+        try:
+            done = int(pos.get("addsDone") or 0)
+            allowed = int(pos.get("maxAdds") or 0)
+        except (TypeError, ValueError):
+            done, allowed = 0, 0
+        if done < allowed and not pos.get("addBlocked"):
+            extras.append(server._as_price(pos.get("addPrice")))
+    for level in extras:
         if level is None:
             continue
         if p1 > p0 and p0 < level < p1:

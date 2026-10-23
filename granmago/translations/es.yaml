@@ -77,3 +77,27 @@ configuration:
   regime_er_min:
     name: Efficiency ratio mínimo
     description: Se usa cuando el filtro incluye er. La entrada exige un ER de Kaufman en 4H igual o mayor.
+  strategy:
+    name: Estrategia
+    description: scanner mantiene las entradas por score. granmago usa las reglas del curso (barrido o retroceso, veto del estocástico, squeeze). El scanner sigue disponible.
+  granmago_variant:
+    name: Variante Gran Mago
+    description: a opera largos y cortos con dos cierres de 4H. b solo largos, con un cierre de 12H.
+  granmago_max_adds:
+    name: Promedios
+    description: Entradas extra en el extremo barrido, 0, 1 o 2. La primera se dimensiona para que todas las patas, si saltan el stop, sigan siendo un solo riesgo. 0 no promedia.
+  granmago_momentum_exit:
+    name: Salida por agotamiento
+    description: Cierra la operación del curso cuando el estocástico está agotado y el histograma del squeeze gira.
+  granmago_max_hold_bars:
+    name: Máximo de velas
+    description: Cierra la operación del curso tras estas velas de confirmación. 15 son unos dos días y medio en 4H y una semana en 12H. 0 desactiva la salida por tiempo.
+  granmago_breakeven_r:
+    name: Breakeven Gran Mago (R)
+    description: Mueve el stop del curso a la entrada tras estos R. 0 lo deja donde se puso. El curso no llegó a explicar el breakeven.
+  granmago_min_rr:
+    name: Relación mínima beneficio/riesgo
+    description: Descarta una señal cuyo objetivo esté más cerca que este múltiplo del stop. 0 acepta cualquier objetivo, también con el stop más ancho que el objetivo.
+  granmago_stop_pad_pct:
+    name: Margen del stop %
+    description: El stop queda más allá de la mecha barrida al menos este porcentaje del precio, o medio ATR de 4H, el que sea mayor.

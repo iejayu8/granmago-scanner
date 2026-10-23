@@ -214,6 +214,8 @@ function motivo(reason) {
   if (reason === "trailing") return "Trailing";
   if (reason === "partial") return "Parcial";
   if (reason === "breakeven") return "Breakeven";
+  if (reason === "momentum") return "Agotamiento";
+  if (reason === "time") return "Tiempo";
   return reason == null ? "-" : String(reason);
 }
 
@@ -273,8 +275,18 @@ function render(s) {
 
   const entryThreshold = (s.settings && Number.isFinite(+s.settings.entryThreshold))
     ? +s.settings.entryThreshold : 100;
-  $("entryRule").textContent = "Umbral de entrada: " + entryThreshold
-    + ". Abre hasta " + maxPos + " monedas distintas, el mejor score primero.";
+  const strategy = (s.settings && s.settings.strategy) || "scanner";
+  if (strategy === "granmago") {
+    const variant = String((s.settings && s.settings.granmagoVariant) || "a").toUpperCase();
+    const adds = (s.settings && Number.isFinite(+s.settings.granmagoMaxAdds))
+      ? +s.settings.granmagoMaxAdds : 0;
+    $("entryRule").textContent = "Modo Gran Mago, variante " + variant
+      + (adds ? (", hasta " + adds + " promedios") : ", sin promediar")
+      + ". El score se muestra y no abre operaciones.";
+  } else {
+    $("entryRule").textContent = "Umbral de entrada: " + entryThreshold
+      + ". Abre hasta " + maxPos + " monedas distintas, el mejor score primero.";
+  }
 
   const rows = s.lastScan || [];
   $("scanTable").innerHTML = rows.length ? rows.map((r) => {
