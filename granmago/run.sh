@@ -2,45 +2,58 @@
 
 export DATA_DIR=/data
 export PORT=8787
+
+# 1.5.0 saved every strategy knob. Those keys are gone from the schema.
+# Supervisor only warns about unknown options, but a later save can reject
+# them. Drop them when the Supervisor API answers. If it does not, the
+# process still starts: server.py ignores these keys.
+options_json="$(bashio::addon.options 2>/dev/null || true)"
+obsolete=(
+  scan_seconds
+  trailing_enabled
+  trailing_activation_pct
+  trailing_distance
+  entry_threshold
+  partial_tp_r
+  partial_tp_fraction
+  partial_move_breakeven
+  stop_mode
+  stop_atr_period
+  stop_atr_mult
+  trailing_activation_r
+  trailing_keep_tp
+  pair_cooldown_minutes
+  max_same_direction_risk_r
+  regime_filter
+  regime_adx_min
+  regime_er_min
+  strategy
+  granmago_variant
+  granmago_max_adds
+  granmago_momentum_exit
+  granmago_max_hold_bars
+  granmago_breakeven_r
+  granmago_min_rr
+  granmago_stop_pad_pct
+  granmago_style
+  granmago_setups
+)
+for key in "${obsolete[@]}"; do
+  if [ -n "${options_json}" ] && bashio::jq.exists "${options_json}" ".${key}"; then
+    bashio::log.info "Quitando la opción obsoleta ${key}"
+    bashio::addon.option "${key}" || bashio::log.warning "No se pudo quitar ${key}; el servidor la ignora"
+  fi
+done
+
 export LOG_LEVEL="$(bashio::config 'log_level')"
 export RISK_PCT="$(bashio::config 'risk_pct')"
 export LEVERAGE="$(bashio::config 'leverage')"
 export INITIAL_BALANCE="$(bashio::config 'initial_balance')"
-export SCAN_SECONDS="$(bashio::config 'scan_seconds')"
-export TRAILING_ENABLED="$(bashio::config 'trailing_enabled')"
-export TRAILING_ACTIVATION_PCT="$(bashio::config 'trailing_activation_pct')"
-export TRAILING_DISTANCE="$(bashio::config 'trailing_distance')"
-export ENTRY_THRESHOLD="$(bashio::config 'entry_threshold')"
 export MAX_POSITIONS="$(bashio::config 'max_positions')"
 export FEE_PCT_PER_SIDE="$(bashio::config 'fee_pct_per_side')"
 export SLIPPAGE_PCT_PER_SIDE="$(bashio::config 'slippage_pct_per_side')"
-export TAKE_PROFIT_R="$(bashio::config 'take_profit_r')"
-export PARTIAL_TP_R="$(bashio::config 'partial_tp_r')"
-export PARTIAL_TP_FRACTION="$(bashio::config 'partial_tp_fraction')"
-export PARTIAL_MOVE_BREAKEVEN="$(bashio::config 'partial_move_breakeven')"
-export STOP_MODE="$(bashio::config 'stop_mode')"
-export STOP_ATR_PERIOD="$(bashio::config 'stop_atr_period')"
-export STOP_ATR_MULT="$(bashio::config 'stop_atr_mult')"
-export TRAILING_ACTIVATION_R="$(bashio::config 'trailing_activation_r')"
-export TRAILING_KEEP_TP="$(bashio::config 'trailing_keep_tp')"
-export PAIR_COOLDOWN_MINUTES="$(bashio::config 'pair_cooldown_minutes')"
-export MAX_SAME_DIRECTION_RISK_R="$(bashio::config 'max_same_direction_risk_r')"
-export REGIME_FILTER="$(bashio::config 'regime_filter')"
-export REGIME_ADX_MIN="$(bashio::config 'regime_adx_min')"
-export REGIME_ER_MIN="$(bashio::config 'regime_er_min')"
-export STRATEGY="$(bashio::config 'strategy')"
-export GRANMAGO_VARIANT="$(bashio::config 'granmago_variant')"
-export GRANMAGO_MAX_ADDS="$(bashio::config 'granmago_max_adds')"
-export GRANMAGO_MOMENTUM_EXIT="$(bashio::config 'granmago_momentum_exit')"
-export GRANMAGO_MAX_HOLD_BARS="$(bashio::config 'granmago_max_hold_bars')"
-export GRANMAGO_BREAKEVEN_R="$(bashio::config 'granmago_breakeven_r')"
-export GRANMAGO_MIN_RR="$(bashio::config 'granmago_min_rr')"
-export GRANMAGO_STOP_PAD_PCT="$(bashio::config 'granmago_stop_pad_pct')"
-export GRANMAGO_STYLE="$(bashio::config 'granmago_style')"
-export GRANMAGO_SETUPS="$(bashio::config 'granmago_setups')"
-# JSON array from the add-on option. server.py also accepts a comma-separated list.
-# A missing key (an options file from before this option existed) leaves the
-# original 12 pairs in place.
+# JSON array. server.py also accepts a comma-separated list. A missing key
+# leaves the 28-pair monitoring book in place.
 if bashio::config.exists 'pairs'; then
   export PAIRS="$(bashio::config 'pairs')"
 fi

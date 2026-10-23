@@ -6,7 +6,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY server.py .
+# Every local module server.py imports has to be named here.
+# tests/test_image_copy.py fails if one is missing.
+COPY server.py granmago_strategy.py ./
 COPY static/ static/
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh

@@ -21,24 +21,61 @@ import granmago_strategy
 import requests
 from flask import Flask, jsonify, request
 
-# The 12-pair book shipped since 1.0.0. An empty or invalid pairs option
-# falls back to this list, so an upgrade does not start scanning new coins.
+# The 12-pair book shipped from 1.0.0 through 1.5.0. Research tools still
+# walk this list (PAIRS below). It is not the add-on default anymore.
 DEFAULT_PAIRS = [
     "BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "BNB-USDT", "ADA-USDT",
     "DOGE-USDT", "AVAX-USDT", "LINK-USDT", "DOT-USDT", "LTC-USDT", "BCH-USDT",
 ]
 # Liquid USDT swaps used in the 1.5.0 walk-forward, frozen from 24h quote
-# volume on 23 Oct 2026 and listed on or before 23 Oct 2024. Not the default.
+# volume on 23 Oct 2026 and listed on or before 23 Oct 2024. This is the
+# add-on default. An empty or invalid pairs option falls back to it.
 LIQUID_PAIRS = DEFAULT_PAIRS + [
     "ZEC-USDT", "PEPE-USDT", "1000BONK-USDT", "NEAR-USDT", "XMR-USDT",
     "INJ-USDT", "SUI-USDT", "TAO-USDT", "IOST-USDT", "XLM-USDT",
     "TRX-USDT", "HBAR-USDT", "ENA-USDT", "WLD-USDT", "AAVE-USDT", "QNT-USDT",
 ]
+# Research universe. The live loop uses active_pairs(), not this list.
 PAIRS = list(DEFAULT_PAIRS)
 _PAIR_RE = re.compile(r"^[A-Z0-9]+-USDT$")
 MAX_CONFIGURED_PAIRS = 40
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
+
+# Walk-forward monitoring setup. The add-on pins these on every start.
+# Leftover options and a saved copy in state.json do not change them.
+# Research tools can still write the settings dict after startup.
+FIXED_BEHAVIOUR = {
+    "scanSeconds": 90,
+    "trailingEnabled": False,
+    "trailingActivationPct": 1.0,
+    "trailingDistance": 0.5,
+    "trailingActivationR": 0.0,
+    "trailingKeepTp": False,
+    "entryThreshold": 100,
+    "takeProfitR": 1.7,
+    "partialTpR": 0.0,
+    "partialTpFraction": 0.5,
+    "partialMoveBreakeven": True,
+    "stopMode": "swing",
+    "stopAtrPeriod": 14,
+    "stopAtrMult": 2.0,
+    "pairCooldownMinutes": 0,
+    "maxSameDirectionRiskR": 0.0,
+    "regimeFilter": "off",
+    "regimeAdxMin": 20.0,
+    "regimeErMin": 0.2,
+    "strategy": "granmago",
+    "granmagoVariant": "a",
+    "granmagoMaxAdds": 0,
+    "granmagoMomentumExit": True,
+    "granmagoMaxHoldBars": 15,
+    "granmagoBreakevenR": 0.0,
+    "granmagoMinRr": 0.0,
+    "granmagoStopPadPct": 0.3,
+    "granmagoStyle": "sweep",
+    "granmagoSetups": "both",
+}
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 STATE_FILE = DATA_DIR / "state.json"
 PORT = int(os.environ.get("PORT", "8787"))
@@ -158,11 +195,10 @@ def _pair_items(value):
 def parse_pairs(value, fallback=None):
     """USDT-swap symbols, uppercased, de-duplicated, capped.
 
-    An empty or fully invalid value uses the 12-pair default. That is what
-    an upgrade with no pairs option, and a blank option, both do.
+    An empty or fully invalid value uses the 28-pair monitoring book.
     """
     if fallback is None:
-        fallback = list(DEFAULT_PAIRS)
+        fallback = list(LIQUID_PAIRS)
     out = []
     seen = set()
     for item in _pair_items(value):
@@ -179,87 +215,43 @@ def parse_pairs(value, fallback=None):
 def active_pairs():
     """Pairs the scanner walks. Open positions outside this list stay monitored."""
     settings = _settings()
-    return parse_pairs(settings.get("pairs"), DEFAULT_PAIRS)
+    return parse_pairs(settings.get("pairs"), LIQUID_PAIRS)
 
 
 def _apply_runtime_options(settings):
-    """Apply add-on options. A leftover max-hold field is ignored.
+    """Apply the exposed options, then pin the monitoring behaviour.
 
-    Positions close only by the stop, the target, the trailing stop, a
-    partial target, or a manual close. There is no time limit.
+    risk, leverage, fees, slippage, max positions and pairs come from the
+    environment when the add-on exported them, otherwise from the saved
+    state, otherwise from the 1.5.1 defaults. Supervisor fills a default
+    only when that key is missing, so an upgrade keeps a value already saved.
 
-    When the add-on exports an option (run.sh), that value replaces the copy
-    saved in state.json. The page can change risk and leverage until the next
-    restart; the next start applies the add-on values again.
+    Strategy, variant, style, exits, trailing, regime, cooldown and the scan
+    interval are fixed. Old environment variables and a saved copy of those
+    keys are ignored. The page can still change risk and leverage until the
+    next restart; the next start applies the add-on values again.
     """
     settings.pop("maxHoldHours", None)
-    _option_bool(settings, "TRAILING_ENABLED", "trailingEnabled", True)
-    _option_float(settings, "TRAILING_ACTIVATION_PCT", "trailingActivationPct", 1.0)
-    _option_float(settings, "TRAILING_DISTANCE", "trailingDistance", 0.5)
-    _option_float(settings, "TRAILING_ACTIVATION_R", "trailingActivationR", 0.0)
-    _option_bool(settings, "TRAILING_KEEP_TP", "trailingKeepTp", False)
-    if _env_set("ENTRY_THRESHOLD"):
-        settings["entryThreshold"] = _sane_threshold(os.environ.get("ENTRY_THRESHOLD"))
-    else:
-        settings["entryThreshold"] = _sane_threshold(settings.get("entryThreshold", 100))
     if _env_set("MAX_POSITIONS"):
-        settings["maxPositions"] = _sane_max_positions(os.environ.get("MAX_POSITIONS"))
+        settings["maxPositions"] = _sane_max_positions(os.environ.get("MAX_POSITIONS"), 3)
     else:
-        settings["maxPositions"] = _sane_max_positions(settings.get("maxPositions", 5))
+        settings["maxPositions"] = _sane_max_positions(settings.get("maxPositions", 3), 3)
     if _env_set("RISK_PCT"):
-        settings["riskPct"] = _sane_risk_pct(os.environ.get("RISK_PCT"))
+        settings["riskPct"] = _sane_risk_pct(os.environ.get("RISK_PCT"), 1.0)
     else:
-        settings["riskPct"] = _sane_risk_pct(settings.get("riskPct", 2))
+        settings["riskPct"] = _sane_risk_pct(settings.get("riskPct", 1), 1.0)
     if _env_set("LEVERAGE"):
         settings["leverage"] = _sane_leverage(os.environ.get("LEVERAGE"))
     else:
         settings["leverage"] = _sane_leverage(settings.get("leverage", 3))
-    _option_float(settings, "FEE_PCT_PER_SIDE", "feePctPerSide", 0.0)
-    _option_float(settings, "SLIPPAGE_PCT_PER_SIDE", "slippagePctPerSide", 0.0)
-    _option_float(settings, "TAKE_PROFIT_R", "takeProfitR", 1.7)
-    _option_float(settings, "PARTIAL_TP_R", "partialTpR", 0.0)
-    _option_float(settings, "PARTIAL_TP_FRACTION", "partialTpFraction", 0.5)
-    _option_bool(settings, "PARTIAL_MOVE_BREAKEVEN", "partialMoveBreakeven", True)
-    if _env_set("STOP_MODE"):
-        settings["stopMode"] = _sane_stop_mode(os.environ.get("STOP_MODE"))
-    else:
-        settings["stopMode"] = _sane_stop_mode(settings.get("stopMode", "swing"))
-    _option_int(settings, "STOP_ATR_PERIOD", "stopAtrPeriod", 14, 2, 100)
-    _option_float(settings, "STOP_ATR_MULT", "stopAtrMult", 2.0)
-    _option_int(settings, "PAIR_COOLDOWN_MINUTES", "pairCooldownMinutes", 0, 0, 10080)
-    _option_float(settings, "MAX_SAME_DIRECTION_RISK_R", "maxSameDirectionRiskR", 0.0)
-    if _env_set("REGIME_FILTER"):
-        settings["regimeFilter"] = _sane_regime(os.environ.get("REGIME_FILTER"))
-    else:
-        settings["regimeFilter"] = _sane_regime(settings.get("regimeFilter", "off"))
-    _option_float(settings, "REGIME_ADX_MIN", "regimeAdxMin", 20.0)
-    _option_float(settings, "REGIME_ER_MIN", "regimeErMin", 0.2)
-    if _env_set("STRATEGY"):
-        settings["strategy"] = _sane_strategy(os.environ.get("STRATEGY"))
-    else:
-        settings["strategy"] = _sane_strategy(settings.get("strategy", "scanner"))
-    if _env_set("GRANMAGO_VARIANT"):
-        settings["granmagoVariant"] = _sane_variant(os.environ.get("GRANMAGO_VARIANT"))
-    else:
-        settings["granmagoVariant"] = _sane_variant(settings.get("granmagoVariant", "a"))
-    _option_int(settings, "GRANMAGO_MAX_ADDS", "granmagoMaxAdds", 0, 0, 2)
-    _option_bool(settings, "GRANMAGO_MOMENTUM_EXIT", "granmagoMomentumExit", True)
-    _option_int(settings, "GRANMAGO_MAX_HOLD_BARS", "granmagoMaxHoldBars", 15, 0, 40)
-    _option_float(settings, "GRANMAGO_BREAKEVEN_R", "granmagoBreakevenR", 0.0)
-    _option_float(settings, "GRANMAGO_MIN_RR", "granmagoMinRr", 0.0)
-    _option_float(settings, "GRANMAGO_STOP_PAD_PCT", "granmagoStopPadPct", 0.3)
-    if _env_set("GRANMAGO_STYLE"):
-        settings["granmagoStyle"] = granmago_strategy._style_name(os.environ.get("GRANMAGO_STYLE"))
-    else:
-        settings["granmagoStyle"] = granmago_strategy._style_name(settings.get("granmagoStyle", "strict"))
-    if _env_set("GRANMAGO_SETUPS"):
-        settings["granmagoSetups"] = granmago_strategy._setups_name(os.environ.get("GRANMAGO_SETUPS"))
-    else:
-        settings["granmagoSetups"] = granmago_strategy._setups_name(settings.get("granmagoSetups", "both"))
+    _option_float(settings, "FEE_PCT_PER_SIDE", "feePctPerSide", 0.06)
+    _option_float(settings, "SLIPPAGE_PCT_PER_SIDE", "slippagePctPerSide", 0.02)
     if _env_set("PAIRS"):
-        settings["pairs"] = parse_pairs(os.environ.get("PAIRS"))
+        settings["pairs"] = parse_pairs(os.environ.get("PAIRS"), LIQUID_PAIRS)
     else:
-        settings["pairs"] = parse_pairs(settings.get("pairs"), DEFAULT_PAIRS)
+        settings["pairs"] = parse_pairs(settings.get("pairs"), LIQUID_PAIRS)
+    for key, value in FIXED_BEHAVIOUR.items():
+        settings[key] = value
 
 
 def _option_bool(settings, env_name, key, default):
@@ -444,7 +436,7 @@ def granmago_stop_pad_pct():
     return _sane_float(_settings().get("granmagoStopPadPct", 0.3), 0.3)
 
 
-def _sane_risk_pct(value, fallback=2.0):
+def _sane_risk_pct(value, fallback=1.0):
     try:
         num = float(value)
     except (TypeError, ValueError):
@@ -524,8 +516,13 @@ def _as_price(value):
     return num
 
 
-def ensure_position_fields(pos):
-    """Fill trailing fields missing from a 1.0.0 position. Does not close it."""
+def ensure_position_fields(pos, state=None):
+    """Fill trailing fields missing from a 1.0.0 position. Does not close it.
+
+    `state` is the book being loaded. The module-level STATE does not exist
+    yet on the first import, so a position saved before trade ids cannot
+    borrow the counter from it.
+    """
     if not isinstance(pos, dict):
         return pos
     if _as_price(pos.get("initialSl")) is None and _as_price(pos.get("sl")) is not None:
@@ -563,16 +560,17 @@ def ensure_position_fields(pos):
     if pos.get("partialTaken") is None:
         pos["partialTaken"] = False
     if pos.get("tradeId") is None:
-        pos["tradeId"] = _next_trade_id()
+        pos["tradeId"] = _next_trade_id(state)
     return pos
 
 
-def _next_trade_id():
+def _next_trade_id(state=None):
+    book = STATE if state is None else state
     try:
-        n = int(STATE.get("tradeSeq") or 0) + 1
+        n = int(book.get("tradeSeq") or 0) + 1
     except (TypeError, ValueError):
         n = 1
-    STATE["tradeSeq"] = n
+    book["tradeSeq"] = n
     return n
 
 
@@ -797,41 +795,13 @@ def default_state():
         "cooldowns": {},
         "tradeSeq": 0,
         "settings": {
-            "riskPct": _env_float("RISK_PCT", 2),
-            "leverage": _env_int("LEVERAGE", 3),
-            "scanSeconds": max(30, _env_int("SCAN_SECONDS", 90)),
-            "trailingEnabled": True,
-            "trailingActivationPct": 1.0,
-            "trailingDistance": 0.5,
-            "trailingActivationR": 0.0,
-            "trailingKeepTp": False,
-            "entryThreshold": 100,
-            "maxPositions": 5,
-            "feePctPerSide": 0.0,
-            "slippagePctPerSide": 0.0,
-            "takeProfitR": 1.7,
-            "partialTpR": 0.0,
-            "partialTpFraction": 0.5,
-            "partialMoveBreakeven": True,
-            "stopMode": "swing",
-            "stopAtrPeriod": 14,
-            "stopAtrMult": 2.0,
-            "pairCooldownMinutes": 0,
-            "maxSameDirectionRiskR": 0.0,
-            "regimeFilter": "off",
-            "regimeAdxMin": 20.0,
-            "regimeErMin": 0.2,
-            "strategy": "scanner",
-            "granmagoVariant": "a",
-            "granmagoMaxAdds": 0,
-            "granmagoMomentumExit": True,
-            "granmagoMaxHoldBars": 15,
-            "granmagoBreakevenR": 0.0,
-            "granmagoMinRr": 0.0,
-            "granmagoStopPadPct": 0.3,
-            "granmagoStyle": "strict",
-            "granmagoSetups": "both",
-            "pairs": list(DEFAULT_PAIRS),
+            "riskPct": 1.0,
+            "leverage": 3,
+            "maxPositions": 3,
+            "feePctPerSide": 0.06,
+            "slippagePctPerSide": 0.02,
+            "pairs": list(LIQUID_PAIRS),
+            **FIXED_BEHAVIOUR,
         },
     }
     _apply_runtime_options(state["settings"])
@@ -873,7 +843,7 @@ def _migrate_positions(state, raw):
         if pos["pair"] in seen:
             continue
         seen.add(pos["pair"])
-        ensure_position_fields(pos)
+        ensure_position_fields(pos, state)
         cleaned.append(pos)
     state["openPositions"] = cleaned
     state.pop("openPosition", None)
@@ -2333,11 +2303,6 @@ def _apply_settings_locked(body):
     if "leverage" in body:
         try:
             settings["leverage"] = min(10, max(1, int(body["leverage"])))
-        except (TypeError, ValueError):
-            pass
-    if "scanSeconds" in body:
-        try:
-            settings["scanSeconds"] = min(3600, max(30, int(body["scanSeconds"])))
         except (TypeError, ValueError):
             pass
 
