@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Backtest the GranMago paper loop over a fixed window.
 
-Reuses scoring, sizing, the notional cap, SL/TP and trailing from
-granmago/server.py. Does not change add-on behaviour. The add-on charges
-no fees, so this charges none. Candles come from Blofin, the source the
+Reuses scoring, sizing, the notional cap, SL/TP, partials and trailing from
+granmago/server.py. Fees and slippage follow the settings on the variant
+(the add-on defaults are 0). Candles come from Blofin, the source the
 add-on requests before Binance.
 
 The scan is evaluated on each closed 1-minute bar (the live loop scans
@@ -129,26 +129,52 @@ def _fetch_page(url):
     raise RuntimeError("Blofin page failed %s (%s)" % (url, last))
 
 
-def fetch_blofin(inst_id, bar, start_ms, end_ms):
-    """Candles with open time in [start_ms, end_ms], oldest first. Blofin pages newest first."""
+def _covers_end(rows, end_ms):
+    """The last bar reaches the requested end. Used when history starts late."""
+    if not rows:
+        return False
+    span = max(MIN_MS, end_ms - rows[0]["ts"])
+    return rows[-1]["ts"] >= end_ms - max(span * 0.02, 4 * H4_MS)
+
+
+def fetch_blofin(inst_id, bar, start_ms, end_ms, allow_short=False):
+    """Candles with open time in [start_ms, end_ms], oldest first. Blofin pages newest first.
+
+    `allow_short` keeps a pair whose listing is after `start_ms`, as long as
+    the download reaches `end_ms` and stops on a short final page rather than
+    a stall in the middle.
+    """
     cache = CACHE_DIR / ("%s-%s.json" % (inst_id, bar))
     if cache.exists():
         payload = json.loads(cache.read_text(encoding="utf-8"))
         rows = [r for r in payload.get("rows", []) if start_ms <= r["ts"] <= end_ms]
         if _covers(rows, start_ms, end_ms):
             return rows
+        if allow_short and payload.get("short") and _covers_end(rows, end_ms):
+            return rows
         cache.unlink()
     found = {}
     cursor = None
     pages = 0
     stalls = 0
-    while pages < 500:
+    # 1m history for half a year is about 900 pages of 300. Three years of
+    # 15m is about 450. The cap sits above both.
+    while pages < 6000:
         params = {"instId": inst_id, "bar": bar, "limit": "300"}
         if cursor is not None:
             params["after"] = str(cursor)
         url = BLOFIN + "?" + urllib.parse.urlencode(params)
-        body = _fetch_page(url)
+        try:
+            body = _fetch_page(url)
+        except RuntimeError:
+            # An empty page after the retries is the start of listed history,
+            # not a hole, once some bars are already in hand.
+            if allow_short and found:
+                break
+            raise
         pages += 1
+        if pages == 1 or pages % 100 == 0:
+            print("  %s %s page %d" % (inst_id, bar, pages), flush=True)
         batch = body["data"]
         oldest = None
         for raw in batch:
@@ -169,6 +195,8 @@ def fetch_blofin(inst_id, bar, start_ms, end_ms):
         if len(batch) < 300 or (cursor is not None and oldest >= cursor):
             stalls += 1
             if stalls >= 4:
+                if allow_short and found:
+                    break
                 raise RuntimeError("pagination stalled for %s %s at %s" % (inst_id, bar, oldest))
             time.sleep(1.0 * stalls)
             continue
@@ -176,14 +204,17 @@ def fetch_blofin(inst_id, bar, start_ms, end_ms):
         cursor = oldest
         time.sleep(0.05)
     rows = parse_blofin(list(found.values()))
-    if not _covers(rows, start_ms, end_ms):
+    short = not _covers(rows, start_ms, end_ms)
+    if short and not (allow_short and _covers_end(rows, end_ms)):
         raise RuntimeError("incomplete %s %s: %d bars %s → %s" % (
             inst_id, bar, len(rows),
             madrid(rows[0]["ts"]) if rows else "-",
             madrid(rows[-1]["ts"]) if rows else "-",
         ))
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache.write_text(json.dumps({"start": start_ms, "end": end_ms, "rows": rows}), encoding="utf-8")
+    cache.write_text(json.dumps({
+        "start": start_ms, "end": end_ms, "short": short, "rows": rows,
+    }), encoding="utf-8")
     return rows
 
 
@@ -310,12 +341,21 @@ class PairData:
         return h4, d1, w1
 
 
-def activation_price(pos):
-    entry = pos["entry"]
-    move = server.trailing_activation_pct() / 100.0
+def _just_past(pos, price):
+    """A hair beyond `price` in the profit direction, so a >= check fills."""
+    if price is None:
+        return None
     if pos["side"] == "long":
-        return math.nextafter(entry * (1.0 + move), math.inf)
-    return math.nextafter(entry * (1.0 - move), 0.0)
+        return math.nextafter(price, math.inf)
+    return math.nextafter(price, 0.0)
+
+
+def activation_price(pos):
+    return _just_past(pos, server.trailing_activation_price(pos))
+
+
+def partial_level(pos):
+    return _just_past(pos, server.partial_target_price(pos))
 
 
 def _bt_position(pair):
@@ -326,35 +366,46 @@ def _bt_position(pair):
 
 
 def mark(pair, price):
-    """One live monitor tick for `pair` at `price`. Returns the exit reason, or None."""
+    """One live monitor tick for `pair` at `price`. Returns the exit reason, or None.
+
+    Uses server._apply_mark, including partial exits. 'partial' means the
+    position is still open.
+    """
     pos = _bt_position(pair)
     if not pos:
         return None
-    server.ensure_position_fields(pos)
-    side = pos["side"]
-    pnl = server.position_pnl(pos, price)
-    pos["price"] = price
-    if pnl is not None:
-        pos["unrealized"] = round(pnl, 2)
-    server.update_best_price(pos, price)
-    if pos.get("trailingActive"):
-        server.tighten_stop(pos)
-        if server._stop_hit(side, price, pos.get("sl")):
-            server.close_position("trailing", price, pair)
-            return "trailing"
-    else:
-        if server._stop_hit(side, price, pos.get("sl")):
-            server.close_position("SL", price, pair)
-            return "SL"
-        if server._target_hit(side, price, pos.get("tp")):
-            server.close_position("TP", price, pair)
-            return "TP"
-        if server.trailing_should_activate(pos, price):
-            server.activate_trailing(pos)
-            if server._stop_hit(side, price, pos.get("sl")):
-                server.close_position("trailing", price, pair)
-                return "trailing"
-    return None
+    return server._apply_mark(pos, price)
+
+
+def _forward_levels(pos, p0, p1):
+    levels = []
+    extras = [
+        server._as_price(pos.get("sl")),
+        server._as_price(pos.get("tp")),
+        partial_level(pos),
+        activation_price(pos),
+    ]
+    if pos.get("strategy") == "granmago":
+        try:
+            done = int(pos.get("addsDone") or 0)
+            allowed = int(pos.get("maxAdds") or 0)
+        except (TypeError, ValueError):
+            done, allowed = 0, 0
+        if done < allowed and not pos.get("addBlocked"):
+            extras.append(server._as_price(pos.get("addPrice")))
+    for level in extras:
+        if level is None:
+            continue
+        if p1 > p0 and p0 < level < p1:
+            levels.append(level)
+        elif p1 < p0 and p1 < level < p0:
+            levels.append(level)
+    levels.sort(reverse=p1 < p0)
+    unique = []
+    for level in levels:
+        if not unique or abs(unique[-1] - level) > 1e-12:
+            unique.append(level)
+    return unique
 
 
 def drive(pair, p0, p1, gap, on_close):
@@ -362,41 +413,27 @@ def drive(pair, p0, p1, gap, on_close):
 
     A gap fill uses p1 itself (the next print). Inside a 1-minute bar the
     high and low did trade, so a stop or target between the two prices fills
-    at that level. Levels are visited in price order, so a 1% activation is
-    applied before the further fixed target and the target is then dropped.
-    Other open pairs are not touched.
+    at that level. Levels are visited in price order, so an activation or a
+    partial is applied before a further target. A partial leaves the position
+    open and the path continues. Other open pairs are not touched.
     """
-    pos = _bt_position(pair)
-    if not pos:
+    if _bt_position(pair) is None:
         return
+
+    def step(px):
+        reason = mark(pair, px)
+        if _bt_position(pair) is None:
+            on_close(reason, px)
+            return True
+        return False
+
     if gap or p0 == p1:
-        reason = mark(pair, p1)
-        if reason:
-            on_close(reason, p1)
+        step(p1)
         return
-    pos = _bt_position(pair)
-    levels = []
-    sl = server._as_price(pos.get("sl"))
-    tp = server._as_price(pos.get("tp"))
-    if sl is not None:
-        levels.append(sl)
-    if tp is not None and not pos.get("trailingActive"):
-        levels.append(tp)
-    if server.trailing_enabled() and not pos.get("trailingActive"):
-        levels.append(activation_price(pos))
-    mids = []
-    for level in levels:
-        if p1 > p0 and p0 < level < p1:
-            mids.append(level)
-        elif p1 < p0 and p1 < level < p0:
-            mids.append(level)
-    mids.sort(reverse=p1 < p0)
-    for px in mids + [p1]:
+    for px in _forward_levels(_bt_position(pair), p0, p1) + [p1]:
         if _bt_position(pair) is None:
             return
-        reason = mark(pair, px)
-        if reason:
-            on_close(reason, px)
+        if step(px):
             return
 
 
@@ -427,9 +464,25 @@ def new_state(threshold, trailing, max_positions=1, activation=1.0, distance=0.5
             "scanSeconds": 90,
             "trailingEnabled": trailing,
             "trailingActivationPct": activation,
+            "trailingActivationR": 0.0,
+            "trailingKeepTp": False,
             "trailingDistance": distance,
             "entryThreshold": threshold,
             "maxPositions": max_positions,
+            "feePctPerSide": 0.0,
+            "slippagePctPerSide": 0.0,
+            "takeProfitR": 1.7,
+            "partialTpR": 0.0,
+            "partialTpFraction": 0.5,
+            "partialMoveBreakeven": True,
+            "stopMode": "swing",
+            "stopAtrPeriod": 14,
+            "stopAtrMult": 2.0,
+            "pairCooldownMinutes": 0,
+            "maxSameDirectionRiskR": 0.0,
+            "regimeFilter": "off",
+            "regimeAdxMin": 20.0,
+            "regimeErMin": 0.2,
         },
     }
 
@@ -483,18 +536,26 @@ class Variant:
 
         def on_close(reason, price):
             meta = self._open_meta.pop(pair, {})
-            hist = self.state["history"][0]
+            hist = self.state["history"][0] if self.state["history"] else {}
+            pnl = hist.get("tradePnl")
+            if pnl is None:
+                pnl = hist.get("pnl")
+            r_mult = hist.get("tradeR")
+            if r_mult is None:
+                r_mult = hist.get("rMultiple")
             closed["row"] = {
-                "pair": hist["pair"],
-                "side": hist["side"],
+                "pair": hist.get("pair", pair),
+                "side": hist.get("side"),
                 "entry_ms": meta.get("entry_ms"),
                 "exit_ms": decision_ms,
-                "entry": hist["entry"],
-                "exit": hist["exit"],
+                "entry": hist.get("entry"),
+                "exit": hist.get("exit"),
                 "reason": reason,
-                "pnl": hist["pnl"],
+                "pnl": pnl,
+                "r": r_mult,
                 "score": meta.get("score"),
                 "capped": bool(meta.get("capped")),
+                "tradeId": hist.get("tradeId"),
             }
 
         if prev_close is None:
@@ -542,6 +603,7 @@ class Variant:
                 "entry_ms": decision_ms,
                 "score": score,
                 "capped": bool(pos.get("notionalCapped")),
+                "tradeId": pos.get("tradeId"),
             }
             if pos.get("notionalCapped"):
                 self.capped_entries += 1
@@ -665,36 +727,51 @@ def _self_check_exits():
     print("exit self-check ok", flush=True)
 
 
+def _load_one_pair(pair, m1_start, h4_start, d1_start, w1_start, end_ms):
+    print("fetch %s" % pair, flush=True)
+    last_err = None
+    m1 = h4 = d1 = w1 = None
+    for attempt in range(4):
+        try:
+            m1 = fetch_blofin(pair, "1m", m1_start, end_ms)
+            h4 = fetch_blofin(pair, "4H", h4_start, end_ms)
+            d1 = fetch_blofin(pair, "1D", d1_start, end_ms)
+            w1 = fetch_blofin(pair, "1W", w1_start, end_ms)
+            last_err = None
+            break
+        except RuntimeError as exc:
+            last_err = exc
+            print("  retry %s (%s)" % (pair, exc), flush=True)
+            time.sleep(2 * (attempt + 1))
+    if last_err is not None:
+        raise last_err
+    if len(m1) < 1000 or len(h4) < 80 or len(d1) < 60 or len(w1) < 50:
+        raise RuntimeError("incomplete history for %s m1=%d h4=%d d1=%d w1=%d" % (
+            pair, len(m1), len(h4), len(d1), len(w1)))
+    print("  1m %d (%s → %s) 4H %d 1D %d 1W %d" % (
+        len(m1), madrid(m1[0]["ts"]), madrid(m1[-1]["ts"] + MIN_MS), len(h4), len(d1), len(w1)), flush=True)
+    return pair, PairData(pair, m1, h4, d1, w1)
+
+
 def load_market(start_ms, end_ms):
     # 4H window the EMA needs at the first scan: 150 bars ≈ 25 days, plus margin.
     h4_start = start_ms - 40 * DAY_MS
     d1_start = start_ms - 120 * DAY_MS
     w1_start = start_ms - 80 * WEEK_MS
     m1_start = bucket_open(start_ms, H4_MS)
+    # A few pairs at a time. Each 1m history is hundreds of pages; sequential
+    # fetches dominated the walk-forward. Cached pairs return immediately.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     pairs = {}
-    for pair in server.PAIRS:
-        print("fetch %s" % pair, flush=True)
-        last_err = None
-        for attempt in range(4):
-            try:
-                m1 = fetch_blofin(pair, "1m", m1_start, end_ms)
-                h4 = fetch_blofin(pair, "4H", h4_start, end_ms)
-                d1 = fetch_blofin(pair, "1D", d1_start, end_ms)
-                w1 = fetch_blofin(pair, "1W", w1_start, end_ms)
-                last_err = None
-                break
-            except RuntimeError as exc:
-                last_err = exc
-                print("  retry %s (%s)" % (pair, exc), flush=True)
-                time.sleep(2 * (attempt + 1))
-        if last_err is not None:
-            raise last_err
-        if len(m1) < 1000 or len(h4) < 80 or len(d1) < 60 or len(w1) < 50:
-            raise SystemExit("incomplete history for %s m1=%d h4=%d d1=%d w1=%d" % (
-                pair, len(m1), len(h4), len(d1), len(w1)))
-        pairs[pair] = PairData(pair, m1, h4, d1, w1)
-        print("  1m %d (%s → %s) 4H %d 1D %d 1W %d" % (
-            len(m1), madrid(m1[0]["ts"]), madrid(m1[-1]["ts"] + MIN_MS), len(h4), len(d1), len(w1)), flush=True)
+    workers = min(3, len(server.PAIRS))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = [
+            pool.submit(_load_one_pair, pair, m1_start, h4_start, d1_start, w1_start, end_ms)
+            for pair in server.PAIRS
+        ]
+        for fut in as_completed(futs):
+            pair, data = fut.result()
+            pairs[pair] = data
     return pairs
 
 
@@ -818,7 +895,7 @@ def run():
     results = [summarize(v, clock[-1] + MIN_MS if clock else end_ms) for v in variants]
     report = {
         "source": "Blofin openapi.blofin.com candles (add-on primary; Binance not used)",
-        "fees": "none (the add-on applies none)",
+        "fees": "none in this comparison (fee_pct_per_side and slippage are 0)",
         "start": madrid(start_ms),
         "end": madrid(clock[-1] + MIN_MS) if clock else madrid(end_ms),
         "minutes": len(clock),

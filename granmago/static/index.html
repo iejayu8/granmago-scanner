@@ -169,7 +169,7 @@
     <div id="tab-history" class="hidden">
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Fecha</th><th>Par</th><th>Lado</th><th>PnL</th><th>Motivo</th></tr></thead>
+          <thead><tr><th>Fecha</th><th>Par</th><th>Lado</th><th>PnL</th><th>R</th><th>Motivo</th></tr></thead>
           <tbody id="historyTrades"></tbody>
         </table>
       </div>
@@ -212,7 +212,18 @@ let closingPair = null;
 function motivo(reason) {
   if (reason === "manual") return "Manual";
   if (reason === "trailing") return "Trailing";
+  if (reason === "partial") return "Parcial";
+  if (reason === "breakeven") return "Breakeven";
+  if (reason === "momentum") return "Agotamiento";
+  if (reason === "time") return "Tiempo";
   return reason == null ? "-" : String(reason);
+}
+
+function fmtR(v) {
+  if (v === null || v === undefined || v === "") return "-";
+  const n = +v;
+  if (!isFinite(n)) return "-";
+  return (n >= 0 ? "+" : "") + n.toFixed(2) + "R";
 }
 ["riskPct", "leverage", "initBalance"].forEach((id) => {
   $(id).addEventListener("input", () => { formDirty = true; });
@@ -264,8 +275,26 @@ function render(s) {
 
   const entryThreshold = (s.settings && Number.isFinite(+s.settings.entryThreshold))
     ? +s.settings.entryThreshold : 100;
-  $("entryRule").textContent = "Umbral de entrada: " + entryThreshold
-    + ". Abre hasta " + maxPos + " monedas distintas, el mejor score primero.";
+  const strategy = (s.settings && s.settings.strategy) || "scanner";
+  if (strategy === "granmago") {
+    const variant = String((s.settings && s.settings.granmagoVariant) || "a").toUpperCase();
+    const adds = (s.settings && Number.isFinite(+s.settings.granmagoMaxAdds))
+      ? +s.settings.granmagoMaxAdds : 0;
+    const style = String((s.settings && s.settings.granmagoStyle) || "strict");
+    const setups = String((s.settings && s.settings.granmagoSetups) || "both");
+    const pairN = (s.settings && Array.isArray(s.settings.pairs) && s.settings.pairs.length)
+      ? s.settings.pairs.length : 12;
+    $("entryRule").textContent = "Modo Gran Mago, variante " + variant
+      + ", estilo " + style
+      + (setups === "sweep" ? ", solo barridos" : setups === "pullback" ? ", solo retrocesos" : "")
+      + (adds ? (", hasta " + adds + " promedios") : ", sin promediar")
+      + ". Escanea " + pairN + " pares. El score se muestra y no abre operaciones.";
+  } else {
+    const pairN = (s.settings && Array.isArray(s.settings.pairs) && s.settings.pairs.length)
+      ? s.settings.pairs.length : 12;
+    $("entryRule").textContent = "Umbral de entrada: " + entryThreshold
+      + ". Escanea " + pairN + " pares y abre hasta " + maxPos + " monedas distintas, el mejor score primero.";
+  }
 
   const rows = s.lastScan || [];
   $("scanTable").innerHTML = rows.length ? rows.map((r) => {
@@ -288,6 +317,9 @@ function render(s) {
     Sesgo: ${top.bias}<br>
     Score L/S: ${top.scoreLong} / ${top.scoreShort}<br>
     EMA50 4H: ${top.ema50_4 ? fmt(top.ema50_4) : "-"} · Stoch: ${top.stoch}
+    ${top.adx == null ? "" : "<br>ADX " + (+top.adx).toFixed(1)}
+    ${top.er == null ? "" : " · ER " + (+top.er).toFixed(2)}
+    ${top.emaSlope == null ? "" : " · pendiente día " + ((+top.emaSlope) * 100).toFixed(2) + "%"}
   ` : "-";
 
   $("scanStatus").textContent = s.busy
@@ -316,9 +348,10 @@ function render(s) {
     <tr>
       <td>${t.time}</td><td>${String(t.pair).replace("-USDT", "")}</td><td>${String(t.side).toUpperCase()}</td>
       <td class="${t.pnl >= 0 ? "positive" : "negative"}">${(+t.pnl).toFixed(2)}</td>
+      <td>${fmtR(t.tradeR != null ? t.tradeR : t.rMultiple)}</td>
       <td>${esc(motivo(t.reason))}</td>
     </tr>
-  `).join("") || '<tr><td colspan="5" style="color:var(--muted)">Sin historial</td></tr>';
+  `).join("") || '<tr><td colspan="6" style="color:var(--muted)">Sin historial</td></tr>';
 }
 
 async function refresh() {
