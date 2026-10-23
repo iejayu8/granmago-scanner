@@ -284,11 +284,27 @@ function render(s) {
     const setups = String((s.settings && s.settings.granmagoSetups) || "both");
     const pairN = (s.settings && Array.isArray(s.settings.pairs) && s.settings.pairs.length)
       ? s.settings.pairs.length : 12;
+    const target = String((s.settings && s.settings.granmagoTarget) || "swing");
+    const trailR = (s.settings && Number.isFinite(+s.settings.granmagoTrailActivateR))
+      ? +s.settings.granmagoTrailActivateR : 0;
     $("entryRule").textContent = "Modo Gran Mago, variante " + variant
       + ", estilo " + style
       + (setups === "sweep" ? ", solo barridos" : setups === "pullback" ? ", solo retrocesos" : "")
       + (adds ? (", hasta " + adds + " promedios") : ", sin promediar")
+      + (target === "none" ? ", sin objetivo de swing" : "")
+      + (trailR > 0 ? (", trailing a " + trailR + "R") : "")
       + ". Escanea " + pairN + " pares. El score se muestra y no abre operaciones.";
+  } else if (strategy === "trend") {
+    const period = (s.settings && Number.isFinite(+s.settings.trendEmaPeriod))
+      ? +s.settings.trendEmaPeriod : 50;
+    const mult = (s.settings && Number.isFinite(+s.settings.trendAtrMult))
+      ? +s.settings.trendAtrMult : 2.5;
+    const pairN = (s.settings && Array.isArray(s.settings.pairs) && s.settings.pairs.length)
+      ? s.settings.pairs.length : 12;
+    $("entryRule").textContent = "Modo tendencia 4H, EMA" + period
+      + ", stop ATR×" + mult
+      + " que solo se aprieta. Escanea " + pairN
+      + " pares. El score se muestra y no abre operaciones.";
   } else {
     const pairN = (s.settings && Array.isArray(s.settings.pairs) && s.settings.pairs.length)
       ? s.settings.pairs.length : 12;

@@ -38,7 +38,7 @@ PAIRS = list(DEFAULT_PAIRS)
 _PAIR_RE = re.compile(r"^[A-Z0-9]+-USDT$")
 MAX_CONFIGURED_PAIRS = 40
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 STATE_FILE = DATA_DIR / "state.json"
 PORT = int(os.environ.get("PORT", "8787"))
@@ -256,6 +256,14 @@ def _apply_runtime_options(settings):
         settings["granmagoSetups"] = granmago_strategy._setups_name(os.environ.get("GRANMAGO_SETUPS"))
     else:
         settings["granmagoSetups"] = granmago_strategy._setups_name(settings.get("granmagoSetups", "both"))
+    if _env_set("GRANMAGO_TARGET"):
+        settings["granmagoTarget"] = _sane_granmago_target(os.environ.get("GRANMAGO_TARGET"))
+    else:
+        settings["granmagoTarget"] = _sane_granmago_target(settings.get("granmagoTarget", "swing"))
+    _option_float(settings, "GRANMAGO_TRAIL_ACTIVATE_R", "granmagoTrailActivateR", 0.0)
+    _option_float(settings, "GRANMAGO_TRAIL_DISTANCE_R", "granmagoTrailDistanceR", 1.0)
+    _option_int(settings, "TREND_EMA_PERIOD", "trendEmaPeriod", 50, 5, 200)
+    _option_float(settings, "TREND_ATR_MULT", "trendAtrMult", 2.5)
     if _env_set("PAIRS"):
         settings["pairs"] = parse_pairs(os.environ.get("PAIRS"))
     else:
@@ -384,9 +392,16 @@ def regime_er_min():
 
 def _sane_strategy(value):
     text = str(value or "scanner").strip().lower()
-    if text in ("scanner", "granmago"):
+    if text in ("scanner", "granmago", "trend"):
         return text
     return "scanner"
+
+
+def _sane_granmago_target(value):
+    text = str(value or "swing").strip().lower()
+    if text == "none":
+        return "none"
+    return "swing"
 
 
 def _sane_variant(value):
@@ -442,6 +457,36 @@ def granmago_min_rr():
 
 def granmago_stop_pad_pct():
     return _sane_float(_settings().get("granmagoStopPadPct", 0.3), 0.3)
+
+
+def granmago_target():
+    """swing keeps the course target. none removes it. The default is swing."""
+    return _sane_granmago_target(_settings().get("granmagoTarget", "swing"))
+
+
+def granmago_trail_activate_r():
+    """R at which the course trail arms. 0 leaves the course stop fixed."""
+    return _sane_float(_settings().get("granmagoTrailActivateR", 0.0), 0.0)
+
+
+def granmago_trail_distance_r():
+    """Trail distance in initial risk units. 0 disables the course trail."""
+    return _sane_float(_settings().get("granmagoTrailDistanceR", 1.0), 1.0)
+
+
+def trend_ema_period():
+    try:
+        period = int(float(_settings().get("trendEmaPeriod", 50)))
+    except (TypeError, ValueError):
+        return 50
+    return min(200, max(5, period))
+
+
+def trend_atr_mult():
+    value = _sane_float(_settings().get("trendAtrMult", 2.5), 2.5)
+    if value <= 0:
+        return 2.5
+    return value
 
 
 def _sane_risk_pct(value, fallback=2.0):
@@ -796,6 +841,7 @@ def default_state():
         "busy": False,
         "cooldowns": {},
         "tradeSeq": 0,
+        "trendSeen": {},
         "settings": {
             "riskPct": _env_float("RISK_PCT", 2),
             "leverage": _env_int("LEVERAGE", 3),
@@ -831,6 +877,11 @@ def default_state():
             "granmagoStopPadPct": 0.3,
             "granmagoStyle": "strict",
             "granmagoSetups": "both",
+            "granmagoTarget": "swing",
+            "granmagoTrailActivateR": 0.0,
+            "granmagoTrailDistanceR": 1.0,
+            "trendEmaPeriod": 50,
+            "trendAtrMult": 2.5,
             "pairs": list(DEFAULT_PAIRS),
         },
     }
@@ -1346,10 +1397,73 @@ def _close_granmago_signals():
         close_position(reason, price, pos.get("pair"))
 
 
+def _trend_seen():
+    """Close time already considered for a trend entry, kept in the saved state.
+
+    A restart must not take the same 4H close again. A stop during that bar
+    waits for the next close.
+    """
+    seen = STATE.get("trendSeen")
+    if not isinstance(seen, dict):
+        seen = {}
+        STATE["trendSeen"] = seen
+    return seen
+
+
+def _attach_trend(row, c4):
+    """Latest closed 4H EMA trend. None until the average exists."""
+    if strategy_mode() != "trend" or not row:
+        return row
+    now_ms = int(now_epoch() * 1000)
+    closed = granmago_strategy.drop_forming(c4, granmago_strategy.H4_MS, now_ms)
+    snap = granmago_strategy.ema_trend_bar(
+        closed,
+        period=trend_ema_period(),
+        atr_mult=trend_atr_mult(),
+        bar_ms=granmago_strategy.H4_MS,
+    )
+    row["trend"] = snap if isinstance(snap, dict) else None
+    return row
+
+
+def _close_trend_flips(results):
+    """Exit a trend trade when a newer 4H close is no longer on its side.
+
+    The fill is that bar's close. The caller holds LOCK. A wide ATR stop
+    does not flatten a trade that is still on the same side of the EMA.
+    """
+    if strategy_mode() != "trend":
+        return
+    by_pair = {}
+    for row in results or []:
+        if isinstance(row, dict) and row.get("pair"):
+            by_pair[row["pair"]] = row.get("trend")
+    for pos in list(_positions()):
+        if not isinstance(pos, dict) or pos.get("strategy") != "trend":
+            continue
+        snap = by_pair.get(pos.get("pair"))
+        if not isinstance(snap, dict):
+            continue
+        try:
+            seen = int(pos.get("trendCloseMs") or 0)
+            current = int(snap.get("closeMs"))
+        except (TypeError, ValueError):
+            continue
+        if current <= seen:
+            continue
+        if snap.get("side") == pos.get("side"):
+            pos["trendCloseMs"] = current
+            continue
+        price = _as_price(snap.get("price"))
+        if price is None:
+            continue
+        close_position("flip", price, pos.get("pair"))
+
+
 def analyze_pair(pair, threshold=None):
     if threshold is None:
         threshold = entry_threshold()
-    if strategy_mode() == "granmago":
+    if strategy_mode() in ("granmago", "trend"):
         c4 = fetch_candles(pair, "4H", 300)
         c_d = fetch_candles(pair, "1D", 220)
         c_w = fetch_candles(pair, "1W", 80)
@@ -1358,7 +1472,8 @@ def analyze_pair(pair, threshold=None):
         c_d = fetch_candles(pair, "1D", 80)
         c_w = fetch_candles(pair, "1W", 60)
     row = score_market(pair, c4, c_d, c_w, threshold)
-    return _attach_granmago(row, c4, c_d, c_w)
+    row = _attach_granmago(row, c4, c_d, c_w)
+    return _attach_trend(row, c4)
 
 
 def scan_all():
@@ -1386,11 +1501,23 @@ def scan_all():
         if strategy_mode() == "granmago":
             best_l = [r for r in results if isinstance(r.get("granmago"), dict) and r["granmago"].get("side") == "long"]
             best_s = [r for r in results if isinstance(r.get("granmago"), dict) and r["granmago"].get("side") == "short"]
+        elif strategy_mode() == "trend":
+            best_l = sorted(
+                (r for r in results if isinstance(r.get("trend"), dict) and r["trend"].get("side") == "long"),
+                key=lambda r: (-float(r["trend"].get("strength") or 0.0), r.get("pair") or ""),
+            )
+            best_s = sorted(
+                (r for r in results if isinstance(r.get("trend"), dict) and r["trend"].get("side") == "short"),
+                key=lambda r: (-float(r["trend"].get("strength") or 0.0), r.get("pair") or ""),
+            )
         else:
             best_l = sorted((r for r in results if r["validLong"]), key=lambda r: r["scoreLong"], reverse=True)
             best_s = sorted((r for r in results if r["validShort"]), key=lambda r: r["scoreShort"], reverse=True)
         with LOCK:
-            _close_granmago_signals()
+            if strategy_mode() == "trend":
+                _close_trend_flips(results)
+            else:
+                _close_granmago_signals()
             STATE["lastScan"] = results
             STATE["bestLong"] = best_l[0] if best_l else None
             STATE["bestShort"] = best_s[0] if best_s else None
@@ -1627,7 +1754,8 @@ def open_granmago(sig):
     The stop and the target come from the signal, not from the scanner's
     swing or R multiple. With adds enabled, this fill risks 1/(1+adds) of
     risk_pct so the reserved adds can still lose the rest at the same stop.
-    Trailing is not used on these positions.
+    The scanner trail is not used. granmago_target none drops the swing
+    target, and a course trail arms only when its activation R is above 0.
     """
     if not isinstance(sig, dict):
         return False
@@ -1643,16 +1771,23 @@ def open_granmago(sig):
         return False
     signal = _as_price(sig.get("price"))
     stop = _as_price(sig.get("sl"))
-    target = _as_price(sig.get("tp"))
-    if signal is None or stop is None or target is None:
+    want_target = granmago_target() != "none"
+    target = _as_price(sig.get("tp")) if want_target else None
+    if signal is None or stop is None or (want_target and target is None):
         return False
     entry = _slip_price(side, signal, closing=False)
     if entry is None:
         return False
-    if side == "long" and not (stop < entry < target):
-        return False
-    if side == "short" and not (target < entry < stop):
-        return False
+    if want_target:
+        if side == "long" and not (stop < entry < target):
+            return False
+        if side == "short" and not (target < entry < stop):
+            return False
+    else:
+        if side == "long" and not (stop < entry):
+            return False
+        if side == "short" and not (entry < stop):
+            return False
     dist = abs(entry - stop)
     if dist > entry * 0.08:
         add_log("SL demasiado amplio en %s" % pair)
@@ -1730,6 +1865,9 @@ def open_granmago(sig):
         "maxHoldBars": granmago_max_hold_bars(),
         "breakevenR": granmago_breakeven_r(),
         "granmagoBe": False,
+        "trailActivateR": granmago_trail_activate_r(),
+        "trailDistanceR": granmago_trail_distance_r(),
+        "granmagoTrail": False,
     })
     add_log(
         "ENTRADA GRANMAGO %s %s %s @ %s SL %s TP %s [%d/%d]"
@@ -1739,10 +1877,116 @@ def open_granmago(sig):
             pair,
             _fmt(entry),
             _fmt(stop),
-            _fmt(target),
+            _fmt(target) if target is not None else "-",
             len(_positions()),
             max_positions(),
         )
+    )
+    return True
+
+
+def open_trend(sig):
+    """Open one 4H EMA trend trade. False when it cannot be sized.
+
+    There is no swing target. The stop is the signal's ATR stop and then
+    only tightens, by that same initial distance, from the best price.
+    A stop wider than 8% of the signal price is refused.
+    """
+    if not isinstance(sig, dict):
+        return False
+    pair = sig.get("pair")
+    side = sig.get("side")
+    if side not in ("long", "short") or not pair or _find_position(pair):
+        if pair and _find_position(pair):
+            add_log("Ya hay posición en %s, no se duplica." % pair)
+        return False
+    if cooldown_active(pair):
+        return False
+    if not regime_allows(sig, side):
+        return False
+    signal = _as_price(sig.get("price"))
+    stop = _as_price(sig.get("sl"))
+    if signal is None or stop is None or signal <= 0:
+        return False
+    raw_dist = abs(signal - stop)
+    if raw_dist <= 0 or raw_dist > signal * 0.08:
+        add_log("SL demasiado amplio en %s" % pair)
+        return False
+    entry = _slip_price(side, signal, closing=False)
+    if entry is None:
+        return False
+    if side == "long" and not (stop < entry):
+        return False
+    if side == "short" and not (entry < stop):
+        return False
+    dist = abs(entry - stop)
+    risk_pct = float(STATE["settings"]["riskPct"]) / 100.0
+    leg_risk = STATE["balance"] * risk_pct
+    if leg_risk <= 0:
+        return False
+    notional = round(leg_risk / (dist / entry), 2)
+    room = _notional_room()
+    capped = False
+    if room <= 0 or notional > room:
+        capped = True
+        notional = math.floor(max(0.0, room) * 100 + 1e-9) / 100.0
+        if notional <= 0:
+            add_log("Sin hueco de nocional para %s (tope balance × apalancamiento)." % pair)
+            return False
+        leg_risk = notional * (dist / entry)
+        add_log(
+            "Tamaño de %s limitado a %.2f USDT de nocional (tope balance × apalancamiento)."
+            % (pair, notional)
+        )
+    if not directional_risk_ok(side, leg_risk):
+        add_log(
+            "Riesgo %s en la misma dirección ya está en el tope (%.2f R)."
+            % (side, max_same_direction_risk_r())
+        )
+        return False
+    entry_fee = _fee_amount(notional)
+    if entry_fee:
+        STATE["balance"] = round(float(STATE["balance"]) - entry_fee, 2)
+    leg_risk = round(leg_risk, 2)
+    try:
+        close_ms = int(sig.get("closeMs") or 0)
+    except (TypeError, ValueError):
+        close_ms = 0
+    _positions().append({
+        "pair": pair,
+        "side": side,
+        "entry": entry,
+        "signalPrice": signal,
+        "sl": stop,
+        "tp": None,
+        "notional": notional,
+        "initialNotional": notional,
+        "notionalCapped": capped,
+        "leverage": _leverage(),
+        "riskAmt": leg_risk,
+        "initialRiskAmt": leg_risk,
+        "openRiskAmt": leg_risk,
+        "initialRiskDist": dist,
+        "entryFee": entry_fee,
+        "time": _now(),
+        "unrealized": 0,
+        "price": entry,
+        "initialSl": stop,
+        "initialTp": None,
+        "bestPrice": entry,
+        "trailingActive": True,
+        "partialTaken": False,
+        "tradeId": _next_trade_id(),
+        "stopMode": "trend",
+        "strategy": "trend",
+        "setup": "T",
+        "trendCloseMs": close_ms,
+        "trailDistanceR": 1.0,
+        "granmagoTrail": True,
+    })
+    add_log(
+        "ENTRADA TENDENCIA %s %s @ %s SL %s [%d/%d]"
+        % (side.upper(), pair, _fmt(entry), _fmt(stop), len(_positions()), max_positions())
     )
     return True
 
@@ -1820,11 +2064,65 @@ def _maybe_add(pos, mark):
     return True
 
 
+def _tighten_r_trail(pos, dist_r):
+    """Pull the stop to best ± dist_r × initial risk. Never loosens it.
+
+    There is no breakeven floor. A trail that has not earned the distance
+    stays at the stop already stored on the position.
+    """
+    best = _as_price(pos.get("bestPrice"))
+    base = _as_price(pos.get("initialRiskDist"))
+    current = _as_price(pos.get("sl"))
+    try:
+        dist_r = float(dist_r)
+    except (TypeError, ValueError):
+        return False
+    if best is None or base is None or current is None or dist_r <= 0 or base <= 0:
+        return False
+    dist = base * dist_r
+    if pos.get("side") == "long":
+        updated = max(current, best - dist)
+    else:
+        updated = min(current, best + dist)
+    if abs(updated - current) <= 1e-12:
+        return False
+    pos["sl"] = updated
+    return True
+
+
+def _apply_course_trail(pos, mark):
+    """Arm the course trail once price has reached its activation R."""
+    try:
+        activate = float(pos.get("trailActivateR") or 0.0)
+        dist_r = float(pos.get("trailDistanceR") or 0.0)
+    except (TypeError, ValueError):
+        return
+    if activate <= 0 or dist_r <= 0:
+        return
+    reached = price_r(pos, mark)
+    if not pos.get("granmagoTrail") and (reached is None or reached < activate):
+        return
+    if not pos.get("granmagoTrail"):
+        pos["granmagoTrail"] = True
+        pos["trailingActive"] = True
+        add_log(
+            "Trailing GranMago %s a %sR. SL %s"
+            % (pos.get("pair"), _fmt_num(activate), _fmt(pos.get("sl")))
+        )
+    if _tighten_r_trail(pos, dist_r):
+        add_log(
+            "Trailing GranMago %s SL → %s (mejor %s)"
+            % (pos.get("pair"), _fmt(pos["sl"]), _fmt(pos.get("bestPrice")))
+        )
+
+
 def _apply_granmago_mark(pos, mark):
     """Hard stop, optional add, optional breakeven, then the swing target.
 
-    No trailing and no scanner partial. A stop is checked before an add, so
+    The scanner partial is not used. A stop is checked before an add, so
     a print through both the extreme and the stop does not average in.
+    The course trail, when the position was opened with one, arms after
+    the target check and does not close on the same print.
     """
     pair = pos["pair"]
     side = pos["side"]
@@ -1834,8 +2132,9 @@ def _apply_granmago_mark(pos, mark):
         pos["unrealized"] = round(pnl, 2)
     update_best_price(pos, mark)
     if _stop_hit(side, mark, pos.get("sl")):
-        close_position("SL", mark, pair)
-        return "SL"
+        reason = "trailing" if pos.get("granmagoTrail") else "SL"
+        close_position(reason, mark, pair)
+        return reason
     _maybe_add(pos, mark)
     if _find_position(pair) is None:
         return "SL"
@@ -1853,6 +2152,27 @@ def _apply_granmago_mark(pos, mark):
     if _target_hit(side, mark, pos.get("tp")):
         close_position("TP", mark, pair)
         return "TP"
+    _apply_course_trail(pos, mark)
+    return None
+
+
+def _apply_trend_mark(pos, mark):
+    """ATR stop first, then the chandelier. The same print does not do both."""
+    pair = pos["pair"]
+    side = pos["side"]
+    pnl = position_pnl(pos, mark)
+    pos["price"] = mark
+    if pnl is not None:
+        pos["unrealized"] = round(pnl, 2)
+    update_best_price(pos, mark)
+    if _stop_hit(side, mark, pos.get("sl")):
+        close_position("trailing", mark, pair)
+        return "trailing"
+    dist_r = pos.get("trailDistanceR")
+    if dist_r is None:
+        dist_r = 1.0
+    if _tighten_r_trail(pos, dist_r):
+        add_log("Trailing tendencia %s SL → %s (mejor %s)" % (pair, _fmt(pos["sl"]), _fmt(pos.get("bestPrice"))))
     return None
 
 
@@ -2022,6 +2342,8 @@ def _apply_mark(pos, price):
         return None
     if pos.get("strategy") == "granmago":
         return _apply_granmago_mark(pos, mark)
+    if pos.get("strategy") == "trend":
+        return _apply_trend_mark(pos, mark)
     pnl = position_pnl(pos, mark)
     pos["price"] = mark
     if pnl is not None:
@@ -2088,18 +2410,30 @@ def maybe_open():
     """Fill free slots from the latest scan.
 
     Scanner mode ranks by score. Gran Mago mode opens the course signal on
-    the bar that just closed and ignores the score. One position per coin,
-    long or short, never both. A manual scan does not call this. Nothing
-    is opened while the bot is stopped.
+    the bar that just closed and ignores the score. Trend mode opens the
+    latest 4H EMA side once per close, strongest distance first. One
+    position per coin, long or short, never both. A manual scan does not
+    call this. Nothing is opened while the bot is stopped.
     """
     opened = False
     with LOCK:
         if not STATE["running"]:
             return
         limit = max_positions()
+        rows = STATE.get("lastScan") or []
+        if strategy_mode() == "trend" and len(_positions()) >= limit:
+            # The bar already passed with no free slot. Remember it so a
+            # later stop does not enter on a close the book already missed.
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                snap = row.get("trend")
+                if row.get("pair") and isinstance(snap, dict):
+                    _trend_seen()[row["pair"]] = snap.get("closeMs")
+            save_state()
+            return
         if len(_positions()) >= limit:
             return
-        rows = STATE.get("lastScan") or []
         occupied = {p.get("pair") for p in _positions() if isinstance(p, dict)}
         if strategy_mode() == "granmago":
             fresh = False
@@ -2120,6 +2454,44 @@ def maybe_open():
                     occupied.add(pair)
             if not fresh:
                 add_log("Ningún setup Gran Mago en el cierre de vela. Esperando...")
+            save_state()
+        elif strategy_mode() == "trend":
+            candidates = []
+            saw_side = False
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                snap = row.get("trend")
+                pair = row.get("pair")
+                if not isinstance(snap, dict) or not pair or pair in occupied:
+                    if pair and isinstance(snap, dict):
+                        _trend_seen()[pair] = snap.get("closeMs")
+                    continue
+                if snap.get("side") not in ("long", "short"):
+                    _trend_seen()[pair] = snap.get("closeMs")
+                    continue
+                saw_side = True
+                if _trend_seen().get(pair) == snap.get("closeMs"):
+                    continue
+                try:
+                    strength = float(snap.get("strength") or 0.0)
+                except (TypeError, ValueError):
+                    strength = 0.0
+                candidates.append((strength, pair, snap))
+            candidates.sort(key=lambda item: (-item[0], item[1]))
+            for strength, pair, snap in candidates:
+                close_ms = snap.get("closeMs")
+                if len(_positions()) >= limit or snap.get("sl") is None:
+                    _trend_seen()[pair] = close_ms
+                    continue
+                _trend_seen()[pair] = close_ms
+                payload = dict(snap)
+                payload["pair"] = pair
+                if open_trend(payload):
+                    opened = True
+                    occupied.add(pair)
+            if not saw_side:
+                add_log("Ninguna tendencia 4H en el cierre de vela. Esperando...")
             save_state()
         else:
             threshold = entry_threshold()
@@ -2421,8 +2793,14 @@ def main():
         ))
         add_log("Trailing: %s." % _trail_label())
         if strategy_mode() == "granmago":
+            trail_r = granmago_trail_activate_r()
+            trail_bit = (
+                "trailing a %sR (distancia %sR)" % (_fmt_num(trail_r), _fmt_num(granmago_trail_distance_r()))
+                if trail_r > 0 and granmago_trail_distance_r() > 0
+                else "sin trailing"
+            )
             add_log(
-                "Estrategia Gran Mago variante %s, estilo %s, setups %s, promedios %d, salida por agotamiento %s, máximo %d velas."
+                "Estrategia Gran Mago variante %s, estilo %s, setups %s, promedios %d, salida por agotamiento %s, máximo %d velas, objetivo %s, %s."
                 % (
                     granmago_variant().upper(),
                     granmago_style(),
@@ -2430,7 +2808,14 @@ def main():
                     granmago_max_adds(),
                     "sí" if granmago_momentum_exit() else "no",
                     granmago_max_hold_bars(),
+                    "swing" if granmago_target() == "swing" else "ninguno",
+                    trail_bit,
                 )
+            )
+        elif strategy_mode() == "trend":
+            add_log(
+                "Estrategia tendencia 4H EMA%d, stop ATR(14)×%s que solo se aprieta, sin objetivo."
+                % (trend_ema_period(), _fmt_num(trend_atr_mult()))
             )
         else:
             add_log("Estrategia: scanner de score. El modo Gran Mago está apagado.")

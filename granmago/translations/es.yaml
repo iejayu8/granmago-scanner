@@ -79,7 +79,7 @@ configuration:
     description: Se usa cuando el filtro incluye er. La entrada exige un ER de Kaufman en 4H igual o mayor.
   strategy:
     name: Estrategia
-    description: scanner mantiene las entradas por score. granmago usa las reglas del curso (barrido o retroceso, veto del estocástico, squeeze). El scanner sigue disponible.
+    description: scanner mantiene las entradas por score. granmago usa las reglas del curso. trend sigue la EMA de 4H y un stop de ATR que solo se aprieta. El defecto sigue siendo scanner.
   granmago_variant:
     name: Variante Gran Mago
     description: a opera largos y cortos con dos cierres de 4H. b solo largos, con un cierre de 12H.
@@ -107,6 +107,21 @@ configuration:
   granmago_setups:
     name: Setups Gran Mago
     description: both toma barridos y retrocesos. sweep solo el barrido. pullback solo el retroceso.
+  granmago_target:
+    name: Objetivo Gran Mago
+    description: swing mantiene el swing diario anterior como objetivo. none lo quita. El defecto es swing, así que una actualización no quita el objetivo.
+  granmago_trail_activate_r:
+    name: Activación del trailing Gran Mago (R)
+    description: Arma un trailing del curso tras estos R de beneficio abierto. 0 deja el stop del curso quieto. El trailing del scanner es otra opción y no afecta a las operaciones del curso.
+  granmago_trail_distance_r:
+    name: Distancia del trailing Gran Mago (R)
+    description: Con el trailing del curso armado, el stop queda a estos múltiplos del riesgo inicial por detrás del mejor precio y solo se aprieta. 0 lo desactiva.
+  trend_ema_period:
+    name: Periodo de la EMA de tendencia
+    description: Solo se usa con strategy trend. El lado es el último cierre de 4H contra esta EMA. 50 es el valor del estudio.
+  trend_atr_mult:
+    name: Múltiplo ATR de tendencia
+    description: Solo se usa con strategy trend. El stop inicial es el ATR(14) de 4H por este múltiplo, y a partir de ahí solo se aprieta esa misma distancia. 2,5 es el valor del estudio. Un stop de más del 8 % no se abre.
   pairs:
     name: Pares
     description: Swaps USDT que se escanean, un símbolo por línea (por ejemplo BTC-USDT). El defecto son los 12 de siempre. No lo cambies al actualizar. Los 28 pares líquidos del estudio de 1.5.0 están en el README. Se usan como máximo 40. Una posición abierta en un par que quites se sigue vigilando hasta que cierre.

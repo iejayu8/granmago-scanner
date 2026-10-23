@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.6.0
+
+- El defecto no cambia. `strategy` sigue en `scanner`, el estilo Gran Mago en `strict`, el objetivo del curso en `swing` y el trailing del curso apagado (`granmago_trail_activate_r` 0). Una actualización no toca el paper que ya está corriendo.
+- `granmago_target: none` quita el objetivo de swing. `granmago_trail_activate_r` por encima de 0 arma un trailing del curso a esos R, a `granmago_trail_distance_r` veces el riesgo inicial del mejor precio, y solo se aprieta. No usa el trailing del scanner ni le pone un suelo de breakeven aparte.
+- `strategy: trend` sigue el último cierre de 4H contra `trend_ema_period` (50) con stop ATR(14) × `trend_atr_mult` (2,5). El stop solo se aprieta esa misma distancia. Un cierre al otro lado de la media (o encima, si el cierre iguala la media) cierra la posición en ese cierre. No hay objetivo. Un stop de más del 8 % no se abre.
+- El walk-forward de esta versión (33 configuraciones, riesgo 1 %, comisión 0,06 % y slippage 0,02 % por lado, 28 pares y también los 12) no deja un borde que supere el intervalo de E[R] y el Sharpe desinflado. Por eso ninguna de estas opciones pasa a ser el defecto. Los números están en el pull request de 1.6.0.
+
 ## 1.5.0
 
 - Modo de estrategia seleccionable. `strategy: scanner` (el defecto) deja el bot de 1.4.0 igual. `strategy: granmago` entra y sale con las reglas del curso de Gran Mago, no con el score.

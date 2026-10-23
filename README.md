@@ -63,7 +63,7 @@ Por eso una **entrada nueva** se reduce al hueco que quede, o no se abre, cuando
 | regime_filter | off | `off`, `slope`, `adx`, `er`, `slope_adx` o `slope_er` |
 | regime_adx_min | 20 | ADX mínimo de 4H cuando el filtro usa adx |
 | regime_er_min | 0.2 | Efficiency ratio mínimo de 4H cuando el filtro usa er |
-| strategy | scanner | `scanner` (score de 1.4.0) o `granmago` (reglas del curso) |
+| strategy | scanner | `scanner` (score de 1.4.0), `granmago` (reglas del curso) o `trend` (EMA de 4H) |
 | granmago_variant | a | `a`: largos y cortos, dos cierres de 4H. `b`: solo largos, un cierre de 12H |
 | granmago_max_adds | 0 | Añadidos en el extremo barrido. 0, 1 o 2. 0 no promedia |
 | granmago_momentum_exit | true | Cierra si el estocástico y el squeeze se agotan |
@@ -73,6 +73,11 @@ Por eso una **entrada nueva** se reduce al hueco que quede, o no se abre, cuando
 | granmago_stop_pad_pct | 0.3 | Margen mínimo del stop más allá de la mecha, en % del precio |
 | granmago_style | strict | `strict` (filtros originales) o `sweep` (barrido relajado) |
 | granmago_setups | both | `both`, `sweep` (solo setup A) o `pullback` (solo setup B) |
+| granmago_target | swing | `swing` (objetivo del curso) o `none` (sin objetivo). El defecto no lo quita |
+| granmago_trail_activate_r | 0 | Arma un trailing del curso a estos R. 0 lo deja apagado. No es el trailing del scanner |
+| granmago_trail_distance_r | 1 | Distancia de ese trailing, en riesgo inicial. Solo se aprieta. 0 lo desactiva |
+| trend_ema_period | 50 | Solo con `strategy: trend`. EMA del cierre de 4H |
+| trend_atr_mult | 2.5 | Solo con `strategy: trend`. Stop inicial ATR(14) de 4H × este valor, y luego solo se aprieta |
 | pairs | los 12 de siempre | Swaps USDT a escanear. Vacío o inválido vuelve a esos 12. Máximo 40 |
 | log_level | info | Log del complemento |
 
@@ -106,7 +111,7 @@ El estocástico es 14, 3, 3 y solo veta: no hay largo con %K por encima de 80 ni
 
 El stop es un stop de precio más allá de la mecha barrida, a `max(0,5 × ATR de 14 velas de 4H, granmago_stop_pad_pct % del precio)`. Si un imbalance sin rellenar o una mecha grande atraviesa ese margen, el stop pasa al otro lado del hueco. Por encima del 8 % del precio la operación no se abre. En X la invalidación a veces es el cierre de 12H al otro lado de la mecha: aquí ese cierre solo impide promediar; la posición espera el stop de precio, porque el bot vigila cada tick. El objetivo es el clúster del swing diario anterior en la dirección del beneficio, un 0,1 % por dentro del extremo. No hay objetivo en R. `granmago_min_rr` en 0 no descarta un stop más ancho que el objetivo. Sus propias cifras (77 % de aciertos y profit factor 1,38) implican un beneficio medio de unas 0,4 veces la pérdida media, así que el filtro de 1,5 del apunte del curso queda apagado a propósito.
 
-No hay trailing en este modo. `granmago_momentum_exit` cierra cuando el estocástico está agotado y el histograma del squeeze pierde fuerza. A las `granmago_max_hold_bars` velas de confirmación (15 por defecto) se cierra por tiempo. `granmago_breakeven_r` en 0 no mueve el stop: él lo mencionó y no llegó a explicarlo.
+Con las opciones por defecto no hay trailing en este modo: el trailing del scanner no se aplica a una operación del curso. `granmago_trail_activate_r` en 0 lo deja así. Por encima de 0, al llegar a ese beneficio el stop pasa a quedar a `granmago_trail_distance_r` veces el riesgo inicial por detrás del mejor precio, y a partir de ahí solo se aprieta. No hay suelo de breakeven distinto de esa cuenta. `granmago_target: none` quita el objetivo de swing; `swing` lo mantiene. `granmago_momentum_exit` cierra cuando el estocástico está agotado y el histograma del squeeze pierde fuerza. A las `granmago_max_hold_bars` velas de confirmación (15 por defecto) se cierra por tiempo. `granmago_breakeven_r` en 0 no mueve el stop: él lo mencionó y no llegó a explicarlo.
 
 `pairs` es la lista que recorre el escaneo. El defecto, y lo que hace una actualización si no se toca la opción, son los 12 pares de arriba. Los 28 del walk-forward largo son esos 12 más ZEC, PEPE, 1000BONK, NEAR, XMR, INJ, SUI, TAO, IOST, XLM, TRX, HBAR, ENA, WLD, AAVE y QNT. No es el defecto. Un símbolo que no sea `BASE-USDT` se ignora. Si no queda ninguno válido se usan los 12. El tope es 40. `max_positions` sigue siendo el número de huecos (de 1 a 12), no el tamaño del universo. Quitar un par de la lista no cierra una posición que ya esté abierta: el bucle de 20 segundos la sigue vigilando.
 
@@ -115,3 +120,9 @@ No hay trailing en este modo. `granmago_momentum_exit` cierra cuando el estocás
 `granmago_max_adds` en 0 no promedia. En 1 o 2, la primera orden arriesga `risk_pct / (1 + añadidos)` y cada añadido el mismo importe, así el stop de todas las patas sigue siendo un solo `risk_pct`. El añadido solo entra si el precio toca el extremo barrido sin tocar el stop, y nunca después de un cierre de confirmación al otro lado de ese extremo.
 
 El riesgo del 2 % y el apalancamiento 3 ya eran el defecto del complemento y coinciden con lo que él escribe en X («máx 2 % y x3»). El filtro de noticias no está: el curso dice no operar con datos y en X dice que el IPC no le cambia la idea, y no hay un calendario fiable en el complemento. La contratendencia y el scalping de varios intentos tampoco se programan.
+
+## Tendencia 4H
+
+`strategy: trend` no es el defecto. Una actualización no cambia el modo ni los pares. El lado es el último cierre de 4H contra la EMA de `trend_ema_period` (50). El stop inicial es el ATR(14) de esa vela por `trend_atr_mult` (2,5). Si esa distancia pasa del 8 % del cierre, no se abre, pero una posición ya abierta del mismo lado no se cierra por eso. No hay objetivo: el stop solo se aprieta, a una distancia igual a la inicial, desde el mejor precio. Cuando un cierre de 4H deja de estar de ese lado de la media, se cierra en ese cierre. Cada cierre se considera una vez: un stop a mitad de vela no vuelve a entrar hasta el cierre siguiente. Si hay más señales que huecos, entra la de mayor distancia a la media y, a igualdad, el nombre del par.
+
+El estudio de 1.6.0 no justifica cambiar el paper que ya corre. El defecto del complemento sigue siendo el scanner. Quien quiera el libro de seguimiento de 1.5.0 lo configura a mano (variante `a`, estilo `sweep`, sin promedios, salida por agotamiento, 15 velas, margen 0,3, riesgo 1, apalancamiento 3, 3 posiciones, comisión 0,06 y slippage 0,02, y los 28 pares del README). El trailing del curso y la tendencia 4H son experimentos opcionales; el detalle del walk-forward está en el changelog de 1.6.0.

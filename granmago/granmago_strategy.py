@@ -451,6 +451,58 @@ def atr_series(candles, period=ATR_PERIOD):
     return out
 
 
+def ema_trend_bar(candles, period=EMA_PERIOD, atr_mult=2.5, bar_ms=H4_MS):
+    """Last bar versus its own EMA, plus an ATR stop from that close.
+
+    The EMA and the ATR at the last bar read that bar and older ones only.
+    `side` is long above the EMA and short below it. `sl` is None when the
+    ATR stop is missing or wider than 8% of the close; the side is still
+    returned so an open trade can leave. None until the EMA exists.
+    """
+    candles = list(candles or [])
+    if not candles:
+        return None
+    closes = []
+    for candle in candles:
+        try:
+            closes.append(float(candle["c"]))
+        except (TypeError, ValueError, KeyError):
+            return None
+    averages = ema_series(closes, int(period))
+    atr = atr_series(candles, ATR_PERIOD)
+    index = len(candles) - 1
+    average = averages[index]
+    price = closes[index]
+    if average is None or price <= 0:
+        return None
+    if price > average:
+        side = "long"
+    elif price < average:
+        side = "short"
+    else:
+        side = None
+    stop = None
+    atr_value = atr[index]
+    if side in ("long", "short") and atr_value is not None and atr_value > 0:
+        dist = atr_value * float(atr_mult)
+        if 0 < dist <= price * MAX_STOP_PCT:
+            stop = price - dist if side == "long" else price + dist
+    try:
+        close_ms = int(candles[index]["ts"]) + int(bar_ms)
+    except (TypeError, ValueError, KeyError):
+        return None
+    return {
+        "side": side,
+        "price": price,
+        "sl": stop,
+        "ema": average,
+        "atr": atr_value,
+        "strength": abs(price / average - 1.0) if average else 0.0,
+        "closeMs": close_ms,
+        "confirmMs": int(bar_ms),
+    }
+
+
 def _atr_asof(candles_4h, series, at_ms):
     found = None
     for candle, value in zip(candles_4h, series):

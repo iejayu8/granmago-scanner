@@ -1,5 +1,5 @@
 name: GranMago Scanner
-version: "1.5.0"
+version: "1.6.0"
 slug: granmago
 description: Paper trading del scanner GranMago. El bot corre en el servidor aunque cierres la página.
 url: https://github.com/iejayu8/granmago-scanner
@@ -55,6 +55,11 @@ options:
   granmago_stop_pad_pct: 0.3
   granmago_style: strict
   granmago_setups: both
+  granmago_target: swing
+  granmago_trail_activate_r: 0
+  granmago_trail_distance_r: 1
+  trend_ema_period: 50
+  trend_atr_mult: 2.5
   pairs:
     - BTC-USDT
     - ETH-USDT
@@ -95,7 +100,7 @@ schema:
   regime_filter: list(off|slope|adx|er|slope_adx|slope_er)
   regime_adx_min: float
   regime_er_min: float
-  strategy: list(scanner|granmago)
+  strategy: list(scanner|granmago|trend)
   granmago_variant: list(a|b)
   granmago_max_adds: int(0,2)
   granmago_momentum_exit: bool
@@ -105,5 +110,10 @@ schema:
   granmago_stop_pad_pct: float
   granmago_style: list(strict|sweep)
   granmago_setups: list(both|sweep|pullback)
+  granmago_target: list(swing|none)
+  granmago_trail_activate_r: float
+  granmago_trail_distance_r: float
+  trend_ema_period: int(5,200)
+  trend_atr_mult: float
   pairs:
     - match(^[A-Za-z0-9]+-USDT$)

@@ -38,6 +38,11 @@ export GRANMAGO_MIN_RR="$(bashio::config 'granmago_min_rr')"
 export GRANMAGO_STOP_PAD_PCT="$(bashio::config 'granmago_stop_pad_pct')"
 export GRANMAGO_STYLE="$(bashio::config 'granmago_style')"
 export GRANMAGO_SETUPS="$(bashio::config 'granmago_setups')"
+export GRANMAGO_TARGET="$(bashio::config 'granmago_target')"
+export GRANMAGO_TRAIL_ACTIVATE_R="$(bashio::config 'granmago_trail_activate_r')"
+export GRANMAGO_TRAIL_DISTANCE_R="$(bashio::config 'granmago_trail_distance_r')"
+export TREND_EMA_PERIOD="$(bashio::config 'trend_ema_period')"
+export TREND_ATR_MULT="$(bashio::config 'trend_atr_mult')"
 # JSON array from the add-on option. server.py also accepts a comma-separated list.
 # A missing key (an options file from before this option existed) leaves the
 # original 12 pairs in place.
