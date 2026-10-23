@@ -150,6 +150,8 @@ def fetch_blofin(inst_id, bar, start_ms, end_ms):
         url = BLOFIN + "?" + urllib.parse.urlencode(params)
         body = _fetch_page(url)
         pages += 1
+        if pages == 1 or pages % 100 == 0:
+            print("  %s %s page %d" % (inst_id, bar, pages), flush=True)
         batch = body["data"]
         oldest = None
         for raw in batch:
@@ -688,36 +690,51 @@ def _self_check_exits():
     print("exit self-check ok", flush=True)
 
 
+def _load_one_pair(pair, m1_start, h4_start, d1_start, w1_start, end_ms):
+    print("fetch %s" % pair, flush=True)
+    last_err = None
+    m1 = h4 = d1 = w1 = None
+    for attempt in range(4):
+        try:
+            m1 = fetch_blofin(pair, "1m", m1_start, end_ms)
+            h4 = fetch_blofin(pair, "4H", h4_start, end_ms)
+            d1 = fetch_blofin(pair, "1D", d1_start, end_ms)
+            w1 = fetch_blofin(pair, "1W", w1_start, end_ms)
+            last_err = None
+            break
+        except RuntimeError as exc:
+            last_err = exc
+            print("  retry %s (%s)" % (pair, exc), flush=True)
+            time.sleep(2 * (attempt + 1))
+    if last_err is not None:
+        raise last_err
+    if len(m1) < 1000 or len(h4) < 80 or len(d1) < 60 or len(w1) < 50:
+        raise RuntimeError("incomplete history for %s m1=%d h4=%d d1=%d w1=%d" % (
+            pair, len(m1), len(h4), len(d1), len(w1)))
+    print("  1m %d (%s → %s) 4H %d 1D %d 1W %d" % (
+        len(m1), madrid(m1[0]["ts"]), madrid(m1[-1]["ts"] + MIN_MS), len(h4), len(d1), len(w1)), flush=True)
+    return pair, PairData(pair, m1, h4, d1, w1)
+
+
 def load_market(start_ms, end_ms):
     # 4H window the EMA needs at the first scan: 150 bars ≈ 25 days, plus margin.
     h4_start = start_ms - 40 * DAY_MS
     d1_start = start_ms - 120 * DAY_MS
     w1_start = start_ms - 80 * WEEK_MS
     m1_start = bucket_open(start_ms, H4_MS)
+    # A few pairs at a time. Each 1m history is hundreds of pages; sequential
+    # fetches dominated the walk-forward. Cached pairs return immediately.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     pairs = {}
-    for pair in server.PAIRS:
-        print("fetch %s" % pair, flush=True)
-        last_err = None
-        for attempt in range(4):
-            try:
-                m1 = fetch_blofin(pair, "1m", m1_start, end_ms)
-                h4 = fetch_blofin(pair, "4H", h4_start, end_ms)
-                d1 = fetch_blofin(pair, "1D", d1_start, end_ms)
-                w1 = fetch_blofin(pair, "1W", w1_start, end_ms)
-                last_err = None
-                break
-            except RuntimeError as exc:
-                last_err = exc
-                print("  retry %s (%s)" % (pair, exc), flush=True)
-                time.sleep(2 * (attempt + 1))
-        if last_err is not None:
-            raise last_err
-        if len(m1) < 1000 or len(h4) < 80 or len(d1) < 60 or len(w1) < 50:
-            raise SystemExit("incomplete history for %s m1=%d h4=%d d1=%d w1=%d" % (
-                pair, len(m1), len(h4), len(d1), len(w1)))
-        pairs[pair] = PairData(pair, m1, h4, d1, w1)
-        print("  1m %d (%s → %s) 4H %d 1D %d 1W %d" % (
-            len(m1), madrid(m1[0]["ts"]), madrid(m1[-1]["ts"] + MIN_MS), len(h4), len(d1), len(w1)), flush=True)
+    workers = min(3, len(server.PAIRS))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = [
+            pool.submit(_load_one_pair, pair, m1_start, h4_start, d1_start, w1_start, end_ms)
+            for pair in server.PAIRS
+        ]
+        for fut in as_completed(futs):
+            pair, data = fut.result()
+            pairs[pair] = data
     return pairs
 
 
