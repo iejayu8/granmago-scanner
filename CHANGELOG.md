@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.1
+
+- El complemento arranca. 1.5.0 copiaba una lista fija de archivos y no metía `granmago_strategy.py` en la imagen, así que el proceso moría con `ModuleNotFoundError` antes de escanear. El Dockerfile copia ese módulo, y un test falla si `server.py` importa un módulo local que la imagen no incluye.
+- La página de configuración se queda en lo que un usuario cambia de verdad: `log_level`, `initial_balance`, `risk_pct` (1), `leverage` (3), `max_positions` (3), `fee_pct_per_side` (0,06), `slippage_pct_per_side` (0,02) y `pairs` (los 28 del walk-forward). El resto de la monitorización queda fijo: estrategia Gran Mago, variante A, estilo sweep, setups both, sin promedios, salida por agotamiento, 15 velas, margen de stop 0,3 %, objetivo 1,7 R, trailing apagado, sin filtro de régimen, sin enfriamiento y escaneo cada 90 s.
+- Una instalación que venga de 1.5.0 trae las claves viejas (`strategy`, `entry_threshold`, `trailing_*`, `regime_*`, `granmago_*` y el resto). El esquema ya no las declara. El arranque las ignora y, si la API del Supervisor responde, las borra para que no se queden avisos. Si esa API no responde, el proceso arranca igual. El Supervisor solo rellena el defecto de una clave que falta: riesgo, apalancamiento, máximo de posiciones, comisiones y pares que ya estuvieran guardados se conservan. Una instalación nueva usa los defectos de arriba.
+- El estado de `/data` (balance, posiciones e historial), incluido un `openPosition` de versiones anteriores o un libro de 1.5.0, se carga sin cerrar operaciones.
+
 ## 1.5.0
 
 - Modo de estrategia seleccionable. `strategy: scanner` (el defecto) deja el bot de 1.4.0 igual. `strategy: granmago` entra y sale con las reglas del curso de Gran Mago, no con el score.

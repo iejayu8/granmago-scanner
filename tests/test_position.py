@@ -109,8 +109,14 @@ def _one():
 
 class PositionTests(unittest.TestCase):
     def setUp(self):
-        os.environ.pop("MAX_POSITIONS", None)
-        os.environ.pop("ENTRY_THRESHOLD", None)
+        for name in (
+            "MAX_POSITIONS", "ENTRY_THRESHOLD", "RISK_PCT", "LEVERAGE",
+            "FEE_PCT_PER_SIDE", "SLIPPAGE_PCT_PER_SIDE", "PAIRS", "STRATEGY",
+            "TRAILING_ENABLED", "SCAN_SECONDS", "REGIME_FILTER",
+            "GRANMAGO_STYLE", "GRANMAGO_VARIANT", "GRANMAGO_SETUPS",
+            "INITIAL_BALANCE",
+        ):
+            os.environ.pop(name, None)
         server.STATE.clear()
         server.STATE.update(server.default_state())
         server.STATE["balance"] = 950.56
@@ -118,6 +124,11 @@ class PositionTests(unittest.TestCase):
         server.STATE["running"] = True
         server.STATE["history"] = []
         server.STATE["log"] = []
+        # These cases exercise the scanner path and the old zero-cost math.
+        # The add-on itself pins Gran Mago and the monitoring costs on start.
+        server.STATE["settings"]["strategy"] = "scanner"
+        server.STATE["settings"]["feePctPerSide"] = 0.0
+        server.STATE["settings"]["slippagePctPerSide"] = 0.0
         server.STATE["settings"]["trailingEnabled"] = True
         server.STATE["settings"]["trailingActivationPct"] = 1.0
         server.STATE["settings"]["trailingDistance"] = 0.5
@@ -715,11 +726,11 @@ class PositionTests(unittest.TestCase):
         self.assertEqual(len(loaded["history"]), 1)
         self.assertNotIn("maxHoldHours", loaded["settings"])
         self.assertEqual(loaded["settings"]["scanSeconds"], 90)
-        self.assertTrue(loaded["settings"]["trailingEnabled"])
-        self.assertEqual(loaded["settings"]["trailingActivationPct"], 1.0)
-        self.assertEqual(loaded["settings"]["trailingDistance"], 0.5)
+        self.assertFalse(loaded["settings"]["trailingEnabled"])
+        self.assertEqual(loaded["settings"]["strategy"], "granmago")
+        self.assertEqual(loaded["settings"]["granmagoStyle"], "sweep")
         self.assertEqual(loaded["settings"]["entryThreshold"], 100)
-        self.assertEqual(loaded["settings"]["maxPositions"], 5)
+        self.assertEqual(loaded["settings"]["maxPositions"], 3)
 
     def test_load_state_migrates_eth_short_without_closing_it(self):
         history = [
@@ -814,10 +825,12 @@ class PositionTests(unittest.TestCase):
         self.assertEqual(loaded["history"][0]["pnl"], 1.5)
         self.assertEqual(loaded["balance"], 100)
 
-    def test_trailing_option_from_env_overrides_saved_settings(self):
-        os.environ["TRAILING_ENABLED"] = "false"
+    def test_trailing_env_and_saved_trailing_are_ignored(self):
+        os.environ["TRAILING_ENABLED"] = "true"
         os.environ["TRAILING_ACTIVATION_PCT"] = "2.5"
         os.environ["TRAILING_DISTANCE"] = "0.25"
+        os.environ["STRATEGY"] = "scanner"
+        os.environ["SCAN_SECONDS"] = "30"
         try:
             payload = {
                 "balance": 950.56,
@@ -827,6 +840,8 @@ class PositionTests(unittest.TestCase):
                     "trailingEnabled": True,
                     "trailingActivationPct": 1.0,
                     "trailingDistance": 0.5,
+                    "strategy": "scanner",
+                    "scanSeconds": 120,
                     "maxHoldHours": 12,
                 },
             }
@@ -836,12 +851,124 @@ class PositionTests(unittest.TestCase):
             os.environ.pop("TRAILING_ENABLED", None)
             os.environ.pop("TRAILING_ACTIVATION_PCT", None)
             os.environ.pop("TRAILING_DISTANCE", None)
+            os.environ.pop("STRATEGY", None)
+            os.environ.pop("SCAN_SECONDS", None)
         self.assertFalse(loaded["settings"]["trailingEnabled"])
-        self.assertEqual(loaded["settings"]["trailingActivationPct"], 2.5)
-        self.assertEqual(loaded["settings"]["trailingDistance"], 0.25)
+        self.assertEqual(loaded["settings"]["trailingActivationPct"], 1.0)
+        self.assertEqual(loaded["settings"]["trailingDistance"], 0.5)
+        self.assertEqual(loaded["settings"]["strategy"], "granmago")
+        self.assertEqual(loaded["settings"]["scanSeconds"], 90)
         self.assertNotIn("maxHoldHours", loaded["settings"])
         self.assertEqual(loaded["balance"], 950.56)
         self.assertEqual(loaded["openPositions"], [])
+
+    def test_import_load_assigns_a_trade_id_without_a_live_state(self):
+        payload = {
+            "balance": 100,
+            "initialBalance": 10000,
+            "openPosition": {
+                "pair": "SOL-USDT",
+                "side": "short",
+                "entry": 102.48,
+                "sl": 109.07,
+                "tp": 91.27,
+                "notional": 100.0,
+            },
+            "history": [{"pnl": 1.0, "pair": "BTC-USDT", "reason": "TP"}],
+            "settings": {"strategy": "scanner", "riskPct": 2},
+        }
+        server.STATE_FILE.write_text(json.dumps(payload), encoding="utf-8")
+        saved = server.STATE
+        try:
+            del server.STATE
+            loaded = server.load_state()
+        finally:
+            server.STATE = saved
+        self.assertEqual(loaded["balance"], 100)
+        self.assertEqual(loaded["history"][0]["pnl"], 1.0)
+        pos = loaded["openPositions"][0]
+        self.assertEqual(pos["pair"], "SOL-USDT")
+        self.assertEqual(pos["entry"], 102.48)
+        self.assertEqual(pos["tradeId"], 1)
+        self.assertEqual(loaded["tradeSeq"], 1)
+        self.assertEqual(loaded["settings"]["strategy"], "granmago")
+
+    def test_state_from_150_loads_the_book_and_pins_monitoring(self):
+        payload = {
+            "running": True,
+            "balance": 4321.5,
+            "initialBalance": 10000,
+            "openPositions": [{
+                "pair": "ETH-USDT",
+                "side": "short",
+                "entry": 2413.52,
+                "sl": 2580.0,
+                "tp": 2130.0,
+                "notional": 800.0,
+                "strategy": "scanner",
+                "trailingActive": True,
+                "note": "keep-me",
+            }],
+            "history": [{
+                "time": "2026-10-01 10:00",
+                "pair": "BTC-USDT",
+                "side": "long",
+                "entry": 60000,
+                "exit": 59000,
+                "pnl": -4.5,
+                "reason": "SL",
+            }],
+            "settings": {
+                "strategy": "scanner",
+                "entryThreshold": 90,
+                "trailingEnabled": True,
+                "regimeFilter": "adx",
+                "granmagoStyle": "strict",
+                "granmagoVariant": "b",
+                "granmagoMaxAdds": 2,
+                "riskPct": 2,
+                "leverage": 5,
+                "maxPositions": 5,
+                "feePctPerSide": 0,
+                "slippagePctPerSide": 0,
+                "pairs": ["BTC-USDT", "ETH-USDT"],
+                "removedKnob": "ignore-me",
+            },
+            "notAField": {"nope": True},
+        }
+        server.STATE_FILE.write_text(json.dumps(payload), encoding="utf-8")
+        loaded = server.load_state()
+        self.assertEqual(loaded["balance"], 4321.5)
+        self.assertTrue(loaded["running"])
+        self.assertEqual(loaded["history"][0]["pnl"], -4.5)
+        self.assertEqual(len(loaded["openPositions"]), 1)
+        pos = loaded["openPositions"][0]
+        self.assertEqual(pos["pair"], "ETH-USDT")
+        self.assertEqual(pos["entry"], 2413.52)
+        self.assertEqual(pos["notional"], 800.0)
+        self.assertEqual(pos["note"], "keep-me")
+        self.assertEqual(pos["strategy"], "scanner")
+        self.assertTrue(pos["trailingActive"])
+        self.assertEqual(loaded["settings"]["strategy"], "granmago")
+        self.assertEqual(loaded["settings"]["granmagoVariant"], "a")
+        self.assertEqual(loaded["settings"]["granmagoStyle"], "sweep")
+        self.assertEqual(loaded["settings"]["granmagoSetups"], "both")
+        self.assertEqual(loaded["settings"]["granmagoMaxAdds"], 0)
+        self.assertTrue(loaded["settings"]["granmagoMomentumExit"])
+        self.assertEqual(loaded["settings"]["granmagoMaxHoldBars"], 15)
+        self.assertEqual(loaded["settings"]["granmagoStopPadPct"], 0.3)
+        self.assertFalse(loaded["settings"]["trailingEnabled"])
+        self.assertEqual(loaded["settings"]["regimeFilter"], "off")
+        self.assertEqual(loaded["settings"]["pairCooldownMinutes"], 0)
+        self.assertEqual(loaded["settings"]["scanSeconds"], 90)
+        self.assertEqual(loaded["settings"]["takeProfitR"], 1.7)
+        self.assertEqual(loaded["settings"]["riskPct"], 2)
+        self.assertEqual(loaded["settings"]["leverage"], 5)
+        self.assertEqual(loaded["settings"]["maxPositions"], 5)
+        self.assertEqual(loaded["settings"]["feePctPerSide"], 0)
+        self.assertEqual(loaded["settings"]["slippagePctPerSide"], 0)
+        self.assertEqual(loaded["settings"]["pairs"], ["BTC-USDT", "ETH-USDT"])
+        self.assertNotIn("notAField", loaded)
 
     def test_risk_and_leverage_options_override_saved_state(self):
         os.environ["RISK_PCT"] = "1"

@@ -2,111 +2,24 @@ configuration:
   log_level:
     name: Log level
     description: How much the add-on writes to the log.
-  risk_pct:
-    name: Risk %
-    description: Percent of the paper balance risked on each trade.
-  leverage:
-    name: Leverage
-    description: Stored on the trade. Size comes from risk and stop distance.
   initial_balance:
     name: Initial balance
     description: Paper balance used when you reset from the page.
-  scan_seconds:
-    name: Seconds between scans
-    description: Full scan interval. An open position is still checked every 20 seconds and does not stop the scan.
-  trailing_enabled:
-    name: Trailing stop
-    description: When on, a profitable trade switches from the fixed stop and target to a trailing stop.
-  trailing_activation_pct:
-    name: Trailing activation %
-    description: Unrealized profit, as a percent of position notional, required before the trailing stop takes over.
-  trailing_distance:
-    name: Trailing distance
-    description: Trail distance as a fraction of the initial risk (entry to the original stop).
-  entry_threshold:
-    name: Entry threshold
-    description: Minimum score required to open a trade. 100 requires a perfect score.
+  risk_pct:
+    name: Risk %
+    description: Percent of the paper balance risked on each trade. Default is 1.
+  leverage:
+    name: Leverage
+    description: Caps total notional at balance times leverage. Size still comes from risk and the stop. Default is 3.
   max_positions:
     name: Max positions
-    description: How many trades can be open at once, each on a different coin. From 1 to 12.
+    description: How many trades can be open at once, each on a different coin. From 1 to 12. Default is 3.
   fee_pct_per_side:
     name: Fee % per side
-    description: Taker fee charged on entry and on exit, in percent of notional. 0 keeps the old paper accounting. Blofin taker is about 0.06.
+    description: Taker fee charged on entry and on exit, in percent of notional. Default is 0.06, about the Blofin taker.
   slippage_pct_per_side:
     name: Slippage % per side
-    description: Adverse fill, in percent, applied to the entry and the exit. 0 disables it. 0.02 is a small market-order assumption.
-  take_profit_r:
-    name: Take profit (R)
-    description: Target distance as a multiple of the initial stop distance. 1.7 is the previous fixed target. 0 disables the target.
-  partial_tp_r:
-    name: Partial take profit (R)
-    description: Close part of the position at this R multiple. 0 disables the partial.
-  partial_tp_fraction:
-    name: Partial fraction
-    description: Fraction of the position closed at the partial target. 0.5 closes half.
-  partial_move_breakeven:
-    name: Breakeven after partial
-    description: Move the stop to the entry after the partial fills.
-  stop_mode:
-    name: Stop mode
-    description: swing uses the last 10 candles of 4H. atr uses ATR(4H) times the multiplier.
-  stop_atr_period:
-    name: ATR period
-    description: ATR period on 4H candles when the stop mode is atr.
-  stop_atr_mult:
-    name: ATR multiplier
-    description: Stop distance is this many ATRs when the stop mode is atr.
-  trailing_activation_r:
-    name: Trailing activation (R)
-    description: Arm the trail after this multiple of the initial risk. 0 keeps the percent-of-notional activation.
-  trailing_keep_tp:
-    name: Keep the target
-    description: When on, arming the trail does not cancel the take profit.
-  pair_cooldown_minutes:
-    name: Cooldown per pair
-    description: Minutes to wait before opening the same coin again. 0 disables it.
-  max_same_direction_risk_r:
-    name: Same-direction risk cap (R)
-    description: Maximum open risk, in units of one full trade, for all longs or all shorts. 0 disables the cap.
-  regime_filter:
-    name: Regime filter
-    description: off keeps every signal. slope blocks trades against the daily EMA50 slope. adx and er skip chop. slope_adx and slope_er require both.
-  regime_adx_min:
-    name: Minimum ADX
-    description: Used when the regime filter includes adx. Entries need 4H ADX at or above this value.
-  regime_er_min:
-    name: Minimum efficiency ratio
-    description: Used when the regime filter includes er. Entries need a 4H Kaufman ER at or above this value.
-  strategy:
-    name: Strategy
-    description: scanner keeps the score entries. granmago uses the course rules (sweep or pullback, stochastic veto, squeeze). The scanner stays available.
-  granmago_variant:
-    name: Gran Mago variant
-    description: a is longs and shorts confirmed by two 4H closes. b is longs only, confirmed by one 12H close.
-  granmago_max_adds:
-    name: Averaging adds
-    description: Extra fills at the swept extreme, 0, 1 or 2. The first entry is sized so every leg stopped out is still one risk percent. 0 does not average.
-  granmago_momentum_exit:
-    name: Momentum exit
-    description: Close a course trade when the stochastic is exhausted and the squeeze histogram is rolling over.
-  granmago_max_hold_bars:
-    name: Maximum hold (bars)
-    description: Close a course trade after this many confirmation candles. 15 is about two and a half days on 4H and a week on 12H. 0 disables the time exit.
-  granmago_breakeven_r:
-    name: Gran Mago breakeven (R)
-    description: Move the course stop to the entry after this many R. 0 leaves the stop where it was placed. The course never specified this.
-  granmago_min_rr:
-    name: Minimum reward to risk
-    description: Skip a course signal whose target is closer than this multiple of the stop. 0 keeps every target, including a stop wider than the target.
-  granmago_stop_pad_pct:
-    name: Stop pad %
-    description: The stop sits beyond the swept wick by at least this percent of price, or by half of the 4H ATR, whichever is wider.
-  granmago_style:
-    name: Gran Mago style
-    description: strict is the original course gate (30-day extreme, stochastic veto, squeeze and ADX). sweep is the relaxed sweep-first mode (recent swings and the previous day, daily EMA50 only, stochastic cross, squeeze and ADX recorded but not required).
-  granmago_setups:
-    name: Gran Mago setups
-    description: both takes sweeps and pullbacks. sweep takes only the sweep. pullback takes only the pullback.
+    description: Adverse fill, in percent, applied to the entry and the exit. Default is 0.02.
   pairs:
     name: Pairs
-    description: USDT swaps to scan, one symbol per entry (for example BTC-USDT). The default is the original 12. Leave it unchanged on upgrade. The 28-pair liquid book from the 1.5.0 study is listed in the README. At most 40 symbols are used. An open position on a pair you remove stays monitored until it closes.
+    description: USDT swaps to scan, one symbol per entry (for example BTC-USDT). Default is the 28-pair monitoring book. At most 40 symbols are used. An open position on a pair you remove stays monitored until it closes.

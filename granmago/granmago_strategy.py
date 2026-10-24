@@ -1,9 +1,14 @@
-"""Gran Mago course strategy, as a selectable mode next to the score scanner.
+"""Gran Mago course strategy.
+
+The add-on pins variant A, style sweep, both setups, no adds, the momentum
+exit, a 15-bar hold and a 0.3% stop pad. Arguments stay on the functions so
+the research tools can still compare other readings. The score scanner is
+the other mode in this module; the add-on does not expose it.
 
 The course (14 classes) plus the later X posts disagree on a few numbers.
-This module picks one concrete reading and keeps the free choices in the
-add-on options (variant, adds, momentum exit, hold, minimum R, breakeven,
-stop pad). Nothing here is tuned on the walk-forward sample.
+This module picks one concrete reading and keeps the free choices as
+arguments (variant, adds, momentum exit, hold, minimum R, breakeven,
+stop pad) for the research tools. Nothing here is tuned on the walk-forward sample.
 
 Chosen readings, where the sources disagree:
 
@@ -64,7 +69,9 @@ Chosen readings, where the sources disagree:
   faithfully, so it is not implemented.
 - Countertrend is off. The repeated scalping re-entry is not implemented.
 
-`style="sweep"` is the relaxed reading. It is not the default.
+`style="sweep"` is the relaxed reading. `find_signals` still defaults to
+`strict` so a research call that omits the argument does not change. The
+add-on passes `sweep`.
 
 - The level is whichever of these the bar actually wicks through, and the
   most extreme one when several are swept together: a daily close-pivot

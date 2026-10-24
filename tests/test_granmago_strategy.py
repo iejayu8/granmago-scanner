@@ -324,6 +324,12 @@ class SweepModeTest(unittest.TestCase):
 
 class GranmagoPaperTest(unittest.TestCase):
     def setUp(self):
+        for name in (
+            "PAIRS", "STRATEGY", "GRANMAGO_STYLE", "GRANMAGO_SETUPS",
+            "GRANMAGO_VARIANT", "GRANMAGO_MAX_ADDS", "FEE_PCT_PER_SIDE",
+            "SLIPPAGE_PCT_PER_SIDE", "RISK_PCT", "LEVERAGE", "MAX_POSITIONS",
+        ):
+            os.environ.pop(name, None)
         server.STATE.clear()
         server.STATE.update(server.default_state())
         server.STATE["running"] = True
@@ -356,30 +362,56 @@ class GranmagoPaperTest(unittest.TestCase):
             "closeMs": 0,
         }
 
-    def test_default_mode_is_the_scanner(self):
+    def test_addon_default_is_the_monitoring_setup(self):
+        for name in ("RISK_PCT", "LEVERAGE", "MAX_POSITIONS", "FEE_PCT_PER_SIDE",
+                     "SLIPPAGE_PCT_PER_SIDE", "PAIRS", "STRATEGY", "GRANMAGO_STYLE"):
+            os.environ.pop(name, None)
+        fresh = server.default_state()
+        settings = fresh["settings"]
+        self.assertEqual(settings["strategy"], "granmago")
+        self.assertEqual(settings["granmagoVariant"], "a")
+        self.assertEqual(settings["granmagoStyle"], "sweep")
+        self.assertEqual(settings["granmagoSetups"], "both")
+        self.assertEqual(settings["granmagoMaxAdds"], 0)
+        self.assertTrue(settings["granmagoMomentumExit"])
+        self.assertEqual(settings["granmagoMaxHoldBars"], 15)
+        self.assertEqual(settings["granmagoStopPadPct"], 0.3)
+        self.assertEqual(settings["takeProfitR"], 1.7)
+        self.assertFalse(settings["trailingEnabled"])
+        self.assertEqual(settings["regimeFilter"], "off")
+        self.assertEqual(settings["pairCooldownMinutes"], 0)
+        self.assertEqual(settings["scanSeconds"], 90)
+        self.assertEqual(settings["riskPct"], 1.0)
+        self.assertEqual(settings["leverage"], 3)
+        self.assertEqual(settings["maxPositions"], 3)
+        self.assertEqual(settings["feePctPerSide"], 0.06)
+        self.assertEqual(settings["slippagePctPerSide"], 0.02)
+        self.assertEqual(settings["pairs"], server.LIQUID_PAIRS)
         server.STATE["settings"]["strategy"] = "scanner"
         self.assertEqual(server.strategy_mode(), "scanner")
 
-    def test_sweep_style_option_round_trip(self):
-        os.environ.pop("GRANMAGO_STYLE", None)
-        os.environ.pop("GRANMAGO_SETUPS", None)
+    def test_removed_style_options_do_not_unpin_the_setup(self):
+        os.environ["GRANMAGO_STYLE"] = "strict"
+        os.environ["GRANMAGO_SETUPS"] = "pullback"
+        os.environ["STRATEGY"] = "scanner"
+        os.environ["GRANMAGO_VARIANT"] = "b"
+        try:
+            server.STATE["settings"]["granmagoStyle"] = "strict"
+            server.STATE["settings"]["granmagoSetups"] = "pullback"
+            server.STATE["settings"]["strategy"] = "scanner"
+            server.STATE["settings"]["granmagoVariant"] = "b"
+            server._apply_runtime_options(server.STATE["settings"])
+            self.assertEqual(server.granmago_style(), "sweep")
+            self.assertEqual(server.granmago_setups(), "both")
+            self.assertEqual(server.strategy_mode(), "granmago")
+            self.assertEqual(server.granmago_variant(), "a")
+        finally:
+            for name in ("GRANMAGO_STYLE", "GRANMAGO_SETUPS", "STRATEGY", "GRANMAGO_VARIANT"):
+                os.environ.pop(name, None)
         server.STATE["settings"]["granmagoStyle"] = "strict"
-        server.STATE["settings"]["granmagoSetups"] = "both"
-        server._apply_runtime_options(server.STATE["settings"])
         self.assertEqual(server.granmago_style(), "strict")
-        self.assertEqual(server.granmago_setups(), "both")
-        os.environ["GRANMAGO_STYLE"] = "sweep"
-        os.environ["GRANMAGO_SETUPS"] = "SWEEP"
-        server._apply_runtime_options(server.STATE["settings"])
-        self.assertEqual(server.granmago_style(), "sweep")
-        self.assertEqual(server.granmago_setups(), "sweep")
-        os.environ.pop("GRANMAGO_STYLE", None)
-        os.environ.pop("GRANMAGO_SETUPS", None)
-        server.STATE["settings"]["granmagoStyle"] = "strict"
-        server.STATE["settings"]["granmagoSetups"] = "both"
-        server._apply_runtime_options(server.STATE["settings"])
 
-    def test_pairs_option_defaults_to_the_original_twelve(self):
+    def test_pairs_option_defaults_to_the_liquid_book(self):
         os.environ.pop("PAIRS", None)
         os.environ.pop("STRATEGY", None)
         os.environ.pop("GRANMAGO_STYLE", None)
@@ -391,20 +423,22 @@ class GranmagoPaperTest(unittest.TestCase):
         server.STATE["settings"]["feePctPerSide"] = 0
         server.STATE["settings"]["slippagePctPerSide"] = 0
         server._apply_runtime_options(server.STATE["settings"])
-        self.assertEqual(server.active_pairs(), server.DEFAULT_PAIRS)
+        self.assertEqual(server.active_pairs(), server.LIQUID_PAIRS)
         self.assertEqual(len(server.LIQUID_PAIRS), 28)
         self.assertEqual(server.LIQUID_PAIRS[:12], server.DEFAULT_PAIRS)
-        self.assertEqual(server.strategy_mode(), "scanner")
-        self.assertEqual(server.granmago_style(), "strict")
+        self.assertEqual(server.strategy_mode(), "granmago")
+        self.assertEqual(server.granmago_style(), "sweep")
         self.assertEqual(server.fee_pct_per_side(), 0)
         self.assertEqual(server.slippage_pct_per_side(), 0)
         os.environ["PAIRS"] = json.dumps(server.LIQUID_PAIRS + ["btc-usdt", "NOT-A-PAIR", ""])
+        os.environ["STRATEGY"] = "scanner"
         try:
             server._apply_runtime_options(server.STATE["settings"])
             self.assertEqual(server.active_pairs(), server.LIQUID_PAIRS)
-            self.assertEqual(server.strategy_mode(), "scanner")
+            self.assertEqual(server.strategy_mode(), "granmago")
         finally:
             os.environ.pop("PAIRS", None)
+            os.environ.pop("STRATEGY", None)
         os.environ["PAIRS"] = "ETH-USDT, eth-usdt, SOL-USDT"
         try:
             server._apply_runtime_options(server.STATE["settings"])
@@ -414,12 +448,12 @@ class GranmagoPaperTest(unittest.TestCase):
         os.environ["PAIRS"] = "nope, ???"
         try:
             server._apply_runtime_options(server.STATE["settings"])
-            self.assertEqual(server.active_pairs(), server.DEFAULT_PAIRS)
+            self.assertEqual(server.active_pairs(), server.LIQUID_PAIRS)
         finally:
             os.environ.pop("PAIRS", None)
         server.STATE["settings"].pop("pairs", None)
         server._apply_runtime_options(server.STATE["settings"])
-        self.assertEqual(server.active_pairs(), server.DEFAULT_PAIRS)
+        self.assertEqual(server.active_pairs(), server.LIQUID_PAIRS)
 
     def test_first_entry_reserves_the_add_and_a_runner_does_not_trail(self):
         self.assertTrue(server.open_granmago(self._signal()))

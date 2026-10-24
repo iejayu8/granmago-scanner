@@ -44,8 +44,9 @@ FETCH_START = datetime(2023, 1, 12, 0, 0, tzinfo=backtest.timezone.utc)
 FOLD_START = datetime(2024, 1, 22, 0, 0, tzinfo=MADRID)
 FOLD_DAYS = 45
 
-# Frozen before this run. The same list now lives on the add-on as the
-# documented liquid book (server.LIQUID_PAIRS). It is not the live default.
+# Frozen before this run. CORE is the original 12-pair book. EXTENDED is
+# the 28-pair liquid book (server.LIQUID_PAIRS), which is the add-on
+# default since 1.5.1. This study still runs both.
 CORE = list(server.DEFAULT_PAIRS)
 EXTENDED = list(server.LIQUID_PAIRS)
 

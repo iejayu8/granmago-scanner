@@ -2,111 +2,24 @@ configuration:
   log_level:
     name: Nivel de log
     description: Detalle de los mensajes del complemento.
-  risk_pct:
-    name: Riesgo %
-    description: Porcentaje del balance de paper que arriesga cada operación.
-  leverage:
-    name: Apalancamiento
-    description: Se anota en la operación. El tamaño sale del riesgo y de la distancia al stop.
   initial_balance:
     name: Balance inicial
     description: Balance de paper al resetear desde la página.
-  scan_seconds:
-    name: Segundos entre escaneos
-    description: Intervalo del escaneo completo. Con una posición abierta el precio se mira cada 20 segundos y el escaneo sigue.
-  trailing_enabled:
-    name: Trailing stop
-    description: Si está activo, una operación en beneficio pasa del stop y el objetivo fijos a un stop dinámico.
-  trailing_activation_pct:
-    name: Activación del trailing %
-    description: Beneficio no realizado, en porcentaje del nocional, para que el trailing tome el control.
-  trailing_distance:
-    name: Distancia del trailing
-    description: Distancia del trailing como fracción del riesgo inicial (entrada al stop original).
-  entry_threshold:
-    name: Umbral de entrada
-    description: Puntuación mínima para abrir una operación. 100 exige el score máximo.
+  risk_pct:
+    name: Riesgo %
+    description: Porcentaje del balance de paper que arriesga cada operación. El defecto es 1.
+  leverage:
+    name: Apalancamiento
+    description: Limita la suma de nocionales a balance por apalancamiento. El tamaño sale del riesgo y del stop. El defecto es 3.
   max_positions:
     name: Máximo de posiciones
-    description: Cuántas operaciones pueden estar abiertas a la vez, cada una en una moneda distinta. De 1 a 12.
+    description: Cuántas operaciones pueden estar abiertas a la vez, cada una en una moneda distinta. De 1 a 12. El defecto es 3.
   fee_pct_per_side:
     name: Comisión % por lado
-    description: Comisión taker en la entrada y en la salida, en porcentaje del nocional. 0 mantiene el paper anterior. El taker de Blofin ronda el 0,06.
+    description: Comisión taker en la entrada y en la salida, en porcentaje del nocional. El defecto es 0,06, cerca del taker de Blofin.
   slippage_pct_per_side:
     name: Slippage % por lado
-    description: Empeora el precio de entrada y de salida, en porcentaje. 0 lo desactiva. 0,02 es un supuesto pequeño de orden a mercado.
-  take_profit_r:
-    name: Take profit (R)
-    description: Distancia del objetivo como múltiplo de la distancia al stop inicial. 1,7 es el objetivo fijo anterior. 0 lo quita.
-  partial_tp_r:
-    name: Take profit parcial (R)
-    description: Cierra una parte de la posición en este múltiplo de R. 0 desactiva el parcial.
-  partial_tp_fraction:
-    name: Fracción del parcial
-    description: Parte de la posición que se cierra en el objetivo parcial. 0,5 cierra la mitad.
-  partial_move_breakeven:
-    name: Breakeven tras el parcial
-    description: Mueve el stop a la entrada cuando se llena el parcial.
-  stop_mode:
-    name: Tipo de stop
-    description: swing usa las últimas 10 velas de 4H. atr usa el ATR(4H) por el multiplicador.
-  stop_atr_period:
-    name: Periodo del ATR
-    description: Periodo del ATR en velas de 4H cuando el stop es atr.
-  stop_atr_mult:
-    name: Multiplicador del ATR
-    description: La distancia del stop es este número de ATR cuando el modo es atr.
-  trailing_activation_r:
-    name: Activación del trailing (R)
-    description: Arma el trailing tras este múltiplo del riesgo inicial. 0 mantiene la activación en porcentaje del nocional.
-  trailing_keep_tp:
-    name: Mantener el objetivo
-    description: Si está activo, armar el trailing no cancela el take profit.
-  pair_cooldown_minutes:
-    name: Enfriamiento por par
-    description: Minutos de espera antes de volver a abrir la misma moneda. 0 lo desactiva.
-  max_same_direction_risk_r:
-    name: Tope de riesgo en la misma dirección (R)
-    description: Riesgo abierto máximo, en unidades de una operación completa, para todos los largos o todos los cortos. 0 desactiva el tope.
-  regime_filter:
-    name: Filtro de régimen
-    description: off deja pasar todas las señales. slope bloquea operaciones contra la pendiente de la EMA50 diaria. adx y er saltan el lateral. slope_adx y slope_er exigen ambos.
-  regime_adx_min:
-    name: ADX mínimo
-    description: Se usa cuando el filtro incluye adx. La entrada exige un ADX de 4H igual o mayor.
-  regime_er_min:
-    name: Efficiency ratio mínimo
-    description: Se usa cuando el filtro incluye er. La entrada exige un ER de Kaufman en 4H igual o mayor.
-  strategy:
-    name: Estrategia
-    description: scanner mantiene las entradas por score. granmago usa las reglas del curso (barrido o retroceso, veto del estocástico, squeeze). El scanner sigue disponible.
-  granmago_variant:
-    name: Variante Gran Mago
-    description: a opera largos y cortos con dos cierres de 4H. b solo largos, con un cierre de 12H.
-  granmago_max_adds:
-    name: Promedios
-    description: Entradas extra en el extremo barrido, 0, 1 o 2. La primera se dimensiona para que todas las patas, si saltan el stop, sigan siendo un solo riesgo. 0 no promedia.
-  granmago_momentum_exit:
-    name: Salida por agotamiento
-    description: Cierra la operación del curso cuando el estocástico está agotado y el histograma del squeeze gira.
-  granmago_max_hold_bars:
-    name: Máximo de velas
-    description: Cierra la operación del curso tras estas velas de confirmación. 15 son unos dos días y medio en 4H y una semana en 12H. 0 desactiva la salida por tiempo.
-  granmago_breakeven_r:
-    name: Breakeven Gran Mago (R)
-    description: Mueve el stop del curso a la entrada tras estos R. 0 lo deja donde se puso. El curso no llegó a explicar el breakeven.
-  granmago_min_rr:
-    name: Relación mínima beneficio/riesgo
-    description: Descarta una señal cuyo objetivo esté más cerca que este múltiplo del stop. 0 acepta cualquier objetivo, también con el stop más ancho que el objetivo.
-  granmago_stop_pad_pct:
-    name: Margen del stop %
-    description: El stop queda más allá de la mecha barrida al menos este porcentaje del precio, o medio ATR de 4H, el que sea mayor.
-  granmago_style:
-    name: Estilo Gran Mago
-    description: strict es el filtro original del curso (extremo de 30 días, veto del estocástico, squeeze y ADX). sweep es el modo de barrido relajado (swings recientes y el día anterior, solo la EMA50 diaria, cruce del estocástico, squeeze y ADX anotados pero no exigidos).
-  granmago_setups:
-    name: Setups Gran Mago
-    description: both toma barridos y retrocesos. sweep solo el barrido. pullback solo el retroceso.
+    description: Empeora el precio de entrada y de salida, en porcentaje. El defecto es 0,02.
   pairs:
     name: Pares
-    description: Swaps USDT que se escanean, un símbolo por línea (por ejemplo BTC-USDT). El defecto son los 12 de siempre. No lo cambies al actualizar. Los 28 pares líquidos del estudio de 1.5.0 están en el README. Se usan como máximo 40. Una posición abierta en un par que quites se sigue vigilando hasta que cierre.
+    description: Swaps USDT que se escanean, un símbolo por línea (por ejemplo BTC-USDT). El defecto son los 28 pares de la monitorización. Se usan como máximo 40. Una posición abierta en un par que quites se sigue vigilando hasta que cierre.
