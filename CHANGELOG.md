@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.6.1
+
+- No cambia el comportamiento respecto a 1.5.2. El complemento ya estaba instalado como 1.6.0 por una etiqueta anterior, puesta sin implementar la estrategia v7, y Home Assistant no ofrece una versión más baja. Esta sube a 1.6.1 para que la actualización sí aparezca.
+- Trae las correcciones de 1.5.2: una señal (par, dirección y cierre de la vela de 4H) abre como máximo una operación; no se entra si el precio del escaneo ya está en el stop o más allá, o ya ha llegado al objetivo, y la entrada usa ese precio; `pairs: []` vuelve a los 28 pares y sustituye la lista guardada en el estado. La estrategia v7 sigue sin estar implementada.
+
 ## 1.5.2
 
 - Una señal (par, dirección y cierre de la vela de 4H) abre como máximo una operación. El escaneo de cada 90 s seguía viendo la misma señal hasta el siguiente cierre, y al saltar el stop volvía a entrar al precio de esa vela aunque el mercado ya estuviera por debajo. La entrada usa el precio del escaneo. Si ese precio ya está en el stop o más allá, o ya ha llegado al objetivo, la operación no se abre.
