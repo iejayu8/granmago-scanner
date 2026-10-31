@@ -455,6 +455,155 @@ class GranmagoPaperTest(unittest.TestCase):
         server._apply_runtime_options(server.STATE["settings"])
         self.assertEqual(server.active_pairs(), server.LIQUID_PAIRS)
 
+    def test_empty_pairs_option_overrides_a_stale_saved_book(self):
+        # bashio::config prints nothing for `pairs: []`, and run.sh still
+        # exports PAIRS as an empty string. That has to replace the 12-pair
+        # book a 1.5.0 install left in state.json.
+        stale = list(server.DEFAULT_PAIRS)
+        self.assertEqual(len(stale), 12)
+        self.assertEqual(len(server.LIQUID_PAIRS), 28)
+        for raw in ("", "[]", "null", "none", "   "):
+            os.environ["PAIRS"] = raw
+            try:
+                server.STATE["settings"]["pairs"] = list(stale)
+                server._apply_runtime_options(server.STATE["settings"])
+                self.assertEqual(server.active_pairs(), server.LIQUID_PAIRS, raw)
+            finally:
+                os.environ.pop("PAIRS", None)
+        # A non-empty array is one symbol per line, and it also wins over state.
+        os.environ["PAIRS"] = "ETH-USDT\nSOL-USDT\n"
+        try:
+            server.STATE["settings"]["pairs"] = list(stale)
+            server._apply_runtime_options(server.STATE["settings"])
+            self.assertEqual(server.active_pairs(), ["ETH-USDT", "SOL-USDT"])
+        finally:
+            os.environ.pop("PAIRS", None)
+        server.STATE["settings"]["pairs"] = list(stale)
+        server._apply_runtime_options(server.STATE["settings"])
+        self.assertEqual(server.active_pairs(), stale)
+
+    def _course_signal(self, side="long", price=80825.96, sl=78442.1, tp=86000.0, close_ms=None):
+        sig = self._signal()
+        sig.update({
+            "side": side,
+            "price": price,
+            "sl": sl,
+            "tp": tp,
+            "addPrice": sl,
+            "sweepExtreme": sl,
+            "confirmMs": H4,
+            "closeMs": H4 * 100 if close_ms is None else close_ms,
+        })
+        return sig
+
+    def _scan_row(self, market, sig=None, pair="BTC-USDT"):
+        if sig is None:
+            sig = self._course_signal()
+        sig = dict(sig)
+        sig["pair"] = pair
+        return {
+            "pair": pair,
+            "price": market,
+            "scoreLong": 0,
+            "scoreShort": 0,
+            "granmago": sig,
+        }
+
+    def test_same_signal_is_not_reopened_after_the_stop(self):
+        server.STATE["settings"]["granmagoMaxAdds"] = 0
+        server.STATE["settings"]["slippagePctPerSide"] = 0
+        close_ms = H4 * 100
+        signal_price = 80825.96
+        stop = 78442.1
+        sig = self._course_signal(price=signal_price, sl=stop, tp=86000.0, close_ms=close_ms)
+        server.STATE["lastScan"] = [self._scan_row(80000.0, sig)]
+        server.maybe_open()
+        self.assertEqual(len(server.STATE["openPositions"]), 1)
+        pos = server.STATE["openPositions"][0]
+        self.assertAlmostEqual(pos["entry"], 80000.0)
+        self.assertAlmostEqual(pos["signalPrice"], signal_price)
+        self.assertEqual(pos["closeMs"], close_ms)
+        reason = server._apply_mark(pos, stop)
+        self.assertEqual(reason, "SL")
+        self.assertEqual(server.STATE["openPositions"], [])
+        self.assertEqual(server.STATE["history"][0]["closeMs"], close_ms)
+        balance_after = server.STATE["balance"]
+        # The next scans still carry the same 4H signal. Some prints are
+        # back inside the bracket, one is the stale signal price, and some
+        # are already through the stop. None of them may open.
+        for market in (
+            80000.0, 77000.0, signal_price, 79000.0, 80000.0,
+            77000.0, 81000.0, 78500.0, 80000.0, 77000.0, 80000.0,
+        ):
+            server.STATE["lastScan"] = [self._scan_row(market, sig)]
+            server.maybe_open()
+            self.assertEqual(server.STATE["openPositions"], [])
+        self.assertEqual(len(server.STATE["history"]), 1)
+        self.assertEqual(server.STATE["balance"], balance_after)
+        self.assertFalse(server.open_granmago(dict(sig, pair="BTC-USDT", market=80000.0)))
+
+        # tools/backtest.py replaces save_state with a no-op, so write the
+        # file the same way a restart would read it.
+        payload = {k: v for k, v in server.STATE.items() if k != "busy"}
+        server.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        server.STATE_FILE.write_text(json.dumps(payload), encoding="utf-8")
+        loaded = server.load_state()
+        server.STATE.clear()
+        server.STATE.update(loaded)
+        server.STATE["running"] = True
+        server.STATE["lastScan"] = [self._scan_row(80000.0, sig)]
+        server.maybe_open()
+        self.assertEqual(server.STATE["openPositions"], [])
+        self.assertEqual(len(server.STATE["history"]), 1)
+
+        later = self._course_signal(close_ms=close_ms + H4)
+        server.STATE["lastScan"] = [self._scan_row(80100.0, later)]
+        server.maybe_open()
+        self.assertEqual(len(server.STATE["openPositions"]), 1)
+        self.assertAlmostEqual(server.STATE["openPositions"][0]["entry"], 80100.0)
+        self.assertEqual(server.STATE["openPositions"][0]["closeMs"], close_ms + H4)
+
+    def test_price_beyond_stop_or_target_does_not_open(self):
+        server.STATE["settings"]["granmagoMaxAdds"] = 0
+        server.STATE["settings"]["slippagePctPerSide"] = 0.02
+        stop = 78442.1
+        # A long buys higher. 0.02% of slippage would drag this print back
+        # above the stop; the raw print is what has to sit inside.
+        market = 78432.1
+        self.assertLess(market, stop)
+        self.assertGreater(market * 1.0002, stop)
+        server.STATE["lastScan"] = [self._scan_row(market)]
+        server.maybe_open()
+        self.assertEqual(server.STATE["openPositions"], [])
+        self.assertEqual(server.STATE["history"], [])
+        self.assertEqual(server.STATE["balance"], 1000.0)
+
+        server.STATE["lastScan"] = [self._scan_row(stop)]
+        server.maybe_open()
+        self.assertEqual(server.STATE["openPositions"], [])
+        server.STATE["lastScan"] = [self._scan_row(86000.0)]
+        server.maybe_open()
+        self.assertEqual(server.STATE["openPositions"], [])
+
+        short = self._course_signal(
+            side="short", price=100.0, sl=106.0, tp=90.0, close_ms=H4 * 20,
+        )
+        above_stop = 106.01
+        self.assertGreater(above_stop, 106.0)
+        self.assertLess(above_stop * (1.0 - 0.0002), 106.0)
+        server.STATE["lastScan"] = [self._scan_row(above_stop, short, pair="ETH-USDT")]
+        server.maybe_open()
+        self.assertEqual(server.STATE["openPositions"], [])
+
+        server.STATE["lastScan"] = [self._scan_row(99.0, short, pair="ETH-USDT")]
+        server.maybe_open()
+        self.assertEqual(len(server.STATE["openPositions"]), 1)
+        pos = server.STATE["openPositions"][0]
+        self.assertEqual(pos["pair"], "ETH-USDT")
+        self.assertEqual(pos["side"], "short")
+        self.assertAlmostEqual(pos["entry"], 99.0 * (1.0 - 0.0002))
+        self.assertAlmostEqual(pos["signalPrice"], 100.0)
+
     def test_first_entry_reserves_the_add_and_a_runner_does_not_trail(self):
         self.assertTrue(server.open_granmago(self._signal()))
         pos = server.STATE["openPositions"][0]

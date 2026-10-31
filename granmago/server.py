@@ -40,7 +40,7 @@ PAIRS = list(DEFAULT_PAIRS)
 _PAIR_RE = re.compile(r"^[A-Z0-9]+-USDT$")
 MAX_CONFIGURED_PAIRS = 40
 
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 
 # Walk-forward monitoring setup. The add-on pins these on every start.
 # Leftover options and a saved copy in state.json do not change them.
@@ -223,8 +223,13 @@ def _apply_runtime_options(settings):
 
     risk, leverage, fees, slippage, max positions and pairs come from the
     environment when the add-on exported them, otherwise from the saved
-    state, otherwise from the 1.5.1 defaults. Supervisor fills a default
+    state, otherwise from the 1.5.2 defaults. Supervisor fills a default
     only when that key is missing, so an upgrade keeps a value already saved.
+
+    pairs is the exception for an empty list. bashio::config prints nothing
+    for `[]`, and run.sh still exports that empty string. An empty option
+    means the 28-pair book and replaces a list left in state.json. A missing
+    PAIRS variable is not an empty option: a saved list is kept.
 
     Strategy, variant, style, exits, trailing, regime, cooldown and the scan
     interval are fixed. Old environment variables and a saved copy of those
@@ -246,7 +251,7 @@ def _apply_runtime_options(settings):
         settings["leverage"] = _sane_leverage(settings.get("leverage", 3))
     _option_float(settings, "FEE_PCT_PER_SIDE", "feePctPerSide", 0.06)
     _option_float(settings, "SLIPPAGE_PCT_PER_SIDE", "slippagePctPerSide", 0.02)
-    if _env_set("PAIRS"):
+    if "PAIRS" in os.environ:
         settings["pairs"] = parse_pairs(os.environ.get("PAIRS"), LIQUID_PAIRS)
     else:
         settings["pairs"] = parse_pairs(settings.get("pairs"), LIQUID_PAIRS)
@@ -794,6 +799,7 @@ def default_state():
         "busy": False,
         "cooldowns": {},
         "tradeSeq": 0,
+        "usedSignals": {},
         "settings": {
             "riskPct": 1.0,
             "leverage": 3,
@@ -821,6 +827,67 @@ def _find_position(pair):
         if isinstance(pos, dict) and pos.get("pair") == pair:
             return pos
     return None
+
+
+def _signal_key(pair, side, confirm_ms, close_ms):
+    """Identity of one course signal: pair, direction, and candle close.
+
+    confirm_ms separates a 4H close from a 12H close that lands on the same
+    timestamp. A missing or non-positive close is not an identity, so research
+    callers that omit it are not blocked from opening.
+    """
+    if side not in ("long", "short") or not pair:
+        return None
+    try:
+        close = int(close_ms)
+    except (TypeError, ValueError):
+        return None
+    if close <= 0:
+        return None
+    try:
+        confirm = int(confirm_ms or 0)
+    except (TypeError, ValueError):
+        confirm = 0
+    return "%s|%s|%d|%d" % (pair, side, confirm, close)
+
+
+def _cap_used_signals(book):
+    if len(book) <= 400:
+        return book
+
+    def _stamp(item):
+        try:
+            return int(item[1])
+        except (TypeError, ValueError):
+            return 0
+
+    return dict(sorted(book.items(), key=_stamp)[-400:])
+
+
+def _seed_used_signals(state):
+    """Keep a signal consumed across a restart.
+
+    An open position and a history row written by this version carry the
+    candle close. A book saved before that field only has what usedSignals
+    already recorded.
+    """
+    book = state.get("usedSignals")
+    if not isinstance(book, dict):
+        book = {}
+    else:
+        book = dict(book)
+    rows = []
+    for name in ("openPositions", "history"):
+        found = state.get(name)
+        if isinstance(found, list):
+            rows.extend(found)
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = _signal_key(row.get("pair"), row.get("side"), row.get("confirmMs"), row.get("closeMs"))
+        if key and key not in book:
+            book[key] = row.get("closeMs")
+    state["usedSignals"] = _cap_used_signals(book)
 
 
 def _migrate_positions(state, raw):
@@ -915,6 +982,7 @@ def load_state():
                     base["settings"].update(data["settings"])
             _apply_runtime_options(base["settings"])
             _migrate_positions(base, data if isinstance(data, dict) else {})
+            _seed_used_signals(base)
             base["busy"] = False
             return base
         except (OSError, json.JSONDecodeError) as exc:
@@ -1591,6 +1659,47 @@ def open_from_result(res, side):
     return True
 
 
+def _used_signals():
+    book = STATE.get("usedSignals")
+    if not isinstance(book, dict):
+        book = {}
+        STATE["usedSignals"] = book
+    return book
+
+
+def _signal_used(pair, side, confirm_ms, close_ms):
+    key = _signal_key(pair, side, confirm_ms, close_ms)
+    return key is not None and key in _used_signals()
+
+
+def _remember_signal(pair, side, confirm_ms, close_ms):
+    key = _signal_key(pair, side, confirm_ms, close_ms)
+    if key is None:
+        return
+    book = _used_signals()
+    book[key] = close_ms
+    if len(book) > 400:
+        STATE["usedSignals"] = _cap_used_signals(book)
+
+
+def _outside_bracket(side, price, stop, target):
+    """True when a fill would already be through the stop or the target.
+
+    Equality counts: a long printed at the stop is stopped, and a print at
+    the target is already closed.
+    """
+    px = _as_price(price)
+    sl = _as_price(stop)
+    tp = _as_price(target)
+    if px is None or sl is None or tp is None:
+        return True
+    if side == "long":
+        return px <= sl or px >= tp
+    if side == "short":
+        return px >= sl or px <= tp
+    return True
+
+
 def open_granmago(sig):
     """Open one course trade from a signal dict. False when it cannot be sized.
 
@@ -1598,6 +1707,12 @@ def open_granmago(sig):
     swing or R multiple. With adds enabled, this fill risks 1/(1+adds) of
     risk_pct so the reserved adds can still lose the rest at the same stop.
     Trailing is not used on these positions.
+
+    A live scan passes the current print as ``market``. The fill is that
+    price, worsened by slippage, and the trade is refused when the print is
+    already through the stop or the target. Research callers leave ``market``
+    unset and fill at the signal price. The same pair, direction and candle
+    close can open at most one trade.
     """
     if not isinstance(sig, dict):
         return False
@@ -1614,14 +1729,22 @@ def open_granmago(sig):
     signal = _as_price(sig.get("price"))
     stop = _as_price(sig.get("sl"))
     target = _as_price(sig.get("tp"))
-    if signal is None or stop is None or target is None:
+    reference = _as_price(sig.get("market"))
+    if reference is None:
+        reference = signal
+    if signal is None or stop is None or target is None or reference is None:
         return False
-    entry = _slip_price(side, signal, closing=False)
-    if entry is None:
+    if _signal_used(pair, side, sig.get("confirmMs"), sig.get("closeMs")):
+        add_log("Señal ya operada en %s %s, no se repite." % (side.upper(), pair))
         return False
-    if side == "long" and not (stop < entry < target):
+    if _outside_bracket(side, reference, stop, target):
+        add_log(
+            "No se abre %s %s: precio %s fuera de stop %s / objetivo %s."
+            % (side.upper(), pair, _fmt(reference), _fmt(stop), _fmt(target))
+        )
         return False
-    if side == "short" and not (target < entry < stop):
+    entry = _slip_price(side, reference, closing=False)
+    if entry is None or _outside_bracket(side, entry, stop, target):
         return False
     dist = abs(entry - stop)
     if dist > entry * 0.08:
@@ -1701,6 +1824,7 @@ def open_granmago(sig):
         "breakevenR": granmago_breakeven_r(),
         "granmagoBe": False,
     })
+    _remember_signal(pair, side, sig.get("confirmMs"), sig.get("closeMs"))
     add_log(
         "ENTRADA GRANMAGO %s %s %s @ %s SL %s TP %s [%d/%d]"
         % (
@@ -1927,7 +2051,7 @@ def close_position(reason, price, pair=None, fraction=1.0):
     trade_r = None
     if full_close and initial_risk > 0:
         trade_r = round(trade_pnl / initial_risk, 4)
-    STATE["history"].insert(0, {
+    closed = {
         "time": _history_time(),
         "pair": pos["pair"],
         "side": pos["side"],
@@ -1944,7 +2068,11 @@ def close_position(reason, price, pair=None, fraction=1.0):
         "fees": round(exit_fee + entry_fee_share, 4),
         "notional": round(closed_notional, 2),
         "tradeId": pos.get("tradeId"),
-    })
+    }
+    if pos.get("closeMs"):
+        closed["closeMs"] = pos.get("closeMs")
+        closed["confirmMs"] = pos.get("confirmMs")
+    STATE["history"].insert(0, closed)
     del STATE["history"][200:]
     add_log("CERRADA %s %s → PnL %.2f USDT" % (pos["pair"], reason, net_rounded))
     if fraction >= 1 - 1e-12:
@@ -2059,8 +2187,11 @@ def maybe_open():
 
     Scanner mode ranks by score. Gran Mago mode opens the course signal on
     the bar that just closed and ignores the score. One position per coin,
-    long or short, never both. A manual scan does not call this. Nothing
-    is opened while the bot is stopped.
+    long or short, never both. The same signal (pair, direction, candle
+    close) is not opened again after it has already traded. The fill uses
+    the price on the scan row, which is the latest print, not the signal's
+    close. A manual scan does not call this. Nothing is opened while the
+    bot is stopped.
     """
     opened = False
     with LOCK:
@@ -2083,8 +2214,15 @@ def maybe_open():
                 if not isinstance(sig, dict) or not pair or pair in occupied:
                     continue
                 fresh = True
+                if _signal_used(pair, sig.get("side"), sig.get("confirmMs"), sig.get("closeMs")):
+                    continue
+                market = _as_price(row.get("price"))
+                if market is None:
+                    add_log("Sin precio actual de %s, no se abre la señal." % pair)
+                    continue
                 payload = dict(sig)
                 payload["pair"] = pair
+                payload["market"] = market
                 if open_granmago(payload):
                     opened = True
                     occupied.add(pair)

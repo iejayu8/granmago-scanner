@@ -22,4 +22,4 @@ configuration:
     description: Empeora el precio de entrada y de salida, en porcentaje. El defecto es 0,02.
   pairs:
     name: Pares
-    description: Swaps USDT que se escanean, un símbolo por línea (por ejemplo BTC-USDT). El defecto son los 28 pares de la monitorización. Se usan como máximo 40. Una posición abierta en un par que quites se sigue vigilando hasta que cierre.
+    description: Swaps USDT que se escanean, un símbolo por línea (por ejemplo BTC-USDT). El defecto son los 28 pares de la monitorización. Una lista vacía usa esos 28 y sustituye la lista guardada en el estado. Se usan como máximo 40. Una posición abierta en un par que quites se sigue vigilando hasta que cierre.
