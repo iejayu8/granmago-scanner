@@ -1,5 +1,5 @@
 name: GranMago Scanner
-version: "1.5.2"
+version: "1.6.1"
 slug: granmago
 description: Paper trading del scanner GranMago. El bot corre en el servidor aunque cierres la página.
 url: https://github.com/iejayu8/granmago-scanner
