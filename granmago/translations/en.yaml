@@ -22,4 +22,4 @@ configuration:
     description: Adverse fill, in percent, applied to the entry and the exit. Default is 0.02.
   pairs:
     name: Pairs
-    description: USDT swaps to scan, one symbol per entry (for example BTC-USDT). Default is the 28-pair monitoring book. At most 40 symbols are used. An open position on a pair you remove stays monitored until it closes.
+    description: USDT swaps to scan, one symbol per entry (for example BTC-USDT). Default is the 28-pair monitoring book. An empty list uses those 28 and replaces a list saved in the add-on state. At most 40 symbols are used. An open position on a pair you remove stays monitored until it closes.

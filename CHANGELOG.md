@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.2
+
+- Una señal (par, dirección y cierre de la vela de 4H) abre como máximo una operación. El escaneo de cada 90 s seguía viendo la misma señal hasta el siguiente cierre, y al saltar el stop volvía a entrar al precio de esa vela aunque el mercado ya estuviera por debajo. La entrada usa el precio del escaneo. Si ese precio ya está en el stop o más allá, o ya ha llegado al objetivo, la operación no se abre.
+- `pairs: []` usa los 28 pares de la monitorización y sustituye la lista guardada en el estado (por ejemplo los 12 de 1.5.0). bashio exporta una lista vacía como cadena vacía; antes eso se leía como opción ausente y ganaba el `state.json`.
+
 ## 1.5.1
 
 - El complemento arranca. 1.5.0 copiaba una lista fija de archivos y no metía `granmago_strategy.py` en la imagen, así que el proceso moría con `ModuleNotFoundError` antes de escanear. El Dockerfile copia ese módulo, y un test falla si `server.py` importa un módulo local que la imagen no incluye.

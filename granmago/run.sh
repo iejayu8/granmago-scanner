@@ -52,8 +52,10 @@ export INITIAL_BALANCE="$(bashio::config 'initial_balance')"
 export MAX_POSITIONS="$(bashio::config 'max_positions')"
 export FEE_PCT_PER_SIDE="$(bashio::config 'fee_pct_per_side')"
 export SLIPPAGE_PCT_PER_SIDE="$(bashio::config 'slippage_pct_per_side')"
-# JSON array. server.py also accepts a comma-separated list. A missing key
-# leaves the 28-pair monitoring book in place.
+# bashio prints one symbol per line. An empty array prints nothing, but
+# config.exists is still true, so PAIRS is exported as an empty string.
+# server.py treats that empty string as the 28-pair book and does not keep
+# a stale list from state.json. A missing key is not exported.
 if bashio::config.exists 'pairs'; then
   export PAIRS="$(bashio::config 'pairs')"
 fi

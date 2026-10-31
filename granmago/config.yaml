@@ -1,7 +1,7 @@
 name: GranMago Scanner
-version: "1.6.0"
+version: "1.5.2"
 slug: granmago
-description: Paper trading con estrategia v7 Pullback-to-EMA + RSI Recovery (15m).
+description: Paper trading del scanner GranMago. El bot corre en el servidor aunque cierres la página.
 url: https://github.com/iejayu8/granmago-scanner
 arch:
   - aarch64
