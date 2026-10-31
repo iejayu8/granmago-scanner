@@ -1,0 +1,16 @@
+configuration:
+  log_level:
+    name: Nivel de log
+    description: Detalle de los mensajes del complemento.
+  risk_pct:
+    name: Riesgo %
+    description: Porcentaje del balance de paper que arriesga cada operación.
+  leverage:
+    name: Apalancamiento
+    description: Se anota en la operación. El tamaño sale del riesgo y de la distancia al stop.
+  initial_balance:
+    name: Balance inicial
+    description: Balance de paper al resetear desde la página.
+  scan_seconds:
+    name: Segundos entre escaneos
+    description: Con una posición abierta el precio se mira cada 20 segundos.
