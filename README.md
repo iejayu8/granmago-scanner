@@ -85,3 +85,7 @@ El estilo es el de barrido. El nivel barrido es el más extremo entre un pivote 
 No se promedia. La primera orden arriesga el `risk_pct` entero.
 
 El filtro de noticias no está: el curso dice no operar con datos y en X dice que el IPC no le cambia la idea, y no hay un calendario fiable en el complemento. La contratendencia y el scalping de varios intentos tampoco se programan.
+
+## Estrategia v7 (alternativa)
+
+Se puede activar la lógica Pullback-to-EMA + RSI Recovery (15m) sustituyendo el modo scanner.
