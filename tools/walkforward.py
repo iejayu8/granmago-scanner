@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Walk-forward test of a small, pre-specified set of GranMago configs.
 
-Candles come from Blofin, the add-on's first source. Scoring uses
+Candles come from Blofin, the add-on's only source. Scoring uses
 server.score_market on each closed 1-minute bar, with the same no-lookahead
-window as tools/backtest.py. Exits use the live server path (fees, slippage,
-partials, trailing, cooldown, regime).
+window as tools/backtest.py. Exits reuse the accounting core in offline replay
+(fees, slippage, partials, trailing, cooldown, regime), not the live ticker gateway.
 
 Folds are anchored. A preset is chosen on the train window by closed-trade
 expectancy in R, with a minimum trade count, and that choice is scored only

@@ -517,7 +517,7 @@ class GranmagoPaperTest(unittest.TestCase):
         stop = 78442.1
         sig = self._course_signal(price=signal_price, sl=stop, tp=86000.0, close_ms=close_ms)
         server.STATE["lastScan"] = [self._scan_row(80000.0, sig)]
-        server.maybe_open()
+        server._maybe_open_replay()
         self.assertEqual(len(server.STATE["openPositions"]), 1)
         pos = server.STATE["openPositions"][0]
         self.assertAlmostEqual(pos["entry"], 80000.0)
@@ -536,7 +536,7 @@ class GranmagoPaperTest(unittest.TestCase):
             77000.0, 81000.0, 78500.0, 80000.0, 77000.0, 80000.0,
         ):
             server.STATE["lastScan"] = [self._scan_row(market, sig)]
-            server.maybe_open()
+            server._maybe_open_replay()
             self.assertEqual(server.STATE["openPositions"], [])
         self.assertEqual(len(server.STATE["history"]), 1)
         self.assertEqual(server.STATE["balance"], balance_after)
@@ -552,13 +552,13 @@ class GranmagoPaperTest(unittest.TestCase):
         server.STATE.update(loaded)
         server.STATE["running"] = True
         server.STATE["lastScan"] = [self._scan_row(80000.0, sig)]
-        server.maybe_open()
+        server._maybe_open_replay()
         self.assertEqual(server.STATE["openPositions"], [])
         self.assertEqual(len(server.STATE["history"]), 1)
 
         later = self._course_signal(close_ms=close_ms + H4)
         server.STATE["lastScan"] = [self._scan_row(80100.0, later)]
-        server.maybe_open()
+        server._maybe_open_replay()
         self.assertEqual(len(server.STATE["openPositions"]), 1)
         self.assertAlmostEqual(server.STATE["openPositions"][0]["entry"], 80100.0)
         self.assertEqual(server.STATE["openPositions"][0]["closeMs"], close_ms + H4)
@@ -573,16 +573,16 @@ class GranmagoPaperTest(unittest.TestCase):
         self.assertLess(market, stop)
         self.assertGreater(market * 1.0002, stop)
         server.STATE["lastScan"] = [self._scan_row(market)]
-        server.maybe_open()
+        server._maybe_open_replay()
         self.assertEqual(server.STATE["openPositions"], [])
         self.assertEqual(server.STATE["history"], [])
         self.assertEqual(server.STATE["balance"], 1000.0)
 
         server.STATE["lastScan"] = [self._scan_row(stop)]
-        server.maybe_open()
+        server._maybe_open_replay()
         self.assertEqual(server.STATE["openPositions"], [])
         server.STATE["lastScan"] = [self._scan_row(86000.0)]
-        server.maybe_open()
+        server._maybe_open_replay()
         self.assertEqual(server.STATE["openPositions"], [])
 
         short = self._course_signal(
@@ -592,11 +592,11 @@ class GranmagoPaperTest(unittest.TestCase):
         self.assertGreater(above_stop, 106.0)
         self.assertLess(above_stop * (1.0 - 0.0002), 106.0)
         server.STATE["lastScan"] = [self._scan_row(above_stop, short, pair="ETH-USDT")]
-        server.maybe_open()
+        server._maybe_open_replay()
         self.assertEqual(server.STATE["openPositions"], [])
 
         server.STATE["lastScan"] = [self._scan_row(99.0, short, pair="ETH-USDT")]
-        server.maybe_open()
+        server._maybe_open_replay()
         self.assertEqual(len(server.STATE["openPositions"]), 1)
         pos = server.STATE["openPositions"][0]
         self.assertEqual(pos["pair"], "ETH-USDT")

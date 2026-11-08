@@ -3,8 +3,9 @@
 
 Reuses scoring, sizing, the notional cap, SL/TP, partials and trailing from
 granmago/server.py. Fees and slippage follow the settings on the variant
-(the add-on defaults are 0). Candles come from Blofin, the source the
-add-on requests before Binance.
+(zero-cost research variants are explicit; the add-on defaults are 0.06%
+fee and 0.02% slippage per side). Candles come only from Blofin. Historical
+candle fills do not reproduce the live ticker freshness/bid/ask gateway.
 
 The scan is evaluated on each closed 1-minute bar (the live loop scans
 about every 90s and checks open trades about every 20s). Scoring uses
@@ -366,7 +367,7 @@ def _bt_position(pair):
 
 
 def mark(pair, price):
-    """One live monitor tick for `pair` at `price`. Returns the exit reason, or None.
+    """One offline replay tick for `pair` at `price`. Returns the exit reason, or None.
 
     Uses server._apply_mark, including partial exits. 'partial' means the
     position is still open.
@@ -589,7 +590,7 @@ class Variant:
         self.state["lastScan"] = tagged
         self.state["bestLong"] = best_l[0] if best_l else None
         self.state["bestShort"] = best_s[0] if best_s else None
-        server.maybe_open()
+        server._maybe_open_replay()
         opened = [p for p in self.state["openPositions"] if p["pair"] not in before]
         if not opened and (best_l or best_s) and len(before) < self.max_positions:
             self.rejected += 1
@@ -894,7 +895,7 @@ def run():
 
     results = [summarize(v, clock[-1] + MIN_MS if clock else end_ms) for v in variants]
     report = {
-        "source": "Blofin openapi.blofin.com candles (add-on primary; Binance not used)",
+        "source": "Blofin openapi.blofin.com historical candles (offline replay; no live tickers)",
         "fees": "none in this comparison (fee_pct_per_side and slippage are 0)",
         "start": madrid(start_ms),
         "end": madrid(clock[-1] + MIN_MS) if clock else madrid(end_ms),

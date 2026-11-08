@@ -244,6 +244,7 @@ function render(s) {
     : (s.openPosition ? [s.openPosition] : []);
   const maxPos = (s.settings && Number.isFinite(+s.settings.maxPositions))
     ? +s.settings.maxPositions : 5;
+  const stalePrices = positions.some((p) => p.priceStale);
   const unrealized = positions.reduce((sum, p) => sum + (+p.unrealized || 0), 0);
   const equity = (+s.balance || 0) + unrealized;
   $("balance").textContent = (+s.balance || 0).toLocaleString(undefined, { maximumFractionDigits: 0 }) + " USDT";
@@ -252,9 +253,10 @@ function render(s) {
   $("pnl").className = "value " + (pnl >= 0 ? "positive" : "negative");
   $("unreal").textContent = (unrealized >= 0 ? "+" : "") + unrealized.toFixed(2);
   $("unreal").className = "value " + (unrealized >= 0 ? "positive" : "negative");
-  $("equity").textContent = equity.toLocaleString(undefined, { maximumFractionDigits: 2 }) + " USDT";
+  $("equity").textContent = stalePrices ? "Sin precio Blofin fresco" : equity.toLocaleString(undefined, { maximumFractionDigits: 2 }) + " USDT";
+  if (stalePrices) $("unreal").textContent = "No disponible";
   $("posCount").textContent = positions.length + "/" + maxPos;
-  $("posSummary").textContent = positions.length + "/" + maxPos + " posiciones · PnL no realizado "
+  $("posSummary").textContent = stalePrices ? "PnL/equity no disponibles: falta precio Blofin fresco" : positions.length + "/" + maxPos + " posiciones · PnL no realizado "
     + (unrealized >= 0 ? "+" : "") + unrealized.toFixed(2)
     + " · Equity " + equity.toFixed(2);
   const hist = s.history || [];
@@ -336,9 +338,9 @@ function render(s) {
     return `<tr>
       <td><strong>${esc(String(p.pair).replace("-USDT", ""))}</strong></td>
       <td>${esc(String(p.side).toUpperCase())}</td>
-      <td>${fmt(p.entry)}</td><td>${fmt(p.price)}</td><td>${fmt(p.sl)}</td>
+      <td>${fmt(p.entry)}</td><td>${p.priceStale ? "Sin precio fresco" : fmt(p.price)}</td><td>${fmt(p.sl)}</td>
       <td>${trailOn ? '<span class="trail-badge">Trailing activo</span>' : tpCell}</td>
-      <td class="${(+p.unrealized || 0) >= 0 ? "positive" : "negative"}">${(+p.unrealized || 0).toFixed(2)}</td>
+      <td class="${(+p.unrealized || 0) >= 0 ? "positive" : "negative"}">${p.priceStale ? "No disponible" : (+p.unrealized || 0).toFixed(2)}</td>
       <td>${esc(when)}</td>
       <td><button class="danger mini" type="button" data-close-pair="${esc(p.pair)}" ${busy ? "disabled" : ""}>Cerrar</button></td>
     </tr>`;
