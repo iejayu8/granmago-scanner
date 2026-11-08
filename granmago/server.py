@@ -13,8 +13,11 @@ import os
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from email.utils import parsedate_to_datetime
 
 import granmago_strategy
 
@@ -40,7 +43,7 @@ PAIRS = list(DEFAULT_PAIRS)
 _PAIR_RE = re.compile(r"^[A-Z0-9]+-USDT$")
 MAX_CONFIGURED_PAIRS = 40
 
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 
 # Walk-forward monitoring setup. The add-on pins these on every start.
 # Leftover options and a saved copy in state.json do not change them.
@@ -98,8 +101,20 @@ logging.basicConfig(
 log = logging.getLogger("granmago")
 
 app = Flask(__name__)
-SESSION = requests.Session()
-SESSION.headers["User-Agent"] = "granmago-scanner/%s" % VERSION
+# No shared requests.Session between scan/monitor/API threads; no price cache.
+_HTTP = threading.local()
+BLOFIN_MARKET = "https://openapi.blofin.com/api/v1/market/"
+QUOTE_MAX_AGE_SECONDS = 30
+QUOTE_FUTURE_SECONDS = 2
+SCAN_MAX_AGE_SECONDS = 180
+ENTRY_MAX_DIVERGENCE = 0.05
+HTTP_MAX_ATTEMPTS = 3
+HTTP_BUDGET_SECONDS = 8
+HTTP_MIN_INTERVAL = 0.25  # <=240 GETs/min and 1200/5min; Blofin limits 500/1500
+_RATE_LOCK = threading.Lock()
+_RATE_LIMIT_UNTIL = 0.0
+_NEXT_REQUEST_AT = 0.0
+BAR_SECONDS = {"4H": 14400, "1D": 86400, "1W": 604800}
 
 LOCK = threading.Lock()
 SCAN_LOCK = threading.Lock()
@@ -514,9 +529,9 @@ def max_positions():
 def _as_price(value):
     try:
         num = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
-    if num <= 0:
+    if isinstance(value, bool) or not math.isfinite(num) or num <= 0:
         return None
     return num
 
@@ -1012,6 +1027,14 @@ def public_state():
     with LOCK:
         snap = json.loads(json.dumps({k: v for k, v in STATE.items()}))
     snap["busy"] = SCAN_LOCK.locked()
+    for pos in snap.get("openPositions", []):
+        mark = pos.get("lastMarket") or {}
+        stale = (pos.get("priceStale", False) or mark.get("source") != "Blofin"
+                 or not _fresh_timestamp(mark.get("ts"), QUOTE_MAX_AGE_SECONDS))
+        pos["priceStale"] = stale
+        if stale:
+            pos["price"] = None
+            pos["unrealized"] = None
     return snap
 
 
@@ -1221,64 +1244,234 @@ def score_setup(bias, near_ema, stoch_ok, daily_align, stoch_value, side):
     return score
 
 
-def fetch_json(url):
+@dataclass(frozen=True)
+class MarketQuote:
+    pair: str
+    price: float
+    ts: int
+    received: float  # monotonic: never persist/reuse a quote across a restart
+    can_open: bool = True
+    source: str = "Blofin"
+
+
+def _fresh_timestamp(ts, max_age):
     try:
-        resp = SESSION.get(url, timeout=10)
-        if resp.status_code != 200:
+        stamp = float(ts)
+        age = now_epoch() - stamp / 1000.0
+        return (not isinstance(ts, bool) and math.isfinite(stamp) and stamp > 0
+                and stamp.is_integer() and -QUOTE_FUTURE_SECONDS <= age <= max_age)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def valid_quote(quote, pair):
+    return (isinstance(quote, MarketQuote) and quote.source == "Blofin"
+            and isinstance(pair, str) and quote.pair == pair and _PAIR_RE.fullmatch(pair) is not None
+            and _as_price(quote.price) is not None
+            and _fresh_timestamp(quote.ts, QUOTE_MAX_AGE_SECONDS)
+            and 0 <= time.monotonic() - quote.received <= QUOTE_MAX_AGE_SECONDS)
+
+
+def _position_quote_valid(quote, pos):
+    # Drop delayed/out-of-order responses even if they are still within TTL.
+    previous = pos.get("lastMarket") or {}
+    if not isinstance(previous, dict):
+        return False
+    try:
+        return valid_quote(quote, pos.get("pair")) and quote.ts >= float(previous.get("ts") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _quote_audit(quote):
+    return {"source": quote.source, "instId": quote.pair, "ts": quote.ts,
+            "price": quote.price, "observedAt": _now()}
+
+
+def _market_warning(pair, reason):
+    # Callers can be doing I/O outside LOCK; add_log itself is not thread-safe.
+    with LOCK:
+        add_log("Blofin %s: %s. Sin sustitución de fuente ni fill." % (pair, reason))
+
+
+def _retry_after_seconds(value):
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        try:
+            seconds = parsedate_to_datetime(value).timestamp() - now_epoch()
+        except (TypeError, ValueError, OverflowError):
             return None
-        return resp.json()
-    except requests.RequestException as exc:
-        log.debug("fetch failed %s: %s", url, exc)
-        return None
+    return max(0.0, seconds) if math.isfinite(seconds) else None
+
+
+def _wait_market_turn(deadline):
+    """Space GETs across all threads, also honoring a shared Retry-After."""
+    global _NEXT_REQUEST_AT
+    while True:
+        with _RATE_LOCK:
+            now = time.monotonic()
+            turn = max(now, _NEXT_REQUEST_AT, _RATE_LIMIT_UNTIL)
+            if turn >= deadline:
+                return False
+            _NEXT_REQUEST_AT = turn + HTTP_MIN_INTERVAL
+        if turn > now:
+            time.sleep(turn - now)
+        with _RATE_LOCK:
+            if _RATE_LIMIT_UNTIL <= time.monotonic():
+                return time.monotonic() < deadline
+        # Another request installed a longer cooldown while this one slept.
+
+
+def fetch_json(url, *, deadline=None):
+    """Only Blofin GETs retry, never entry/close/accounting operations.
+
+    Three attempts with exponential backoff, inside one 8s request budget.
+    Long Retry-After creates a process-wide cooldown and returns immediately
+    rather than blocking other positions. A quote shares its budget across
+    instrument and ticker requests. There is no stale response cache.
+    """
+    global _RATE_LIMIT_UNTIL
+    if not url.startswith(BLOFIN_MARKET):
+        raise ValueError("only Blofin public market data is allowed")
+    if deadline is None:
+        deadline = time.monotonic() + HTTP_BUDGET_SECONDS
+    for attempt in range(HTTP_MAX_ATTEMPTS):
+        if not _wait_market_turn(deadline):
+            log.warning("Blofin GET suspendido: presupuesto agotado o Retry-After activo")
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        retry_delay = 0.25 * (2 ** attempt)
+        resp = None
+        try:
+            session = getattr(_HTTP, "session", None)
+            if session is None:
+                session = _HTTP.session = requests.Session()
+                session.headers["User-Agent"] = "granmago-scanner/%s" % VERSION
+            # No redirect to another host/provider. Connect/read both bounded.
+            resp = session.get(url, timeout=min(2.0, remaining / 2), allow_redirects=False, stream=True)
+            if resp.status_code == 200:
+                # Read incrementally so a trickling body cannot defeat the
+                # overall deadline by resetting the socket read timeout.
+                payload = bytearray()
+                for chunk in resp.iter_content(chunk_size=1):
+                    if time.monotonic() > deadline or len(payload) >= 2 * 1024 * 1024:
+                        log.warning("Blofin GET respuesta tardía/demasiado grande; sin fill")
+                        return None
+                    payload.extend(chunk)
+                return json.loads(payload)
+            if resp.status_code not in (408, 429, 500, 502, 503, 504):
+                log.warning("Blofin GET HTTP %s: no se reintenta", resp.status_code)
+                return None
+            retry_after = _retry_after_seconds(resp.headers.get("Retry-After"))
+            if resp.status_code == 429:
+                retry_after = max(1.0, retry_after or 0.0)
+            if retry_after is not None:
+                with _RATE_LOCK:
+                    _RATE_LIMIT_UNTIL = max(_RATE_LIMIT_UNTIL, time.monotonic() + retry_after)
+                retry_delay = max(retry_delay, retry_after)
+            log.warning("Blofin GET HTTP %s, intento %d/%d", resp.status_code, attempt + 1, HTTP_MAX_ATTEMPTS)
+        except requests.RequestException:
+            log.warning("Blofin GET fallo transitorio, intento %d/%d", attempt + 1, HTTP_MAX_ATTEMPTS)
+        except ValueError:
+            log.warning("Blofin GET JSON inválido; sin fill")
+            return None
+        finally:
+            if resp is not None:
+                resp.close()
+        if attempt + 1 == HTTP_MAX_ATTEMPTS or retry_delay >= deadline - time.monotonic():
+            return None
+        time.sleep(retry_delay)
+    return None
 
 
 def fetch_candles(inst_id, bar, limit=120):
-    blofin = fetch_json(
-        "https://openapi.blofin.com/api/v1/market/candles"
-        "?instId=%s&bar=%s&limit=%s" % (inst_id, bar, limit)
-    )
-    if isinstance(blofin, dict) and str(blofin.get("code")) == "0" and isinstance(blofin.get("data"), list):
+    """Blofin candles only. Opening timestamps are NOT fresh execution quotes."""
+    if not isinstance(inst_id, str) or not _PAIR_RE.fullmatch(inst_id) or bar not in BAR_SECONDS:
+        _market_warning(str(inst_id), "par/intervalo inválido")
+        return []
+    body = fetch_json(BLOFIN_MARKET + "candles?instId=%s&bar=%s&limit=%s" % (inst_id, bar, limit))
+    try:
+        if (not isinstance(body, dict) or str(body.get("code")) != "0"
+                or not isinstance(body.get("data"), list) or not body["data"]):
+            raise ValueError("respuesta de velas ausente/error")
         rows = []
-        for c in reversed(blofin["data"]):
-            try:
-                close = float(c[4])
-            except (TypeError, ValueError, IndexError):
-                continue
-            if close <= 0:
-                continue
-            rows.append({"ts": int(float(c[0])), "o": float(c[1]), "h": float(c[2]), "l": float(c[3]), "c": close})
-        if rows:
-            return rows
-    interval = {"4H": "4h", "1D": "1d", "1W": "1w"}.get(bar, "4h")
-    symbol = inst_id.replace("-", "")
-    binance = fetch_json(
-        "https://api.binance.com/api/v3/klines?symbol=%s&interval=%s&limit=%s" % (symbol, interval, limit)
-    )
-    if isinstance(binance, list):
-        rows = []
-        for c in binance:
-            try:
-                rows.append({"ts": int(c[0]), "o": float(c[1]), "h": float(c[2]), "l": float(c[3]), "c": float(c[4])})
-            except (TypeError, ValueError, IndexError):
-                continue
+        for c in body["data"]:
+            if not isinstance(c, (list, tuple)) or len(c) < 5 or any(isinstance(v, bool) for v in c[:5]):
+                raise ValueError("vela malformada")
+            ts = int(c[0])
+            o, h, l, close = (float(v) for v in c[1:5])
+            if (str(ts) != str(c[0]) or ts <= 0 or ts > (now_epoch() + QUOTE_FUTURE_SECONDS) * 1000
+                    or not all(math.isfinite(v) and v > 0 for v in (o, h, l, close))
+                    or not l <= min(o, close) <= max(o, close) <= h):
+                raise ValueError("OHLC/timestamp inválido")
+            rows.append({"ts": ts, "o": o, "h": h, "l": l, "c": close})
+        rows.sort(key=lambda c: c["ts"])
+        if len({c["ts"] for c in rows}) != len(rows):
+            raise ValueError("velas duplicadas")
+        # Accept a just-closed candle for 60s while the new forming one appears.
+        if now_epoch() - rows[-1]["ts"] / 1000 > BAR_SECONDS[bar] + 60:
+            raise ValueError("ventana de velas obsoleta")
         return rows
-    return []
+    except (TypeError, ValueError, IndexError, KeyError, OverflowError):
+        _market_warning(inst_id, "velas inválidas, obsoletas o no disponibles")
+        return []
+
+
+def fetch_quote(inst_id):
+    """Uncached same-instrument USDT linear SWAP ticker with exchange time.
+
+    Instruments are rechecked every request (no stale metadata cache). Last,
+    bid and ask must be finite, positive and coherent. A ticker's ts is its
+    generation time in ms per Blofin docs, not the candle opening time.
+    """
+    if not isinstance(inst_id, str) or not _PAIR_RE.fullmatch(inst_id):
+        _market_warning(str(inst_id), "símbolo inválido")
+        return None
+    deadline = time.monotonic() + HTTP_BUDGET_SECONDS
+    instrument = fetch_json(BLOFIN_MARKET + "instruments?instId=" + inst_id, deadline=deadline)
+    try:
+        if not isinstance(instrument, dict) or str(instrument.get("code")) != "0":
+            raise ValueError()
+        items = instrument["data"]
+        if not isinstance(items, list) or len(items) != 1:
+            raise ValueError()
+        meta = items[0]
+        if (not isinstance(meta, dict) or meta.get("instId") != inst_id or meta.get("instType") != "SWAP"
+                or meta.get("contractType") != "linear" or meta.get("quoteCurrency") != "USDT"
+                or meta.get("settleCurrency") != "USDT" or meta.get("state") != "live"
+                or meta.get("apiPermission") not in ("full", "reduce_only")):
+            raise ValueError()
+    except (TypeError, ValueError, IndexError, KeyError):
+        _market_warning(inst_id, "instrumento no disponible/live o mercado incompatible")
+        return None
+    body = fetch_json(BLOFIN_MARKET + "tickers?instId=" + inst_id, deadline=deadline)
+    try:
+        if not isinstance(body, dict) or str(body.get("code")) != "0":
+            raise ValueError()
+        items = body["data"]
+        if not isinstance(items, list) or len(items) != 1:
+            raise ValueError()
+        tick = items[0]
+        if not isinstance(tick, dict) or any(isinstance(tick.get(k), bool) for k in ("last", "bidPrice", "askPrice")):
+            raise ValueError()
+        last, bid, ask = (float(tick[k]) for k in ("last", "bidPrice", "askPrice"))
+        if (tick.get("instId") != inst_id or not _fresh_timestamp(tick.get("ts"), QUOTE_MAX_AGE_SECONDS)
+                or not all(math.isfinite(v) and v > 0 for v in (last, bid, ask))
+                or bid > ask or ask / bid > 1.05 or not bid * 0.95 <= last <= ask * 1.05):
+            raise ValueError()
+        return MarketQuote(inst_id, last, int(tick["ts"]), time.monotonic(), meta["apiPermission"] == "full")
+    except (TypeError, ValueError, IndexError, KeyError, OverflowError):
+        _market_warning(inst_id, "ticker inválido/obsoleto/incoherente o no disponible")
+        return None
 
 
 def fetch_price(inst_id):
-    symbol = inst_id.replace("-", "")
-    data = fetch_json("https://api.binance.com/api/v3/ticker/price?symbol=%s" % symbol)
-    if isinstance(data, dict) and data.get("price"):
-        try:
-            price = float(data["price"])
-            if price > 0:
-                return price
-        except (TypeError, ValueError):
-            pass
-    candles = fetch_candles(inst_id, "4H", 5)
-    if candles:
-        return candles[-1]["c"]
-    return None
+    """Scalar compatibility helper; live execution keeps the timestamped quote."""
+    quote = fetch_quote(inst_id)
+    return quote.price if valid_quote(quote, inst_id) else None
 
 
 def score_market(pair, c4, c_d, c_w, threshold):
@@ -1357,7 +1550,8 @@ def _attach_granmago(row, c4, c_d, c_w):
     )
     row["granmago"] = None
     if row.get("pair"):
-        _GRANMAGO_BARS[row["pair"]] = bars
+        with LOCK:
+            _GRANMAGO_BARS[row["pair"]] = bars
     if signals and bars:
         latest = signals[-1]
         # Only the bar that just closed. An older signal is not chased.
@@ -1366,22 +1560,27 @@ def _attach_granmago(row, c4, c_d, c_w):
     return row
 
 
-def _close_granmago_signals():
-    """Momentum or time exit on the last closed confirmation bar. Caller holds LOCK."""
-    if strategy_mode() != "granmago":
-        return
-    for pos in list(_positions()):
-        if not isinstance(pos, dict) or pos.get("strategy") != "granmago":
-            continue
-        bars = _GRANMAGO_BARS.get(pos.get("pair")) or {}
-        if not bars:
-            continue
-        last_ms = max(bars)
-        decision = granmago_strategy.exit_decision(pos, bars[last_ms])
-        if decision is None:
-            continue
-        reason, price = decision
-        close_position(reason, price, pos.get("pair"))
+def _close_granmago_signals(successful_pairs):
+    """Closed bars decide momentum/time exits; only a fresh ticker can fill."""
+    with LOCK:
+        pending = []
+        if strategy_mode() != "granmago" or not STATE["running"]:
+            return
+        for pos in _positions():
+            if pos.get("strategy") != "granmago" or pos.get("pair") not in successful_pairs:
+                continue
+            bars = _GRANMAGO_BARS.get(pos["pair"]) or {}
+            if bars:
+                decision = granmago_strategy.exit_decision(pos, bars[max(bars)])
+                if decision is not None:
+                    pending.append((pos, decision[0]))
+    for expected, reason in pending:
+        pair = expected["pair"]
+        quote = fetch_quote(pair)
+        with LOCK:
+            if (STATE["running"] and _find_position(pair) is expected
+                    and valid_quote(quote, pair)):
+                close_position(reason, quote.price, pair, quote=quote)
 
 
 def analyze_pair(pair, threshold=None):
@@ -1396,7 +1595,10 @@ def analyze_pair(pair, threshold=None):
         c_d = fetch_candles(pair, "1D", 80)
         c_w = fetch_candles(pair, "1W", 60)
     row = score_market(pair, c4, c_d, c_w, threshold)
-    return _attach_granmago(row, c4, c_d, c_w)
+    row = _attach_granmago(row, c4, c_d, c_w)
+    if row:
+        row["analyzedAtMs"] = int(now_epoch() * 1000)
+    return row
 
 
 def scan_all():
@@ -1427,8 +1629,8 @@ def scan_all():
         else:
             best_l = sorted((r for r in results if r["validLong"]), key=lambda r: r["scoreLong"], reverse=True)
             best_s = sorted((r for r in results if r["validShort"]), key=lambda r: r["scoreShort"], reverse=True)
+        _close_granmago_signals({r["pair"] for r in results})
         with LOCK:
-            _close_granmago_signals()
             STATE["lastScan"] = results
             STATE["bestLong"] = best_l[0] if best_l else None
             STATE["bestShort"] = best_s[0] if best_s else None
@@ -1562,7 +1764,7 @@ def _remember_cooldown(pair):
     cool[pair] = now_epoch() + minutes * 60.0
 
 
-def open_from_result(res, side):
+def open_from_result(res, side, *, quote=None):
     """Append one paper trade. False when the pair is taken or the size is refused.
 
     risk_pct is applied to the current realized balance, same as a single
@@ -1571,6 +1773,10 @@ def open_from_result(res, side):
     Entry price is worsened by slippage. The taker fee is taken from the
     balance immediately. Both are zero unless the add-on options set them.
     """
+    if quote is not None:
+        if not valid_quote(quote, res.get("pair")) or not quote.can_open:
+            return False
+        res = dict(res, price=quote.price)
     pair = res.get("pair")
     if not pair or _find_position(pair):
         if pair:
@@ -1656,6 +1862,9 @@ def open_from_result(res, side):
         "ENTRADA AUTO %s %s @ %s (score %s) [%d/%d]"
         % (side.upper(), pair, _fmt(entry), score, len(_positions()), max_positions())
     )
+    if quote is not None:
+        _find_position(pair)["entryMarket"] = _quote_audit(quote)
+        _find_position(pair)["lastMarket"] = _quote_audit(quote)
     return True
 
 
@@ -1700,7 +1909,7 @@ def _outside_bracket(side, price, stop, target):
     return True
 
 
-def open_granmago(sig):
+def open_granmago(sig, *, quote=None):
     """Open one course trade from a signal dict. False when it cannot be sized.
 
     The stop and the target come from the signal, not from the scanner's
@@ -1716,6 +1925,10 @@ def open_granmago(sig):
     """
     if not isinstance(sig, dict):
         return False
+    if quote is not None:
+        if not valid_quote(quote, sig.get("pair")) or not quote.can_open:
+            return False
+        sig = dict(sig, market=quote.price)
     pair = sig.get("pair")
     side = sig.get("side")
     if side not in ("long", "short") or not pair or _find_position(pair):
@@ -1824,6 +2037,9 @@ def open_granmago(sig):
         "breakevenR": granmago_breakeven_r(),
         "granmagoBe": False,
     })
+    if quote is not None:
+        _find_position(pair)["entryMarket"] = _quote_audit(quote)
+        _find_position(pair)["lastMarket"] = _quote_audit(quote)
     _remember_signal(pair, side, sig.get("confirmMs"), sig.get("closeMs"))
     add_log(
         "ENTRADA GRANMAGO %s %s %s @ %s SL %s TP %s [%d/%d]"
@@ -1841,7 +2057,7 @@ def open_granmago(sig):
     return True
 
 
-def _maybe_add(pos, mark):
+def _maybe_add(pos, mark, *, quote=None):
     """One extra fill at the swept extreme. The stop does not move."""
     if pos.get("addBlocked"):
         return False
@@ -1861,7 +2077,9 @@ def _maybe_add(pos, mark):
         return False
     if budget <= 0:
         return False
-    fill = _slip_price(side, pos.get("addPrice"), closing=False)
+    if quote is not None and (not _position_quote_valid(quote, pos) or not quote.can_open):
+        return False
+    fill = _slip_price(side, quote.price if quote is not None else pos.get("addPrice"), closing=False)
     stop = _as_price(pos.get("sl"))
     if fill is None or stop is None:
         return False
@@ -1914,7 +2132,7 @@ def _maybe_add(pos, mark):
     return True
 
 
-def _apply_granmago_mark(pos, mark):
+def _apply_granmago_mark(pos, mark, *, quote=None):
     """Hard stop, optional add, optional breakeven, then the swing target.
 
     No trailing and no scanner partial. A stop is checked before an add, so
@@ -1928,9 +2146,9 @@ def _apply_granmago_mark(pos, mark):
         pos["unrealized"] = round(pnl, 2)
     update_best_price(pos, mark)
     if _stop_hit(side, mark, pos.get("sl")):
-        close_position("SL", mark, pair)
+        close_position("SL", mark, pair, quote=quote)
         return "SL"
-    _maybe_add(pos, mark)
+    _maybe_add(pos, mark, quote=quote)
     if _find_position(pair) is None:
         return "SL"
     pos = _find_position(pair)
@@ -1945,7 +2163,7 @@ def _apply_granmago_mark(pos, mark):
                 pos["granmagoBe"] = True
                 add_log("Breakeven GranMago %s SL → %s" % (pair, _fmt(pos["sl"])))
     if _target_hit(side, mark, pos.get("tp")):
-        close_position("TP", mark, pair)
+        close_position("TP", mark, pair, quote=quote)
         return "TP"
     return None
 
@@ -1982,7 +2200,7 @@ def _move_stop_to_breakeven(pos):
     return True
 
 
-def close_position(reason, price, pair=None, fraction=1.0):
+def close_position(reason, price, pair=None, fraction=1.0, *, quote=None):
     """Close one open pair, or a fraction of it. With a single position, the pair can be omitted.
 
     `price` is the market print. Slippage worsens the fill and the taker fee
@@ -2004,6 +2222,11 @@ def close_position(reason, price, pair=None, fraction=1.0):
     if idx is None:
         return None
     pos = positions[idx]
+    if quote is not None:
+        if not _position_quote_valid(quote, pos):
+            add_log("No se cierra %s: ticker Blofin caducado/inválido." % pair)
+            return None
+        price = quote.price
     try:
         fraction = float(fraction)
     except (TypeError, ValueError):
@@ -2072,6 +2295,8 @@ def close_position(reason, price, pair=None, fraction=1.0):
     if pos.get("closeMs"):
         closed["closeMs"] = pos.get("closeMs")
         closed["confirmMs"] = pos.get("confirmMs")
+    if quote is not None:
+        closed["exitMarket"] = _quote_audit(quote)
     STATE["history"].insert(0, closed)
     del STATE["history"][200:]
     add_log("CERRADA %s %s → PnL %.2f USDT" % (pos["pair"], reason, net_rounded))
@@ -2104,14 +2329,20 @@ def _stop_reason(pos):
     return "SL"
 
 
-def _apply_mark(pos, price):
+def _apply_mark(pos, price, *, quote=None):
     """SL, partial, TP or trailing for one position. The caller holds LOCK.
 
     Returns the exit reason, or 'partial' when a slice was closed and the
     rest is still open, or None. A stop is always checked first. A print that
-    reaches the full target also fills a pending partial at the partial price
-    before the remainder is closed at this print.
+    reaches the full target fills a pending partial before the remainder.
+    Live fills always use quote.price; offline replays use the partial level.
     """
+    if quote is not None:
+        if not _position_quote_valid(quote, pos):
+            return None
+        price = quote.price
+        pos["lastMarket"] = _quote_audit(quote)
+        pos["priceStale"] = False
     ensure_position_fields(pos)
     pair = pos["pair"]
     side = pos["side"]
@@ -2119,7 +2350,7 @@ def _apply_mark(pos, price):
     if mark is None:
         return None
     if pos.get("strategy") == "granmago":
-        return _apply_granmago_mark(pos, mark)
+        return _apply_granmago_mark(pos, mark, quote=quote)
     pnl = position_pnl(pos, mark)
     pos["price"] = mark
     if pnl is not None:
@@ -2127,23 +2358,23 @@ def _apply_mark(pos, price):
     update_best_price(pos, mark)
     if _stop_hit(side, mark, pos.get("sl")):
         reason = _stop_reason(pos)
-        close_position(reason, mark, pair)
+        close_position(reason, mark, pair, quote=quote)
         return reason
     if _partial_hit(pos, mark):
         level = partial_target_price(pos)
-        close_position("partial", level if level is not None else mark, pair, fraction=partial_tp_fraction())
+        close_position("partial", level if level is not None else mark, pair, fraction=partial_tp_fraction(), quote=quote)
         if _find_position(pair) is None:
             return "partial"
         pos = _find_position(pair)
     if _target_hit(side, mark, pos.get("tp")):
-        close_position("TP", mark, pair)
+        close_position("TP", mark, pair, quote=quote)
         return "TP"
     if pos.get("trailingActive"):
         moved = tighten_stop(pos)
         if moved:
             add_log("Trailing %s SL → %s (mejor %s)" % (pair, _fmt(pos["sl"]), _fmt(pos["bestPrice"])))
         if _stop_hit(side, mark, pos.get("sl")):
-            close_position("trailing", mark, pair)
+            close_position("trailing", mark, pair, quote=quote)
             return "trailing"
         return None
     if trailing_should_activate(pos, mark):
@@ -2153,21 +2384,26 @@ def _apply_mark(pos, price):
             % (pair, _fmt(pos["sl"]), _fmt(pos["bestPrice"]))
         )
         if _stop_hit(side, mark, pos.get("sl")):
-            close_position("trailing", mark, pair)
+            close_position("trailing", mark, pair, quote=quote)
             return "trailing"
     return None
 
 
 def _monitor_one(pair):
-    price = fetch_price(pair)
+    with LOCK:
+        expected = _find_position(pair)
+    if expected is None:
+        return
+    quote = fetch_quote(pair)
     with LOCK:
         pos = _find_position(pair)
-        if not pos:
+        if pos is not expected or not STATE["running"]:
             return
-        if price is None:
-            add_log("Sin precio de %s, se reintenta" % pair)
+        if not _position_quote_valid(quote, pos):
+            pos["priceStale"] = True
+            add_log("Sin ticker Blofin fresco de %s: no se actualiza PnL ni se ejecuta SL/TP." % pair)
             return
-        _apply_mark(pos, price)
+        _apply_mark(pos, quote.price, quote=quote)
 
 
 def monitor_position():
@@ -2175,16 +2411,74 @@ def monitor_position():
         pairs = [p.get("pair") for p in _positions() if isinstance(p, dict) and p.get("pair")]
     if not pairs:
         return
-    for pair in pairs:
-        _monitor_one(pair)
+    # One illiquid/rate-limited pair must not hold up the other positions.
+    # Each worker has its own HTTP session; all book mutation still uses LOCK.
+    with ThreadPoolExecutor(max_workers=min(4, len(pairs))) as pool:
+        list(pool.map(_monitor_one, pairs))
     with LOCK:
         STATE["lastTickAt"] = _now()
         save_state()
 
 
 def maybe_open():
-    """Fill free slots from the latest scan.
+    """Live entry gateway: never use lastScan/candle prices as execution quotes.
 
+    Network outside LOCK; recheck the exact scan, mode, book and running state
+    afterwards. Replays call _maybe_open_replay explicitly and never do I/O.
+    """
+    opened = False
+    with LOCK:
+        if not STATE["running"] or len(_positions()) >= max_positions():
+            return
+        scan = STATE.get("lastScan")
+        rows = json.loads(json.dumps(scan or []))
+        mode = strategy_mode()
+        if mode != "granmago":
+            rows.sort(key=lambda r: max(_score_num(r.get("scoreLong")), _score_num(r.get("scoreShort"))), reverse=True)
+    for row in rows:
+        pair = row.get("pair")
+        with LOCK:
+            if (not STATE["running"] or STATE.get("lastScan") is not scan
+                    or strategy_mode() != mode or len(_positions()) >= max_positions()):
+                break
+            if not pair or _find_position(pair):
+                continue
+            if mode == "granmago":
+                sig = row.get("granmago")
+                if not isinstance(sig, dict) or _signal_used(pair, sig.get("side"), sig.get("confirmMs"), sig.get("closeMs")):
+                    continue
+                side = sig.get("side")
+            else:
+                side, _ = _qualifying_side(row, entry_threshold())
+                if side is None:
+                    continue
+        quote = fetch_quote(pair)
+        with LOCK:
+            if (not STATE["running"] or STATE.get("lastScan") is not scan
+                    or strategy_mode() != mode or len(_positions()) >= max_positions()):
+                break
+            reference = _as_price(row.get("price"))
+            if (not valid_quote(quote, pair) or not quote.can_open
+                    or not _fresh_timestamp(row.get("analyzedAtMs"), SCAN_MAX_AGE_SECONDS)
+                    or reference is None or abs(quote.price / reference - 1) > ENTRY_MAX_DIVERGENCE):
+                add_log("No se abre %s: falta ticker Blofin fresco/coherente o escaneo vigente." % pair)
+                continue
+            if mode == "granmago":
+                payload = dict(sig, pair=pair, market=quote.price)
+                opened = open_granmago(payload, quote=quote) or opened
+            else:
+                side, _ = _qualifying_side(row, entry_threshold())
+                if side is not None:
+                    opened = open_from_result(dict(row, price=quote.price), side, quote=quote) or opened
+            save_state()
+    if opened:
+        kick()
+
+
+def _maybe_open_replay():
+    """OFFLINE ONLY: fill slots from historical/synthetic scan prices, no HTTP.
+
+    Not called by the Flask API or live loops. Production uses maybe_open.
     Scanner mode ranks by score. Gran Mago mode opens the course signal on
     the bar that just closed and ignores the score. One position per coin,
     long or short, never both. The same signal (pair, direction, candle
@@ -2478,17 +2772,19 @@ def api_close_position():
             return jsonify({"ok": False, "error": "falta_par"}), 400
         pair = pair.strip()
         with LOCK:
-            if not _find_position(pair):
+            expected = _find_position(pair)
+            if expected is None:
                 return jsonify({"ok": False, "error": "sin_posicion"}), 409
-        price = fetch_price(pair)
+        quote = fetch_quote(pair)
         with LOCK:
-            if not _find_position(pair):
-                return jsonify({"ok": False, "error": "sin_posicion"}), 409
-            if price is None or price <= 0:
+            if _find_position(pair) is not expected:
+                return jsonify({"ok": False, "error": "posicion_cambiada"}), 409
+            if not _position_quote_valid(quote, expected):
+                expected["priceStale"] = True
                 add_log("No se pudo cerrar %s: sin precio de mercado." % pair)
                 save_state()
                 return jsonify({"ok": False, "error": "sin_precio"}), 503
-            close_position("manual", price, pair)
+            close_position("manual", quote.price, pair, quote=quote)
             save_state()
         return jsonify(public_state())
     finally:
@@ -2498,6 +2794,7 @@ def api_close_position():
 def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with LOCK:
+        add_log("Mercado exclusivo Blofin: ticker fresco para entradas, PnL y cierres; sin fallback.")
         add_log("Umbral de entrada: %d." % entry_threshold())
         add_log("Máximo de posiciones: %d (una por moneda)." % max_positions())
         add_log("Universo: %d pares (%s)." % (

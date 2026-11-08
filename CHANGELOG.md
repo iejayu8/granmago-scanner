@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.6.2
+
+- Fuente de mercado exclusiva Blofin para velas y ticker fresco de entradas, PnL y todos los cierres; se elimina el fallback externo y el uso de cierres de vela como fills en vivo.
+- Validación de instrumento, timestamps/frescura, valores finitos, libro y coherencia de entrada. Sin precio válido no se ejecuta; la interfaz no presenta PnL/equity obsoletos como actuales.
+- Reintentos GET Blofin acotados con backoff, presupuesto, limitación global de tasa y Retry-After. Monitor por posición en paralelo, sin red bajo lock ni duplicación de operaciones.
+- Auditoría de proveedor/timestamp/precio para nuevos fills. No reescribe historial, no ajusta la pérdida XMR ni cambia estrategia o fórmula de riesgo. Tests aislados de regresión, errores, frescura, reintentos y concurrencia; replays históricos separados de las puertas en vivo.
+
 ## 1.6.1
 
 - No cambia el comportamiento respecto a 1.5.2. El complemento ya estaba instalado como 1.6.0 por una etiqueta anterior, puesta sin implementar la estrategia v7, y Home Assistant no ofrece una versión más baja. Esta sube a 1.6.1 para que la actualización sí aparezca.

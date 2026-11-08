@@ -20,10 +20,68 @@ El puerto 8787 no choca con HADomotics (8099).
 
 - Vigila cada posición abierta cada 20 segundos con el precio en vivo. El stop y el objetivo de una moneda no mueven los de otra.
 - Escanea los pares de la opción `pairs` cada 90 segundos, también con posiciones abiertas. El defecto son los 28 pares de la monitorización: BTC, ETH, SOL, XRP, BNB, ADA, DOGE, AVAX, LINK, DOT, LTC, BCH, ZEC, PEPE, 1000BONK, NEAR, XMR, INJ, SUI, TAO, IOST, XLM, TRX, HBAR, ENA, WLD, AAVE y QNT.
-- La estrategia es la de Gran Mago, variante A, estilo sweep, barridos y retrocesos, sin promediar. En cada escaneo automático abre la señal del cierre de 4H que todavía no se ha operado, hasta `max_positions` (3 por defecto). Una señal (par, dirección y cierre de esa vela) abre como máximo una vez: después del stop no se vuelve a entrar. La entrada usa el precio de ese escaneo, no el cierre de la vela si el mercado ya se ha movido. Si ese precio ya está en el stop o más allá, o ya ha llegado al objetivo, no se abre. Nunca dos posiciones en el mismo par, ni en el sentido contrario. El score se calcula para la tabla y no abre operaciones.
+- La estrategia es la de Gran Mago, variante A, estilo sweep, barridos y retrocesos, sin promediar. En cada escaneo automático abre la señal del cierre de 4H que todavía no se ha operado, hasta `max_positions` (3 por defecto). Una señal (par, dirección y cierre de esa vela) abre como máximo una vez: después del stop no se vuelve a entrar. La entrada consulta un ticker Blofin fresco justo antes del fill, no el cierre de una vela ni el precio guardado del escaneo. Si ese precio ya está en el stop o más allá, o ya ha llegado al objetivo, no se abre. Nunca dos posiciones en el mismo par, ni en el sentido contrario. El score se calcula para la tabla y no abre operaciones.
 - Un escaneo manual actualiza el ranking y no abre operaciones.
 - El trailing está apagado. Cada operación espera su stop, su objetivo, la salida por agotamiento o las 15 velas de confirmación. El botón **Cerrar** sigue cerrando a mercado.
 - Guarda el estado en `/data/state.json` del addon. Un reinicio no borra el balance ni las operaciones, y si estaba en marcha se reanuda solo. Un estado de 1.2.0 con una sola `openPosition`, o un libro de 1.5.0, pasa a la lista al cargar: no se cierra y no se le cambia la entrada.
+
+## Mercado exclusivo Blofin (1.6.2)
+
+Velas, entradas, valoración/PnL y todos los cierres (SL, TP, manual, agotamiento,
+tiempo, y los caminos opcionales de parcial/trailing/promedios) usan **solo
+Blofin**, mismo instrumento USDT lineal SWAP. El precio observado es `last` del
+ticker, no el endpoint distinto `mark-price`. No se consulta Binance ni otra
+fuente y no se usa una vela/cotización guardada como sustituto de un ticker.
+
+- La metadata del instrumento se comprueba en cada consulta: símbolo exacto,
+  SWAP lineal, cotización/liquidación USDT y estado `live`. `reduce_only` permite
+  cerrar, no abrir. No hay caché de cotizaciones ni de metadata.
+- El `ts` del ticker es su **generación en milisegundos**, según la documentación
+  pública de [Blofin](https://docs.blofin.com/index.html#public-data). Se acepta
+  antigüedad máxima 30 s y adelanto de reloj máximo 2 s. `last`/bid/ask deben ser
+  positivos, finitos y coherentes: spread <=5%, last dentro de bid/ask con margen
+  5%. Se vuelve a validar la frescura bajo el lock antes de contabilizar.
+- Las velas sirven para indicadores/señales, no como precio de ejecución. Se
+  rechazan OHLC inválidos, duplicados o ventanas cuyo último inicio sea anterior
+  a la duración de vela +60 s. La entrada exige escaneo de como máximo 180 s y
+  divergencia ticker/precio de referencia <=5%; puede omitir señales en un salto
+  brusco de mercado en lugar de inventar un fill. No se cambia la fórmula del
+  riesgo, el stop, los objetivos o los indicadores.
+- Si Blofin falla: **reintentos solo contra Blofin**, hasta 3 GET por endpoint,
+  backoff 0,25/0,5 s ante errores de conexión/timeout y HTTP 408/429/500/502/503/504.
+  Presupuesto de reintentos/lectura 8 s por consulta, compartido por metadata y
+  ticker, con timeout de socket <=2 s. Se descartan respuestas que lleguen tarde
+  y se corta la lectura incremental al agotar el presupuesto. No hay bucle de
+  reintentos infinito ni reintento de una operación contable.
+- Se espacian todos los GET >=0,25 s (hasta 240/min y 1200/5 min, por debajo de
+  los límites publicados 500/min y 1500/5 min). `Retry-After` numérico o fecha HTTP
+  se respeta con enfriamiento compartido; si excede el presupuesto se devuelve
+  sin precio, sin dormir ese periodo largo ni cambiar de fuente. Un 403, JSON
+  malformado, error semántico o dato inválido no se convierte en fill. El ciclo
+  siguiente vuelve a intentarlo según la cadencia normal/enfriamiento.
+- Hasta 4 posiciones se vigilan en paralelo, con sesión HTTP por hilo y sin
+  mantener el lock del ledger durante la red. Se comprueba identidad de posición
+  y escaneo para no cerrar una posición nueva con una respuesta vieja; ticks
+  fuera de orden se descartan. Los reintentos GET no duplican entradas/cierres.
+- Sin ticker válido no se abre, no se cierra ni se recalcula PnL. Se avisa en el
+  log; el cierre manual devuelve 503 `sin_precio`. La interfaz muestra PnL/equity
+  no disponibles cuando falta una valoración fresca. Esto significa que **el
+  stop paper no está garantizado durante una caída de Blofin**; tras recuperarse
+  puede haber un gap real y el fill seguirá siendo al ticker fresco, no al SL.
+- Las operaciones nuevas guardan `entryMarket`/`lastMarket`; los cierres nuevos,
+  `exitMarket` con proveedor, instrumento, timestamp y precio observado. El
+  historial previo no se reescribe y no se corrige retroactivamente XMR.
+
+### Pruebas y herramientas históricas
+
+`python3 -m unittest discover -s tests -v` usa datos sintéticos y HTTP simulado,
+con directorios temporales; no necesita HA, credenciales ni órdenes reales.
+Los backtests siguen leyendo únicamente velas históricas Blofin y llaman
+explícitamente al motor offline `_maybe_open_replay`. No disponen de snapshots
+históricos de tickers/bid/ask y **no validan paridad exacta de fills en vivo** ni
+la política de frescura de tickers. Sus cachés son históricas y nunca alimentan
+las rutas de ejecución del complemento. No se ha recalculado rentabilidad con
+este cambio.
 
 ## Riesgo con varias posiciones
 

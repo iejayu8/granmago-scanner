@@ -5,6 +5,7 @@ import math
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -48,19 +49,23 @@ def _pnl(pos, price):
     return round(pct * pos["notional"], 2)
 
 
+def _quote(price, pair):
+    return None if price is None else server.MarketQuote(pair, price, int(server.now_epoch() * 1000), time.monotonic())
+
+
 def _tick(price):
-    original = server.fetch_price
+    original = server.fetch_quote
 
     def fake(pair):
         if isinstance(price, dict):
-            return price.get(pair)
-        return price
+            return _quote(price.get(pair), pair)
+        return _quote(price, pair)
 
-    server.fetch_price = fake
+    server.fetch_quote = fake
     try:
         server.monitor_position()
     finally:
-        server.fetch_price = original
+        server.fetch_quote = original
 
 
 def _arm(entry, side, sl, tp, notional=1000.0, pair="SOL-USDT"):
@@ -161,12 +166,12 @@ class PositionTests(unittest.TestCase):
 
     def test_api_close_position_records_manual(self):
         server.STATE["openPositions"] = [_book()]
-        original = server.fetch_price
-        server.fetch_price = lambda pair: 175.0
+        original = server.fetch_quote
+        server.fetch_quote = lambda pair: _quote(175.0, pair)
         try:
             resp = server.app.test_client().post("/api/close_position", json={"pair": "SOL-USDT"})
         finally:
-            server.fetch_price = original
+            server.fetch_quote = original
         self.assertEqual(resp.status_code, 200)
         data = resp.get_json()
         self.assertEqual(data["openPositions"], [])
@@ -191,12 +196,12 @@ class PositionTests(unittest.TestCase):
 
     def test_api_close_position_without_price_keeps_position(self):
         server.STATE["openPositions"] = [_book()]
-        original = server.fetch_price
-        server.fetch_price = lambda pair: None
+        original = server.fetch_quote
+        server.fetch_quote = lambda pair: None
         try:
             resp = server.app.test_client().post("/api/close_position", json={"pair": "SOL-USDT"})
         finally:
-            server.fetch_price = original
+            server.fetch_quote = original
         self.assertEqual(resp.status_code, 503)
         self.assertEqual(server.STATE["openPositions"][0]["pair"], "SOL-USDT")
         self.assertEqual(server.STATE["balance"], 950.56)
@@ -208,17 +213,17 @@ class PositionTests(unittest.TestCase):
         eth["sl"] = 2580.0
         eth["tp"] = 2130.0
         server.STATE["openPositions"] = [sol, eth]
-        original = server.fetch_price
+        original = server.fetch_quote
 
         def fake(pair):
-            return {"SOL-USDT": 170.0, "ETH-USDT": 2400.0}.get(pair)
+            return _quote({"SOL-USDT": 170.0, "ETH-USDT": 2400.0}.get(pair), pair)
 
-        server.fetch_price = fake
+        server.fetch_quote = fake
         try:
             wrong = server.app.test_client().post("/api/close_position", json={"pair": "BTC-USDT"})
             closed = server.app.test_client().post("/api/close_position", json={"pair": "SOL-USDT"})
         finally:
-            server.fetch_price = original
+            server.fetch_quote = original
         self.assertEqual(wrong.status_code, 409)
         self.assertEqual(closed.status_code, 200)
         data = closed.get_json()
@@ -479,7 +484,7 @@ class PositionTests(unittest.TestCase):
             _signal("SOL-USDT", "short", 100),
             _signal("BTC-USDT", "short", 100),
         ]
-        server.maybe_open()
+        server._maybe_open_replay()
         self.assertEqual([p["pair"] for p in server.STATE["openPositions"]], ["SOL-USDT", "BTC-USDT"])
         self.assertIs(server.STATE["openPositions"][0], sol)
         self.assertEqual(sol["side"], "short")
@@ -494,12 +499,12 @@ class PositionTests(unittest.TestCase):
             _signal("BTC-USDT", "long", 100),
             _signal("ETH-USDT", "long", 97),
         ]
-        server.maybe_open()
+        server._maybe_open_replay()
         self.assertEqual(
             [p["pair"] for p in server.STATE["openPositions"]],
             ["BTC-USDT", "ETH-USDT"],
         )
-        server.maybe_open()
+        server._maybe_open_replay()
         self.assertEqual(
             [p["pair"] for p in server.STATE["openPositions"]],
             ["BTC-USDT", "ETH-USDT"],
@@ -514,7 +519,7 @@ class PositionTests(unittest.TestCase):
             _signal("ETH-USDT", "long", 97),
             _signal("XRP-USDT", "long", 89),
         ]
-        server.maybe_open()
+        server._maybe_open_replay()
         self.assertEqual(
             [p["pair"] for p in server.STATE["openPositions"]],
             ["BTC-USDT", "ETH-USDT", "ADA-USDT", "SOL-USDT"],
@@ -531,7 +536,7 @@ class PositionTests(unittest.TestCase):
             _signal("BTC-USDT", "long", 100),
             _signal("SOL-USDT", "long", 100),
         ]
-        server.maybe_open()
+        server._maybe_open_replay()
         self.assertEqual(
             [p["pair"] for p in server.STATE["openPositions"]],
             ["ETH-USDT", "BTC-USDT", "SOL-USDT"],
@@ -540,7 +545,7 @@ class PositionTests(unittest.TestCase):
     def test_stopped_bot_and_manual_scan_do_not_open(self):
         server.STATE["running"] = False
         server.STATE["lastScan"] = [_signal("BTC-USDT", "long", 100)]
-        server.maybe_open()
+        server._maybe_open_replay()
         self.assertEqual(server.STATE["openPositions"], [])
 
         server.STATE["running"] = True
@@ -572,7 +577,7 @@ class PositionTests(unittest.TestCase):
             _signal("ETH-USDT", "long", 99, tight=True),
             _signal("BTC-USDT", "long", 100, tight=True),
         ]
-        server.maybe_open()
+        server._maybe_open_replay()
         first, second = server.STATE["openPositions"]
         self.assertEqual(first["pair"], "BTC-USDT")
         self.assertEqual(second["pair"], "ETH-USDT")
@@ -613,11 +618,11 @@ class PositionTests(unittest.TestCase):
             _signal("ETH-USDT", "long", 95),
             _signal("SOL-USDT", "short", 99),
         ]
-        server.maybe_open()
+        server._maybe_open_replay()
         self.assertEqual(server.STATE["openPositions"], [])
 
         server.STATE["lastScan"] = [_signal("ETH-USDT", "long", 100)]
-        server.maybe_open()
+        server._maybe_open_replay()
         opened = _one()
         self.assertEqual(opened["pair"], "ETH-USDT")
         self.assertEqual(opened["side"], "long")
@@ -632,10 +637,10 @@ class PositionTests(unittest.TestCase):
         server.STATE["settings"]["entryThreshold"] = 90
         self.assertEqual(server.entry_threshold(), 90)
         server.STATE["lastScan"] = [_signal("ETH-USDT", "long", 89)]
-        server.maybe_open()
+        server._maybe_open_replay()
         self.assertEqual(server.STATE["openPositions"], [])
         server.STATE["lastScan"] = [_signal("ETH-USDT", "long", 90)]
-        server.maybe_open()
+        server._maybe_open_replay()
         self.assertEqual(_one()["pair"], "ETH-USDT")
         self.assertEqual(server._sane_threshold(150), 100)
         self.assertEqual(server._sane_threshold(-4), 0)
@@ -792,7 +797,7 @@ class PositionTests(unittest.TestCase):
         server.STATE["balance"] = 100
         server.STATE["settings"]["leverage"] = 1
         server.STATE["lastScan"] = [_signal("BTC-USDT", "long", 100, tight=True)]
-        server.maybe_open()
+        server._maybe_open_replay()
         self.assertEqual([p["pair"] for p in server.STATE["openPositions"]], ["ETH-USDT"])
         self.assertEqual(server.STATE["openPositions"][0]["notional"], 1500.0)
         self.assertEqual(server.STATE["openPositions"][0]["entry"], 2413.52)
@@ -1113,17 +1118,17 @@ class PositionTests(unittest.TestCase):
         server._clock = lambda: 1_000_000.0
         try:
             server.STATE["lastScan"] = [_signal("ETH-USDT", "long", 100)]
-            server.maybe_open()
+            server._maybe_open_replay()
             self.assertEqual(len(server.STATE["openPositions"]), 1)
             server.close_position("manual", _one()["entry"], "ETH-USDT")
             server.STATE["lastScan"] = [_signal("ETH-USDT", "long", 100)]
-            server.maybe_open()
+            server._maybe_open_replay()
             self.assertEqual(server.STATE["openPositions"], [])
             server._clock = lambda: 1_000_000.0 + 60 * 60 - 1
-            server.maybe_open()
+            server._maybe_open_replay()
             self.assertEqual(server.STATE["openPositions"], [])
             server._clock = lambda: 1_000_000.0 + 60 * 60
-            server.maybe_open()
+            server._maybe_open_replay()
             self.assertEqual(_one()["pair"], "ETH-USDT")
         finally:
             server._clock = None
@@ -1140,7 +1145,7 @@ class PositionTests(unittest.TestCase):
             _signal("SOL-USDT", "short", 100, price=100),
             _signal("ADA-USDT", "long", 100, price=100),
         ]
-        server.maybe_open()
+        server._maybe_open_replay()
         sides = [(p["pair"], p["side"]) for p in server.STATE["openPositions"]]
         self.assertEqual(sides, [
             ("ETH-USDT", "long"),
@@ -1160,7 +1165,7 @@ class PositionTests(unittest.TestCase):
         rising = _signal("ETH-USDT", "short", 100, price=100)
         rising["emaSlope"] = 0.03
         server.STATE["lastScan"] = [rising]
-        server.maybe_open()
+        server._maybe_open_replay()
         self.assertEqual(server.STATE["openPositions"], [])
 
         server.STATE["settings"]["regimeFilter"] = "adx"
@@ -1169,11 +1174,11 @@ class PositionTests(unittest.TestCase):
         chop["adx"] = 12
         chop["emaSlope"] = -0.05
         server.STATE["lastScan"] = [chop]
-        server.maybe_open()
+        server._maybe_open_replay()
         self.assertEqual(server.STATE["openPositions"], [])
         chop["adx"] = 25
         server.STATE["lastScan"] = [chop]
-        server.maybe_open()
+        server._maybe_open_replay()
         self.assertEqual(_one()["pair"], "ETH-USDT")
 
     def test_efficiency_ratio_and_adx_directions(self):
