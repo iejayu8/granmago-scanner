@@ -52,6 +52,66 @@ _FX_STATE = {"lastAttemptAt": None, "lastOkAt": None, "lastError": None}
 _STATUS_LOCK = threading.Lock()
 
 
+class SuspendDetector:
+    """Detect box freezes: wall time jumps while CLOCK_MONOTONIC does not.
+
+    The Grok Bot box is a VM that the platform pauses when no bot is active.
+    During a pause every process is frozen (CLOCK_MONOTONIC and /proc/uptime
+    stop too) and on resume the wall clock is stepped forward. A gap of wall
+    time larger than the monotonic gap is that freeze, not a hang.
+    """
+
+    def __init__(self, threshold=30.0, wall=time.time, mono=time.monotonic):
+        self.threshold = float(threshold)
+        self._wall, self._mono = wall, mono
+        self._last = (wall(), mono())
+        self.count = 0
+        self.total = 0.0
+        self.recent = deque(maxlen=20)
+
+    def tick(self):
+        """Return the suspension dict when one ended since the last tick, else None."""
+        wall, mono = self._wall(), self._mono()
+        lw, lm = self._last
+        self._last = (wall, mono)
+        frozen = (wall - lw) - (mono - lm)
+        if frozen < self.threshold:
+            return None
+        ev = {"from": _iso(lw), "to": _iso(wall), "seconds": round(frozen, 1)}
+        self.count += 1
+        self.total += frozen
+        self.recent.append(ev)
+        return ev
+
+    def as_dict(self):
+        return {"count": self.count, "totalSeconds": round(self.total, 1),
+                "last": self.recent[-1] if self.recent else None, "recent": list(self.recent)[-5:]}
+
+
+class CycleTracker:
+    """Run-time (monotonic) age of the last engine cycle; immune to box pauses."""
+
+    def __init__(self, mono=time.monotonic):
+        self._mono = mono
+        self.value = None
+        self.at = mono()
+
+    def observe(self, last_tick):
+        if last_tick != self.value:
+            self.value = last_tick
+            self.at = self._mono()
+        return round(self._mono() - self.at, 1)
+
+
+SUSPEND = SuspendDetector(float(os.environ.get("GRANMAGO_SUSPEND_THRESHOLD", "30")))
+CYCLE = CycleTracker()
+CYCLE_MAX_RUN_AGE = float(os.environ.get("GRANMAGO_CYCLE_MAX_RUN_AGE", "600"))
+
+
+def _iso(epoch):
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _utc_now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -143,18 +203,20 @@ def build_status(engine, fj=None):
     running = bool(snap.get("running"))
     errors = list(_ERRORS)[-10:]
     uptime = time.monotonic() - _STARTED_MONO
+    # Run-time age (excludes box pauses). Wall age is kept for humans only.
+    run_age = CYCLE.observe(last_tick)
     if not running:
         health = "stopped"
-    elif age is None and uptime < 600:
+    elif last_tick is None and uptime < CYCLE_MAX_RUN_AGE:
         health = "starting"
-    elif age is None or age > 600:
+    elif run_age > CYCLE_MAX_RUN_AGE:
         health = "stale"
     elif _JOURNAL_ERRORS or (errors and errors[-1]["level"] in ("ERROR", "CRITICAL")):
         health = "degraded"
     else:
         health = "ok"
     out = {
-        "schema": 1,
+        "schema": 2,
         "generatedAt": _utc_now(),
         "health": health,
         "version": engine.VERSION,
@@ -174,6 +236,11 @@ def build_status(engine, fj=None):
         "closedInHistory": len(snap.get("history") or []),
         "lastCycleAt": last_tick,
         "lastCycleAgeSeconds": age,
+        "lastCycleRunAgeSeconds": run_age,
+        "monotonicAt": round(time.monotonic(), 1),
+        "wallUptimeSeconds": round(time.time() - _STARTED_AT.timestamp(), 1),
+        "suspensions": SUSPEND.as_dict(),
+        "heartbeat": {"cycleMaxRunAgeSeconds": CYCLE_MAX_RUN_AGE, "statusIntervalSeconds": STATUS_INTERVAL},
         "lastScanAt": last_scan,
         "recentErrors": errors,
         "journalErrors": list(_JOURNAL_ERRORS),
@@ -221,11 +288,28 @@ def install_status_route(engine, fj):
 def _status_loop(engine, fj, stop):
     path = engine.DATA_DIR / "status.json"
     while not stop.is_set():
+        ev = SUSPEND.tick()
+        if ev is not None:
+            on_resume(engine, ev)
         try:
             write_status(path, build_status(engine, fj))
         except Exception as exc:
             logging.getLogger("granmago.standalone").warning("status.json write failed: %r", exc)
         stop.wait(STATUS_INTERVAL)
+
+
+def on_resume(engine, ev):
+    """Log a box pause and start a fresh cycle right away."""
+    msg = ("Caja en pausa %.0f min (%s -> %s): la plataforma suspendió la VM; reanudado."
+           % (ev["seconds"] / 60.0, ev["from"], ev["to"]))
+    logging.getLogger("granmago.standalone").info(msg)
+    try:
+        with engine.LOCK:
+            engine.STATE["log"].insert(0, "[%s] %s" % (datetime.now().strftime("%H:%M:%S"), msg))
+            del engine.STATE["log"][80:]
+        engine.kick()
+    except Exception as exc:
+        logging.getLogger("granmago.standalone").warning("resume handling failed: %r", exc)
 
 
 def _fx_loop(fj, stop, csv_path):
@@ -255,6 +339,9 @@ def main():
         sys.path.insert(0, str(HERE))
     from fiscal_journal import FiscalJournal
     logging.getLogger().addHandler(_ErrorCapture())
+    import faulthandler
+    import signal
+    faulthandler.register(signal.SIGUSR1, all_threads=True)  # `kill -USR1 <pid>` -> stacks in engine.log
     engine.DATA_DIR.mkdir(parents=True, exist_ok=True)
     journal = FiscalJournal(engine.DATA_DIR / "fiscal_journal.sqlite", mode=MODE,
                             engine_version=engine.VERSION, instance=os.environ.get("GRANMAGO_INSTANCE", "box"))

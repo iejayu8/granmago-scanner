@@ -9,7 +9,8 @@ and `HASSIO_TOKEN` are removed from the engine's environment.
 ## Run
 
 ```bash
-standalone/granmagoctl.sh start     # watchdog + engine in background (setsid/nohup)
+standalone/granmagoctl.sh start     # watchdog + engine in background (setsid/nohup); idempotent
+standalone/granmagoctl.sh ensure    # same as start, for periodic routines (no-op when up)
 standalone/granmagoctl.sh status    # pids + GET /status summary
 standalone/granmagoctl.sh logs 100  # tail engine.log
 standalone/granmagoctl.sh stop      # TERM to watchdog -> TERM to engine (KILL after 10 s)
@@ -33,7 +34,40 @@ Foreground, without the watchdog: `python3 standalone/granmago_standalone.py`.
 TP 1.7R and the other fixed behaviour are pinned by the engine (`FIXED_BEHAVIOUR`).
 
 Watchdog: a bash restart loop. Backoff is 5 s doubling to 300 s and resets after
-a run longer than 600 s.
+a run longer than 600 s. The engine's stdout and stderr go straight to
+`engine.log`, a file and never a pipe, so output can never block it.
+
+Heartbeat: every 30 s the watchdog runs `heartbeat_check.py`. If `status.json`
+has not been refreshed for 300 s, or the engine has had no cycle for 600 s, the
+watchdog:
+1. sends `SIGUSR1` to the engine (faulthandler writes every thread's stack to `engine.log`);
+2. restarts it;
+3. writes a `HEARTBEAT` line to `watchdog.log`.
+
+Both ages are measured in run time (CLOCK_MONOTONIC, the clock behind `/proc/uptime`).
+
+## Box pauses (important)
+
+The Grok Bot box is a VM that the platform pauses a few minutes after no bot is
+working on it. Background processes do not count as activity. During a pause
+everything freezes: the engine, the watchdog and CLOCK_MONOTONIC. On resume the
+wall clock jumps forward. The engine can neither prevent nor run through a pause.
+
+What it does is detect each one:
+- `status.json` gains `suspensions` {count, totalSeconds, last, recent};
+- the log gets a line "Caja en pausa N min ... reanudado";
+- the engine starts a fresh cycle (`kick()`).
+
+Health and the heartbeat use run-time ages, so a pause is never reported as a
+hang and never causes a restart. `lastCycleAgeSeconds` is the wall-time age;
+`lastCycleRunAgeSeconds` is the run-time age.
+
+Start is idempotent and checks the pid against the real command line, so
+`granmagoctl.sh ensure` is safe to run from a periodic routine.
+
+The box has no systemd as init and no cron, so nothing restarts the engine
+after a box update or restart. Either a routine runs `ensure`, or it is
+started by hand.
 
 ## Status
 
@@ -41,14 +75,14 @@ a run longer than 600 s.
 The file is rewritten atomically (tmp + fsync + rename) every 15 s.
 
 Main keys:
-- identity and health: `health` (`ok`/`starting`/`degraded`/`stale`/`stopped`), `version`, `mode` (`paper`), `realMoney` (false), `running`, `pid`, `bind`;
+- identity and health: `health` (`ok`/`starting`/`degraded`/`stale`/`stopped`; `stale` = no cycle for 600 s of run time), `version`, `mode` (`paper`), `realMoney` (false), `running`, `pid`, `bind`;
 - uptime: `startedAt`, `uptimeSeconds`;
 - account: `balance`, `initialBalance`, `openPositions[]`, `openCount`;
 - cycles: `lastCycleAt`, `lastCycleAgeSeconds`, `lastScanAt`;
 - errors: `recentErrors[]` (WARNING+ log records), `journalErrors[]`;
 - `config`, `journal` {rows, fx_pending, path, fx}, `recentLog`.
 
-`stale` means the last cycle is more than 600 s old.
+It also has `monotonicAt`, `lastCycleRunAgeSeconds`, `wallUptimeSeconds`, `suspensions` and `heartbeat`. The schema is now 2.
 
 ## Fiscal journal
 
@@ -129,5 +163,5 @@ It holds every `trades` column plus:
 ## Tests
 
 `python3 -m unittest discover -s tests` runs the existing suite plus
-`test_fiscal_journal.py` and `test_standalone.py`. The latter starts the real
+`test_fiscal_journal.py`, `test_standalone.py` and `test_standalone_liveness.py`. The latter starts the real
 runner on a free loopback port with autostart off, so it makes no network calls.
