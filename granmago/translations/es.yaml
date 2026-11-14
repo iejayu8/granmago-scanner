@@ -20,6 +20,24 @@ configuration:
   slippage_pct_per_side:
     name: Slippage % por lado
     description: Empeora el precio de entrada y de salida, en porcentaje. El defecto es 0,02.
+  trading_mode:
+    name: Modo de trading
+    description: paper (defecto, simulado), demo (órdenes en una cuenta Blofin Demo Trading con las claves de abajo) o live (bloqueado en esta versión; el complemento se niega a operar).
+  blofin_api_key:
+    name: API key de Blofin
+    description: API key de Demo Trading. Solo permiso de trading, sin retirada y restringida por IP si se puede. Nunca aparece en logs ni en la página.
+  blofin_api_secret:
+    name: Secret de Blofin
+    description: Secret de la API key. Nunca aparece en logs ni en la página.
+  blofin_api_passphrase:
+    name: Passphrase de Blofin
+    description: Passphrase elegida al crear la key. Nunca aparece en logs ni en la página.
+  control_token:
+    name: Token de control
+    description: Opcional. Permite que herramientas fuera del panel de HA usen los endpoints de control (arrancar, parar, kill switch) con la cabecera X-GranMago-Token. Sin él, solo el panel de HA controla el bot.
+  kill_switch:
+    name: Kill switch
+    description: Activado, el bot no abre posiciones nuevas. Las abiertas mantienen su SL/TP. Para cerrarlas también usa POST /api/kill_switch con closeAll.
   pairs:
     name: Pares
     description: Swaps USDT que se escanean, un símbolo por línea (por ejemplo BTC-USDT). El defecto son los 28 pares de la monitorización. Una lista vacía usa esos 28 y sustituye la lista guardada en el estado. Se usan como máximo 40. Una posición abierta en un par que quites se sigue vigilando hasta que cierre.

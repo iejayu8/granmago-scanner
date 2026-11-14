@@ -56,6 +56,23 @@ export SLIPPAGE_PCT_PER_SIDE="$(bashio::config 'slippage_pct_per_side')"
 # config.exists is still true, so PAIRS is exported as an empty string.
 # server.py treats that empty string as the 28-pair book and does not keep
 # a stale list from state.json. A missing key is not exported.
+# Trading (1.7.0). Paper by default. Demo only when trading_mode=demo; live is
+# rejected by the server. Secrets are passed via the environment only, never
+# echoed: no "set -x", no logging of these variables.
+export TRADING_MODE="$(bashio::config 'trading_mode')"
+export KILL_SWITCH="$(bashio::config 'kill_switch')"
+if bashio::config.has_value 'blofin_api_key'; then
+  export BLOFIN_API_KEY="$(bashio::config 'blofin_api_key')"
+fi
+if bashio::config.has_value 'blofin_api_secret'; then
+  export BLOFIN_API_SECRET="$(bashio::config 'blofin_api_secret')"
+fi
+if bashio::config.has_value 'blofin_api_passphrase'; then
+  export BLOFIN_API_PASSPHRASE="$(bashio::config 'blofin_api_passphrase')"
+fi
+if bashio::config.has_value 'control_token'; then
+  export CONTROL_TOKEN="$(bashio::config 'control_token')"
+fi
 if bashio::config.exists 'pairs'; then
   export PAIRS="$(bashio::config 'pairs')"
 fi

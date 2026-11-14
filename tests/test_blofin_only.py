@@ -69,6 +69,8 @@ class BlofinOnlyTest(unittest.TestCase):
         server._clock = lambda: NOW
         server._RATE_LIMIT_UNTIL = 0
         server._NEXT_REQUEST_AT = 0
+        server._INSTRUMENTS.clear()
+        server._PAIR_HEALTH.clear()
         self.spacing = patch.object(server, 'HTTP_MIN_INTERVAL', 0)
         self.spacing.start()
         self.addCleanup(self.spacing.stop)
@@ -99,8 +101,11 @@ class BlofinOnlyTest(unittest.TestCase):
             return response(status=self.http_status)
         if '/instruments?' in url:
             body = self.edit_meta(instrument(pair))
-        elif '/tickers?' in url:
-            body = self.edit_tick(ticker(pair, self.price))
+        elif '/books?' in url:
+            # 1.7.0: execution quotes come from the order book (books?size=1);
+            # the ticker helper still describes bid/ask/ts for these tests.
+            t = self.edit_tick(ticker(pair, self.price))
+            body = dict(asks=[[t.get('askPrice'), '1']], bids=[[t.get('bidPrice'), '1']], ts=t.get('ts'))
         else:
             self.fail('Unexpected endpoint ' + url)
         return response(dict(code='0', data=[body]))
@@ -130,7 +135,9 @@ class BlofinOnlyTest(unittest.TestCase):
         self.assertEqual(hist['exitMarket']['ts'], int(NOW * 1000))
         self.assertNotAlmostEqual(hist['exit'], 118.7)
         self.assertTrue(all('binance' not in u.lower() for u in self.urls))
-        self.assertEqual(len([u for u in self.urls if '/tickers?' in u]), 3)
+        self.assertEqual(len([u for u in self.urls if '/books?' in u]), 3)
+        # Instruments are cached (10 min), not re-fetched for every quote.
+        self.assertEqual(len([u for u in self.urls if '/instruments?' in u]), 1)
 
     def test_fresh_ticker_not_4h_candle_is_entry_price(self):
         server.STATE['lastScan'] = [scan_row()]
@@ -139,11 +146,12 @@ class BlofinOnlyTest(unittest.TestCase):
         self.assertAlmostEqual(server.STATE['openPositions'][0]['entry'], 614.5 * 1.0002)
 
     def test_bad_ticks_fail_closed_for_all_live_paths(self):
-        bad = [dict(ts=str(int((NOW - 31) * 1000))), dict(ts=str(int((NOW + 3) * 1000))),
-               dict(ts='nan'), dict(ts='1700000000'), dict(ts=None), dict(instId='BTC-USDT'),
-               dict(last='nan'), dict(last='inf'), dict(last='-1'), dict(last='0'),
-               dict(last=True), dict(bidPrice='0'), dict(askPrice='0'),
-               dict(bidPrice='900', askPrice='800'), dict(last='118.7')]
+        # Book freshness is the books ts (<= 10 s); bid/ask must be sane.
+        bad = [dict(ts=str(int((NOW - 11) * 1000))), dict(ts=str(int((NOW + 3) * 1000))),
+               dict(ts='nan'), dict(ts='1700000000'), dict(ts=None),
+               dict(bidPrice='nan'), dict(askPrice='inf'), dict(bidPrice='-1'), dict(askPrice='0'),
+               dict(bidPrice=True), dict(bidPrice='0'), dict(askPrice=None),
+               dict(bidPrice='900', askPrice='800'), dict(bidPrice='600', askPrice='630')]
         for changes in bad:
             for path in ('entry', 'monitor', 'manual', 'signal'):
                 with self.subTest(changes=changes, path=path):
@@ -397,7 +405,9 @@ class BlofinOnlyTest(unittest.TestCase):
         with patch.object(requests.sessions.Session, 'request', side_effect=requests.Timeout()) as request_mock, patch.object(server.time, 'sleep') as sleep:
             self.enter()
         self.assertEqual(request_mock.call_count, 3)
-        self.assertEqual([x.args[0] for x in sleep.call_args_list], [.25, .5])
+        delays = [x.args[0] for x in sleep.call_args_list]
+        self.assertEqual(len(delays), 2)  # jittered backoff: base * [1, 1.5)
+        self.assertTrue(.25 <= delays[0] <= .375 and .5 <= delays[1] <= .75, delays)
         self.assertFalse(server.STATE['openPositions'])
         self.assertFalse(server.STATE['history'])
 

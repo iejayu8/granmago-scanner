@@ -83,6 +83,14 @@ la política de frescura de tickers. Sus cachés son históricas y nunca aliment
 las rutas de ejecución del complemento. No se ha recalculado rentabilidad con
 este cambio.
 
+## Robustez de mercado y demo Blofin (1.7.0)
+
+- El precio de ejecución es el mid del libro (`books?size=1`) y su frescura es la del `ts` del libro (≤ 10 s). El `last` del ticker ya no se usa para decidir.
+- La vela de 4H recién cerrada se acepta durante 180 s tras el cierre, y los pares que fallan se reintentan al final del escaneo.
+- `/api/state` → `market` y `/api/health` muestran contadores por endpoint con el motivo exacto de cada rechazo y los pares degradados.
+- `trading_mode: demo` ejecuta en Blofin Demo Trading con SL/TP en el exchange, reconciliación cada minuto y estado seguro ante cualquier duda. Guía completa: [DEMO_SETUP.md](DEMO_SETUP.md). El modo real está bloqueado.
+- Los endpoints de control solo responden desde el panel de HA, loopback o con `control_token`.
+
 ## Riesgo con varias posiciones
 
 Cada entrada arriesga `risk_pct` del **balance realizado** en ese momento. El tamaño no se reparte entre las posiciones: tres entradas pueden arriesgar 3 × `risk_pct`. Con el 1% por defecto, el riesgo a stop de un libro lleno es el 3% del balance.
@@ -101,6 +109,10 @@ El apalancamiento no multiplica el nocional. El nocional sale del riesgo y de la
 | fee_pct_per_side | 0.06 | Comisión taker, en % del nocional, en la entrada y en la salida |
 | slippage_pct_per_side | 0.02 | Empeora la entrada y la salida, en % del precio |
 | pairs | los 28 de la monitorización | Swaps USDT a escanear. Una lista vacía o inválida usa esos 28 y sustituye la lista guardada en el estado. Máximo 40 |
+| trading_mode | paper | `paper` (simulado), `demo` (Blofin Demo Trading, ver [DEMO_SETUP.md](DEMO_SETUP.md)) o `live` (bloqueado en esta versión) |
+| blofin_api_key / blofin_api_secret / blofin_api_passphrase | vacío | Claves de la API key de **Demo Trading**. Solo se usan en `demo`; nunca aparecen en logs ni en la página |
+| control_token | vacío | Opcional. Permite llamar a los endpoints de control desde fuera del panel con la cabecera `X-GranMago-Token` |
+| kill_switch | false | Sin entradas nuevas. Las posiciones abiertas conservan su SL/TP |
 
 El resto no está en la configuración. Queda fijo en la monitorización validada: Gran Mago, variante A, estilo sweep, setups both, sin promedios, salida por agotamiento, máximo 15 velas, margen de stop 0,3 %, objetivo 1,7 R en el camino del scanner, trailing apagado, filtro de régimen apagado, sin enfriamiento entre operaciones y un escaneo cada 90 segundos. Una actualización desde 1.5.0 ignora las claves viejas que siguieran guardadas.
 

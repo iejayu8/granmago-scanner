@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.7.0
+
+- **Trading en Blofin Demo (opcional).** `trading_mode: paper` sigue siendo el defecto y no cambia nada. Con `trading_mode: demo` y las tres claves de una API key de *Demo Trading*, las entradas Gran Mago se ejecutan en `https://demo-trading-openapi.blofin.com`: orden a mercado con `clientOrderId` determinista por señal, SL y TP adjuntos a la orden (y, si no aparecen, TP/SL de posición), margen aislado, modo `net`, tamaño redondeado a `lotSize`/`minSize`/`maxMarketSize` y precios a `tickSize` por el lado seguro. Tras un timeout se consulta por `clientOrderId`, nunca se reenvía a ciegas; si el resultado sigue siendo desconocido el bot entra en **estado seguro** y no abre nada más. Reconciliación al arrancar y cada minuto (posiciones, TP/SL vivos, órdenes pendientes). Presupuesto de 25 peticiones privadas por 10 s (Blofin permite 30). Cierres, PnL, comisiones y funding salen de los fills reales de Blofin. Diario fiscal propio `fiscal_journal_demo.sqlite` (modo `demo`, campos del diario de la PR #14).
+- **`trading_mode: live` (dinero real) bloqueado en código**: el bot no arranca el trading y muestra el error.
+- **Kill switch**: opción `kill_switch` y `POST /api/kill_switch {"enabled": true, "closeAll": true|false}`. Bloquea entradas nuevas y, si se pide, cierra todas las posiciones (en demo, a mercado en Blofin).
+- **Seguridad (C5)**: los endpoints que cambian algo (`start`, `stop`, `reset`, `settings`, `scan`, `close_position`, `kill_switch`) solo responden desde el panel de HA (ingress), loopback, o con la cabecera `X-GranMago-Token` igual a la opción `control_token`. Las lecturas (`/api/state`, `/api/health`) siguen abiertas. Las claves son opciones `password`, se pasan por entorno, se censuran en logs y nunca salen en el estado.
+- **Robustez de datos Blofin (informe P0–P4)**: precio de ejecución = mid de `books?size=1` y frescura por el `ts` del libro (≤ 10 s), en vez del `last`/`ts` del ticker, que envejece en pares sin trades (C1). La vela recién cerrada se acepta 180 s tras el cierre de 4H (Blofin publica la nueva a los ~70 s, C2). Los pares fallidos se reintentan al final del escaneo. Motivo exacto de cada rechazo y contadores por endpoint (ok, fallos por motivo, p50/p95) en `/api/state` → `market` y `/api/health`. Sesión HTTP compartida, instrumentos en caché 10 min, timeouts (3 s, 3 s) y backoff con jitter. Un par con 3 fallos seguidos o 60 s sin precio válido queda **degradado** (sin entradas) y necesita un ciclo sano antes de volver a abrir.
+- Nuevo `GET /api/health` (versión, modo, estado seguro, kill switch, pares degradados, alertas) para sensores REST de HA.
+
 ## 1.6.2
 
 - Fuente de mercado exclusiva Blofin para velas y ticker fresco de entradas, PnL y todos los cierres; se elimina el fallback externo y el uso de cierres de vela como fills en vivo.
