@@ -47,7 +47,7 @@ PAIRS = list(DEFAULT_PAIRS)
 _PAIR_RE = re.compile(r"^[A-Z0-9]+-USDT$")
 MAX_CONFIGURED_PAIRS = 40
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 
 # Walk-forward monitoring setup. The add-on pins these on every start.
 # Leftover options and a saved copy in state.json do not change them.
@@ -832,6 +832,14 @@ def default_state():
         "cooldowns": {},
         "tradeSeq": 0,
         "usedSignals": {},
+        # 1.7.1: persisted across restarts (load_state only keeps known keys).
+        "ledgerMode": "paper",        # whose book is active: "paper" or "demo"
+        "balanceSource": "paper",     # "paper" or "blofin-demo"
+        "paperSnapshot": None,        # paper book while demo is active
+        "demoLedger": None,           # demo book while paper is active
+        "killSwitch": False,
+        "lastReconcileAt": None,
+        "migrations": [],
         "settings": {
             "riskPct": 1.0,
             "leverage": 3,
@@ -1010,6 +1018,11 @@ def load_state():
             base = default_state()
             if isinstance(data, dict):
                 base.update({k: data[k] for k in base if k in data and k != "settings"})
+                if "ledgerMode" not in data:
+                    # Pre-1.7.1 file: the active book is demo if the balance came from Blofin.
+                    base["ledgerMode"] = "demo" if data.get("balanceSource") == "blofin-demo" else "paper"
+                if not isinstance(base.get("migrations"), list):
+                    base["migrations"] = []
                 if isinstance(data.get("settings"), dict):
                     base["settings"].update(data["settings"])
             _apply_runtime_options(base["settings"])
@@ -1051,6 +1064,12 @@ def public_state():
     snap["market"] = market_stats()
     snap["alerts"] = list(ALERTS)[-10:]
     snap["killSwitch"] = bool(snap.get("killSwitch"))
+    for name in ("paperSnapshot", "demoLedger"):
+        book = snap.get(name)
+        if isinstance(book, dict):  # summary only: the panel shows the active book
+            snap[name] = {"balance": book.get("balance"), "initialBalance": book.get("initialBalance"),
+                          "trades": len(book.get("history") or []), "openPositions": len(book.get("openPositions") or []),
+                          "at": book.get("at")}
     for pos in snap.get("openPositions", []):
         mark = pos.get("lastMarket") or {}
         stale = (pos.get("priceStale", False) or mark.get("source") != "Blofin"
@@ -2741,6 +2760,8 @@ def maybe_open():
             return
         if TRADING_ERROR:
             return
+        if TRADER is not None and STATE.get("initialBalance") is None:
+            return  # demo balance not synced from Blofin yet
         scan = STATE.get("lastScan")
         rows = json.loads(json.dumps(scan or []))
         mode = strategy_mode()
@@ -3010,6 +3031,129 @@ def trading_mode():
     return TRADING_CONFIG.mode if TRADING_CONFIG else "paper"
 
 
+# ------------------------------------------------------------ ledgers (1.7.1)
+# Paper and demo keep separate books. The active one lives in the top-level
+# keys; the other is parked in paperSnapshot / demoLedger. Caller holds LOCK.
+BOOK_KEYS = ("balance", "initialBalance", "history", "openPositions", "tradeSeq", "usedSignals", "cooldowns")
+LEDGER_MIGRATION = "1.7.1-ledgers"
+
+
+def _book_copy():
+    return json.loads(json.dumps({k: STATE.get(k) for k in BOOK_KEYS}))
+
+
+def _book_load(book):
+    book = json.loads(json.dumps(book or {}))
+    STATE["balance"] = float(book["balance"]) if book.get("balance") is not None else 0.0
+    STATE["initialBalance"] = book.get("initialBalance")
+    STATE["history"] = list(book.get("history") or [])
+    STATE["openPositions"] = list(book.get("openPositions") or [])
+    STATE["tradeSeq"] = int(book.get("tradeSeq") or 0)
+    STATE["usedSignals"] = dict(book.get("usedSignals") or {})
+    STATE["cooldowns"] = dict(book.get("cooldowns") or {})
+
+
+def _fresh_demo_book():
+    # initialBalance stays None until the first valid Blofin balance (trading_cycle).
+    return {"balance": 0.0, "initialBalance": None, "history": [], "openPositions": [],
+            "tradeSeq": 0, "usedSignals": {}, "cooldowns": {}}
+
+
+def _max_trade_id(rows):
+    ids = [0]
+    for row in rows:
+        try:
+            ids.append(int(row.get("tradeId") or 0))
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return max(ids)
+
+
+def _same_money(a, b):
+    try:
+        return abs(float(a) - float(b)) < 0.005
+    except (TypeError, ValueError):
+        return False
+
+
+def _migrate_ledgers_1_7_1():
+    """One-off repair of 1.7.0 demo states.
+
+    1.7.0 mixed paper and demo in one book and load_state dropped
+    paperSnapshot, so the snapshot was retaken with the demo balance. Rebuild
+    the paper book from the paper trades (rows without "exchange"):
+    balance = initialBalance + sum(pnl). Demo keeps only exchange rows.
+    """
+    done = STATE.setdefault("migrations", [])
+    if LEDGER_MIGRATION in done:
+        return
+    if STATE.get("ledgerMode") == "demo" or STATE.get("balanceSource") == "blofin-demo":
+        history = [h for h in (STATE.get("history") or []) if isinstance(h, dict)]
+        positions = [p for p in _positions() if isinstance(p, dict)]
+        paper_hist = [h for h in history if not h.get("exchange")]
+        demo_hist = [h for h in history if h.get("exchange")]
+        snap = STATE.get("paperSnapshot")
+        if not isinstance(snap, dict) or _same_money(snap.get("balance"), STATE.get("balance")):
+            try:
+                initial = float(STATE.get("initialBalance") or 10000)
+            except (TypeError, ValueError):
+                initial = 10000.0
+            pnl = sum(float(h.get("pnl") or 0) for h in paper_hist)
+            STATE["paperSnapshot"] = {
+                "balance": round(initial + pnl, 4), "initialBalance": initial,
+                "history": paper_hist, "openPositions": [p for p in positions if not p.get("exchange")],
+                "tradeSeq": max(int(STATE.get("tradeSeq") or 0) if not demo_hist else 0, _max_trade_id(paper_hist)),
+                "usedSignals": dict(STATE.get("usedSignals") or {}), "cooldowns": {},
+                "at": _now(), "rebuiltBy": LEDGER_MIGRATION,
+            }
+            add_log("Migración 1.7.1: libro paper reconstruido (%.2f USDT, %d operaciones)." % (
+                initial + pnl, len(paper_hist)))
+        else:
+            snap.setdefault("initialBalance", STATE.get("initialBalance"))
+            snap.setdefault("tradeSeq", _max_trade_id(snap.get("history") or []))
+            snap.setdefault("usedSignals", dict(STATE.get("usedSignals") or {}))
+            snap.setdefault("cooldowns", {})
+        demo_pos = [p for p in positions if p.get("exchange")]
+        _book_load(dict(_fresh_demo_book(), balance=STATE.get("balance") or 0.0, history=demo_hist,
+                        openPositions=demo_pos, tradeSeq=_max_trade_id(demo_hist + demo_pos),
+                        usedSignals=dict(STATE.get("usedSignals") or {})))
+        STATE["ledgerMode"] = "demo"
+        STATE["balanceSource"] = "blofin-demo"
+        add_log("Migración 1.7.1: libro demo separado (%d operaciones demo)." % len(demo_hist))
+    done.append(LEDGER_MIGRATION)
+
+
+def _switch_ledger(target):
+    """Make the paper or demo book active. The paper snapshot is taken only
+    when the active book really is paper, never from a Blofin balance."""
+    current = STATE.get("ledgerMode") or "paper"
+    if target not in ("paper", "demo") or current == target:
+        return
+    if target == "demo":
+        if STATE.get("balanceSource") != "blofin-demo":
+            STATE["paperSnapshot"] = dict(_book_copy(), at=_now())
+        _book_load(STATE.get("demoLedger") or _fresh_demo_book())
+        STATE["balanceSource"] = "blofin-demo"
+        add_log("Libro DEMO activo. El libro paper queda guardado (%.2f USDT)." % float(
+            (STATE.get("paperSnapshot") or {}).get("balance") or 0))
+    else:
+        STATE["demoLedger"] = dict(_book_copy(), at=_now())
+        snap = STATE.get("paperSnapshot")
+        if isinstance(snap, dict):
+            _book_load(snap)
+            if STATE.get("initialBalance") is None:
+                STATE["initialBalance"] = STATE["balance"]
+        else:
+            fresh = default_state()
+            _book_load({k: fresh[k] for k in BOOK_KEYS})
+        STATE["balanceSource"] = "paper"
+        add_log("Libro PAPER restaurado (%.2f USDT, %d operaciones)." % (STATE["balance"], len(STATE["history"])))
+        if STATE["demoLedger"].get("openPositions"):
+            add_log("AVISO: quedan posiciones DEMO abiertas en Blofin que este modo no gestiona: "
+                    + ", ".join(p.get("pair", "?") for p in STATE["demoLedger"]["openPositions"]))
+    STATE["ledgerMode"] = target
+
+
 def init_trading(environ=None, transport=None, sleep=time.sleep):
     """Read trading options. Returns the mode. Never raises: a blocked or
     invalid configuration leaves the bot stopped with a clear error."""
@@ -3029,6 +3173,10 @@ def init_trading(environ=None, transport=None, sleep=time.sleep):
         return "blocked"
     TRADING_CONFIG = cfg
     blofin_trading.install_redactor(cfg.secrets())
+    with LOCK:
+        _migrate_ledgers_1_7_1()
+        _switch_ledger(cfg.mode)
+        save_state()
     if cfg.mode == "demo":
         import fiscal_journal
         TRADER = blofin_trading.DemoTrader(cfg, DATA_DIR, transport=transport, sleep=sleep,
@@ -3036,13 +3184,6 @@ def init_trading(environ=None, transport=None, sleep=time.sleep):
         JOURNAL = fiscal_journal.FiscalJournal(DATA_DIR / "fiscal_journal_demo.sqlite", mode="demo",
                                                engine_version=VERSION, instance=env.get("GRANMAGO_INSTANCE", "ha"))
         with LOCK:
-            if not STATE.get("paperSnapshot"):
-                # The demo balance comes from Blofin and overwrites STATE["balance"]:
-                # keep the paper ledger figures once so switching back loses nothing.
-                STATE["paperSnapshot"] = {"balance": STATE.get("balance"), "at": _now(),
-                                          "history": json.loads(json.dumps(STATE.get("history") or [])),
-                                          "openPositions": json.loads(json.dumps(_positions()))}
-                save_state()
             add_log("Modo DEMO Blofin (%s). El SL/TP vive en el exchange." % cfg.base_url)
     if _as_bool(env.get("KILL_SWITCH"), False):
         with LOCK:
@@ -3239,6 +3380,12 @@ def trading_cycle(force_reconcile=False):
                     with LOCK:
                         STATE["balance"] = round(bal, 4)
                         STATE["balanceSource"] = "blofin-demo"
+                        if STATE.get("initialBalance") is None:
+                            # Demo starts from the first balance Blofin reports
+                            # (minus the PnL of demo trades already booked).
+                            booked = sum(float(h.get("pnl") or 0) for h in STATE.get("history") or [])
+                            STATE["initialBalance"] = round(bal - booked, 4)
+                            add_log("Saldo inicial DEMO fijado en %.2f USDT (Blofin)." % STATE["initialBalance"])
             except Exception as exc:
                 TRADER.alert("Balance demo no disponible: %r" % exc)
         with LOCK:
@@ -3333,7 +3480,7 @@ def api_start():
     body = request.get_json(silent=True) or {}
     with LOCK:
         _apply_settings_locked(body)
-        if not STATE["history"] and not _positions() and body.get("initialBalance"):
+        if TRADER is None and not STATE["history"] and not _positions() and body.get("initialBalance"):
             try:
                 bal = float(body["initialBalance"])
             except (TypeError, ValueError):
@@ -3375,8 +3522,10 @@ def api_reset():
             bal = 10000
         running = STATE["running"]
         settings = STATE["settings"]
+        keep = {k: STATE.get(k) for k in ("demoLedger", "killSwitch", "migrations")}
         STATE.clear()
         STATE.update(default_state())
+        STATE.update({k: v for k, v in keep.items() if v is not None})
         STATE["balance"] = bal
         STATE["initialBalance"] = bal
         STATE["running"] = running

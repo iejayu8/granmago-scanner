@@ -39,7 +39,9 @@ Las tres claves y el `control_token` son campos de contraseña: HA no los muestr
 3. Al arrancar, el bot: consulta la key (`readOnly`, IPs), comprueba el desfase de reloj (≤ 5 s), pone la cuenta en modo de posición **net** (solo si no hay posiciones abiertas) y margen **isolated**, revisa intenciones de orden pendientes y reconcilia con Blofin. Si algo falla, queda en **estado seguro** (no abre nada) y lo dice en `/api/health`.
 4. Abre el panel y pulsa **Iniciar** como siempre.
 
-Volver a paper: `trading_mode: paper` y reiniciar. Las posiciones demo que sigan abiertas en Blofin **no** se cierran solas al cambiar de modo; ciérralas antes con el kill switch (`closeAll`) o desde la web de Blofin.
+Paper y demo llevan libros separados (1.7.1): en demo el historial y el PnL son solo los de la cuenta Blofin, con saldo inicial = primer saldo de Blofin; el libro paper queda guardado intacto.
+
+Volver a paper: `trading_mode: paper` y reiniciar; se restaura el libro paper. Las posiciones demo que sigan abiertas en Blofin **no** se cierran solas al cambiar de modo; ciérralas antes con el kill switch (`closeAll`) o desde la web de Blofin.
 
 En demo, **Reset** y el cambio de ajustes desde el panel están desactivados (el balance sale de la cuenta Blofin). El cierre manual desde el panel se encola y se ejecuta a mercado en Blofin (respuesta 202).
 
