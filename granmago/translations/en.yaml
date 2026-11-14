@@ -20,6 +20,24 @@ configuration:
   slippage_pct_per_side:
     name: Slippage % per side
     description: Adverse fill, in percent, applied to the entry and the exit. Default is 0.02.
+  trading_mode:
+    name: Trading mode
+    description: paper (default, simulated), demo (orders on a Blofin Demo Trading account with the keys below) or live (blocked in this version, the add-on refuses to trade).
+  blofin_api_key:
+    name: Blofin API key
+    description: Demo Trading API key. Trade permission only, no withdrawal, IP-restricted if possible. Never shown in logs or in the page.
+  blofin_api_secret:
+    name: Blofin API secret
+    description: Secret of the API key. Never shown in logs or in the page.
+  blofin_api_passphrase:
+    name: Blofin API passphrase
+    description: Passphrase chosen when the key was created. Never shown in logs or in the page.
+  control_token:
+    name: Control token
+    description: Optional. Lets tools outside the HA panel call the control endpoints (start, stop, kill switch) with the X-GranMago-Token header. Without it only the HA panel can control the bot.
+  kill_switch:
+    name: Kill switch
+    description: When on, the bot opens no new positions. Open positions keep their SL/TP. To also close them use the kill switch button or POST /api/kill_switch with closeAll.
   pairs:
     name: Pairs
     description: USDT swaps to scan, one symbol per entry (for example BTC-USDT). Default is the 28-pair monitoring book. An empty list uses those 28 and replaces a list saved in the add-on state. At most 40 symbols are used. An open position on a pair you remove stays monitored until it closes.

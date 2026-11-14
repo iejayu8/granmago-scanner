@@ -1,7 +1,7 @@
 name: GranMago Scanner
-version: "1.6.2"
+version: "1.7.0"
 slug: granmago
-description: Paper trading del scanner GranMago. El bot corre en el servidor aunque cierres la página.
+description: Scanner GranMago. Paper por defecto; demo de Blofin opcional (modo real bloqueado). El bot corre en el servidor aunque cierres la página.
 url: https://github.com/iejayu8/granmago-scanner
 arch:
   - aarch64
@@ -26,6 +26,12 @@ options:
   max_positions: 3
   fee_pct_per_side: 0.06
   slippage_pct_per_side: 0.02
+  trading_mode: paper
+  blofin_api_key: ""
+  blofin_api_secret: ""
+  blofin_api_passphrase: ""
+  control_token: ""
+  kill_switch: false
   pairs:
     - BTC-USDT
     - ETH-USDT
@@ -63,5 +69,11 @@ schema:
   max_positions: int(1,12)
   fee_pct_per_side: float
   slippage_pct_per_side: float
+  trading_mode: list(paper|demo|live)
+  blofin_api_key: password?
+  blofin_api_secret: password?
+  blofin_api_passphrase: password?
+  control_token: password?
+  kill_switch: bool
   pairs:
     - match(^[A-Za-z0-9]+-USDT$)
