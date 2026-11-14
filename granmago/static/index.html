@@ -15,6 +15,10 @@
   h1 { margin: 0; font-size: 1.25rem; }
   .badge { background: #238636; color: white; padding: 4px 10px; border-radius: 20px; font-size: 0.75rem; font-weight: 600; }
   .badge.warn { background: var(--orange); }
+  .badge.danger { background: var(--red); }
+  .badge.demo { background: var(--blue); }
+  .alerts { background: #2d1416; border: 1px solid var(--red); border-radius: 8px; padding: 10px 12px; margin-bottom: 16px; font-size: 0.85rem; color: #ffa198; line-height: 1.5; }
+  .alerts.info { background: #1c2333; border-color: var(--blue); color: #a5d6ff; }
   .container { max-width: 960px; margin: 0 auto; padding: 12px; }
   .disclaimer { background: #1c2128; border: 1px solid var(--orange); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; font-size: 0.8rem; color: #ffa657; line-height: 1.4; }
   .live { background: #12261e; border: 1px solid #238636; border-radius: 8px; padding: 10px 12px; margin-bottom: 16px; font-size: 0.85rem; color: #7ee787; line-height: 1.4; }
@@ -62,10 +66,11 @@
 <header>
   <div>
     <h1>GranMago Scanner</h1>
-    <small style="color:var(--muted)">Paper trading en el servidor</small>
+    <small style="color:var(--muted)" id="modeSubtitle">Paper trading en el servidor</small>
   </div>
   <div style="text-align:right">
-    <span class="badge">PAPER</span>
+    <span class="badge" id="modeBadge">PAPER</span>
+    <span class="badge danger hidden" id="safeBadge">ESTADO SEGURO</span>
     <span class="badge warn" id="statusBadge">DETENIDO</span>
     <small id="heartbeat"></small>
   </div>
@@ -73,14 +78,16 @@
 
 <div class="container">
   <div class="disclaimer">
-    <strong>AVISO:</strong> Scanner educativo. Rankea las principales monedas según EMA50 multi-timeframe, estocástico y zona de liquidez. No es asesoramiento financiero y no opera en un exchange real.
+    <strong>AVISO:</strong> Scanner educativo. Rankea las principales monedas según EMA50 multi-timeframe, estocástico y zona de liquidez. No es asesoramiento financiero. En modo paper simula; en modo demo opera en la cuenta Demo Trading de Blofin (dinero ficticio). El modo real está bloqueado.
   </div>
   <div class="live" id="liveNote">
     El bot corre en Home Assistant. Puedes cerrar esta página o apagar la pantalla: las posiciones abiertas siguen.
   </div>
 
+  <div class="alerts hidden" id="tradingAlerts"></div>
+
   <div class="grid">
-    <div class="card"><h3>Balance</h3><div class="value" id="balance">—</div></div>
+    <div class="card"><h3 id="balanceLabel">Balance</h3><div class="value" id="balance">—</div></div>
     <div class="card"><h3>Equity</h3><div class="value" id="equity">—</div></div>
     <div class="card"><h3>PnL total</h3><div class="value" id="pnl">—</div></div>
     <div class="card"><h3>PnL no realizado</h3><div class="value" id="unreal">—</div></div>
@@ -229,7 +236,46 @@ function fmtR(v) {
   $(id).addEventListener("input", () => { formDirty = true; });
 });
 
+function renderMode(s) {
+  const mode = String(s.tradingMode || "paper");
+  const demo = mode === "demo";
+  const trading = s.trading || {};
+  $("modeBadge").textContent = mode === "blocked" ? "BLOQUEADO" : mode.toUpperCase();
+  $("modeBadge").className = "badge" + (demo ? " demo" : mode === "blocked" ? " danger" : "");
+  $("modeSubtitle").textContent = demo
+    ? "Blofin Demo Trading · SL/TP en el exchange"
+    : mode === "blocked" ? "Trading bloqueado: revisa la configuración" : "Paper trading en el servidor";
+  const unsafe = demo && trading.safe === false;
+  $("safeBadge").classList.toggle("hidden", !unsafe);
+  $("balanceLabel").textContent = demo ? "Balance (Blofin demo)" : "Balance";
+
+  const lines = [];
+  if (s.tradingError) lines.push("Trading bloqueado: " + s.tradingError);
+  if (unsafe) lines.push("Estado seguro, sin entradas nuevas: " + ((trading.unsafeReasons || []).join(", ") || "ver /api/health"));
+  if (s.killSwitch) lines.push("Kill switch activo: sin entradas nuevas.");
+  if (demo && s.initialBalance == null) lines.push("Esperando el primer saldo de Blofin demo.");
+  const recent = [].concat(trading.alerts || [], s.alerts || [])
+    .filter((a) => a && a.msg && a.level !== "info")
+    .slice(-4)
+    .map((a) => "Alerta: " + a.msg);
+  lines.push(...recent);
+  const box = $("tradingAlerts");
+  box.replaceChildren(...lines.map((t) => { const d = document.createElement("div"); d.textContent = t; return d; }));
+  box.className = "alerts" + (lines.length ? "" : " hidden")
+    + ((s.tradingError || unsafe || s.killSwitch) ? "" : " info");
+
+  // Demo: the balance is Blofin's; no reset, no initial balance. Risk and
+  // leverage come from the add-on options (the API refuses changes in demo).
+  $("btnReset").disabled = demo;
+  $("btnReset").title = demo ? "Desactivado en demo: el saldo es el de la cuenta Blofin" : "";
+  $("initBalance").disabled = demo;
+  $("riskPct").disabled = demo;
+  $("leverage").disabled = demo;
+  return demo;
+}
+
 function render(s) {
+  renderMode(s);
   const running = !!s.running;
   $("statusBadge").textContent = running ? "CORRIENDO" : "DETENIDO";
   $("statusBadge").className = "badge" + (running ? "" : " warn");
@@ -248,9 +294,15 @@ function render(s) {
   const unrealized = positions.reduce((sum, p) => sum + (+p.unrealized || 0), 0);
   const equity = (+s.balance || 0) + unrealized;
   $("balance").textContent = (+s.balance || 0).toLocaleString(undefined, { maximumFractionDigits: 0 }) + " USDT";
-  const pnl = (+s.balance || 0) - (+s.initialBalance || 0);
-  $("pnl").textContent = (pnl >= 0 ? "+" : "") + pnl.toFixed(2);
-  $("pnl").className = "value " + (pnl >= 0 ? "positive" : "negative");
+  // PnL of the active book only (paper or demo, each with its own initial balance).
+  if (s.initialBalance == null) {
+    $("pnl").textContent = "—";
+    $("pnl").className = "value";
+  } else {
+    const pnl = (+s.balance || 0) - (+s.initialBalance || 0);
+    $("pnl").textContent = (pnl >= 0 ? "+" : "") + pnl.toFixed(2);
+    $("pnl").className = "value " + (pnl >= 0 ? "positive" : "negative");
+  }
   $("unreal").textContent = (unrealized >= 0 ? "+" : "") + unrealized.toFixed(2);
   $("unreal").className = "value " + (unrealized >= 0 ? "positive" : "negative");
   $("equity").textContent = stalePrices ? "Sin precio Blofin fresco" : equity.toLocaleString(undefined, { maximumFractionDigits: 2 }) + " USDT";
@@ -272,7 +324,7 @@ function render(s) {
   if (!formDirty && s.settings) {
     $("riskPct").value = s.settings.riskPct;
     $("leverage").value = String(s.settings.leverage);
-    $("initBalance").value = s.initialBalance;
+    if (s.initialBalance != null) $("initBalance").value = s.initialBalance;
   }
 
   const entryThreshold = (s.settings && Number.isFinite(+s.settings.entryThreshold))
@@ -407,6 +459,7 @@ $("openTrades").addEventListener("click", (ev) => {
   });
 });
 $("btnReset").onclick = () => {
+  if ($("btnReset").disabled) return;
   if (!confirm("¿Resetear balance e historial? El bot no se detiene.")) return;
   post("/api/reset", payload());
 };
