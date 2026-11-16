@@ -159,3 +159,7 @@ El filtro de noticias no está: el curso dice no operar con datos y en X dice qu
 ## Estrategia v7 (alternativa)
 
 Se puede activar la lógica Pullback-to-EMA + RSI Recovery (15m) sustituyendo el modo scanner.
+
+### Tests antes de cada versión
+
+Antes de publicar cualquier versión hay que pasar la suite completa con `tools/run_tests.sh` (incluye invariantes de temporización, contrato y render headless del panel, simulación de varias horas, parsing de la doc de Blofin y estrés concurrente). Si el render headless se omite, el script falla.
