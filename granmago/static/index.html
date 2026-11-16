@@ -226,6 +226,17 @@ function motivo(reason) {
   return reason == null ? "-" : String(reason);
 }
 
+function pnlOf(p) {
+  if (!p.priceStale) return isFinite(+p.unrealized) && p.unrealized != null ? +p.unrealized : NaN;
+  return p.exchangeMark && isFinite(+p.exchangeMark.unrealizedPnl) ? +p.exchangeMark.unrealizedPnl : NaN;
+}
+
+function pnlCell(p) {
+  const v = pnlOf(p);
+  if (!isFinite(v)) return "No disponible";
+  return v.toFixed(2) + (p.priceStale ? " (Blofin)" : "");
+}
+
 function fmtR(v) {
   if (v === null || v === undefined || v === "") return "-";
   const n = +v;
@@ -291,41 +302,30 @@ function render(s) {
   const maxPos = (s.settings && Number.isFinite(+s.settings.maxPositions))
     ? +s.settings.maxPositions : 5;
   const stalePrices = positions.some((p) => p.priceStale);
-  const unrealized = positions.reduce((sum, p) => sum + (+p.unrealized || 0), 0);
-  const equity = (+s.balance || 0) + unrealized;
-  $("balance").textContent = (+s.balance || 0).toLocaleString(undefined, { maximumFractionDigits: 0 }) + " USDT";
-  // PnL of the active book only (paper or demo, each with its own initial balance).
-  if (s.initialBalance == null) {
-    $("pnl").textContent = "—";
-    $("pnl").className = "value";
-  } else {
-    const pnl = (+s.balance || 0) - (+s.initialBalance || 0);
-    $("pnl").textContent = (pnl >= 0 ? "+" : "") + pnl.toFixed(2);
-    $("pnl").className = "value " + (pnl >= 0 ? "positive" : "negative");
-  }
-  $("unreal").textContent = (unrealized >= 0 ? "+" : "") + unrealized.toFixed(2);
-  $("unreal").className = "value " + (unrealized >= 0 ? "positive" : "negative");
-  // Demo: equity is read from the Blofin account (refreshed every reconcile,
-  // ~60 s), not rebuilt from local prices. Older than 180 s = not shown.
-  const acc = s.exchangeAccount;
-  const accAge = acc && acc.fetchedAtMs ? (Date.now() - acc.fetchedAtMs) / 1000 : Infinity;
-  const demoEq = s.tradingMode === "demo" && acc && acc.totalEquity != null && accAge <= 180;
-  if (demoEq) {
-    $("equity").textContent = (+acc.totalEquity).toLocaleString(undefined, { maximumFractionDigits: 2 }) + " USDT";
-    $("equity").title = "Blofin demo, hace " + Math.max(0, Math.round(accAge)) + " s";
-  } else {
-    $("equity").textContent = stalePrices ? "Sin precio Blofin fresco" : equity.toLocaleString(undefined, { maximumFractionDigits: 2 }) + " USDT";
-  }
-  if (stalePrices) {
-    const ex = positions.filter((p) => p.priceStale && p.exchangeMark);
-    $("unreal").textContent = ex.length === positions.filter((p) => p.priceStale).length && ex.length
-      ? positions.reduce((sum, p) => sum + (p.priceStale ? +p.exchangeMark.unrealizedPnl : (+p.unrealized || 0)), 0).toFixed(2) + " (Blofin)"
-      : "No disponible";
-  }
+  // All money figures come from the server (s.display): one clock, one rule.
+  // Demo equity is Blofin's own totalEquity (it already includes unrealized PnL).
+  const d = s.display || {};
+  const money = (v, digits) => (v == null || !isFinite(+v)) ? null
+    : (+v).toLocaleString(undefined, { maximumFractionDigits: digits });
+  const signed = (v) => (v == null || !isFinite(+v)) ? null : ((+v >= 0 ? "+" : "") + (+v).toFixed(2));
+  const setSigned = (id, v, fallback) => {
+    const txt = signed(v);
+    $(id).textContent = txt == null ? fallback : txt;
+    $(id).className = "value" + (txt == null ? "" : (+v >= 0 ? " positive" : " negative"));
+  };
+  const bal = money(d.balance, 0);
+  $("balance").textContent = bal == null ? "—" : bal + " USDT";
+  setSigned("pnl", d.pnlTotal, "—");
+  setSigned("unreal", d.unrealized, positions.length ? "No disponible" : "+0.00");
+  if (d.unrealizedSource === "blofin" && signed(d.unrealized) != null) $("unreal").textContent += " (Blofin)";
+  const eq = money(d.equity, 2);
+  $("equity").textContent = eq == null ? (d.unavailable ? d.unavailable.charAt(0).toUpperCase() + d.unavailable.slice(1) : "—") : eq + " USDT";
+  const accAge = s.exchangeAccount && s.exchangeAccount.ageSeconds;
+  $("equity").title = d.equitySource === "blofin" && accAge != null ? "Blofin demo, hace " + Math.round(accAge) + " s" : "";
   $("posCount").textContent = positions.length + "/" + maxPos;
-  $("posSummary").textContent = stalePrices ? "PnL/equity no disponibles: falta precio Blofin fresco" : positions.length + "/" + maxPos + " posiciones · PnL no realizado "
-    + (unrealized >= 0 ? "+" : "") + unrealized.toFixed(2)
-    + " · Equity " + equity.toFixed(2);
+  $("posSummary").textContent = positions.length + "/" + maxPos + " posiciones · PnL no realizado "
+    + (signed(d.unrealized) == null ? "no disponible" : signed(d.unrealized))
+    + " · Equity " + (eq == null ? "no disponible" : eq);
   const hist = s.history || [];
   const wins = hist.filter((t) => t.pnl > 0).length;
   $("winrate").textContent = hist.length ? Math.round(wins / hist.length * 100) + "%" : "-";
@@ -405,9 +405,9 @@ function render(s) {
     return `<tr>
       <td><strong>${esc(String(p.pair).replace("-USDT", ""))}</strong></td>
       <td>${esc(String(p.side).toUpperCase())}</td>
-      <td>${fmt(p.entry)}</td><td>${p.priceStale ? (p.exchangeMark ? fmt(p.exchangeMark.markPrice) + " (Blofin)" : "Sin precio fresco") : fmt(p.price)}</td><td>${fmt(p.sl)}</td>
+      <td>${fmt(p.entry)}</td><td>${p.priceStale ? (p.exchangeMark && isFinite(+p.exchangeMark.markPrice) ? fmt(p.exchangeMark.markPrice) + " (Blofin)" : "Sin precio fresco") : fmt(p.price)}</td><td>${fmt(p.sl)}</td>
       <td>${trailOn ? '<span class="trail-badge">Trailing activo</span>' : tpCell}</td>
-      <td class="${(+p.unrealized || 0) >= 0 ? "positive" : "negative"}">${p.priceStale ? (p.exchangeMark ? (+p.exchangeMark.unrealizedPnl).toFixed(2) + " (Blofin)" : "No disponible") : (+p.unrealized || 0).toFixed(2)}</td>
+      <td class="${pnlOf(p) >= 0 ? "positive" : "negative"}">${pnlCell(p)}</td>
       <td>${esc(when)}</td>
       <td><button class="danger mini" type="button" data-close-pair="${esc(p.pair)}" ${busy ? "disabled" : ""}>Cerrar</button></td>
     </tr>`;
@@ -415,8 +415,8 @@ function render(s) {
 
   $("historyTrades").innerHTML = hist.slice(0, 30).map((t) => `
     <tr>
-      <td>${t.time}</td><td>${String(t.pair).replace("-USDT", "")}</td><td>${String(t.side).toUpperCase()}</td>
-      <td class="${t.pnl >= 0 ? "positive" : "negative"}">${(+t.pnl).toFixed(2)}</td>
+      <td>${esc(t.time == null ? "-" : String(t.time))}</td><td>${esc(String(t.pair).replace("-USDT", ""))}</td><td>${esc(String(t.side).toUpperCase())}</td>
+      <td class="${(+t.pnl || 0) >= 0 ? "positive" : "negative"}">${isFinite(+t.pnl) && t.pnl != null ? (+t.pnl).toFixed(2) : "-"}</td>
       <td>${fmtR(t.tradeR != null ? t.tradeR : t.rMultiple)}</td>
       <td>${esc(motivo(t.reason))}</td>
     </tr>

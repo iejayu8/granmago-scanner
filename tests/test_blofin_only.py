@@ -71,6 +71,8 @@ class BlofinOnlyTest(unittest.TestCase):
         server._NEXT_REQUEST_AT = 0
         server._INSTRUMENTS.clear()
         server._PAIR_HEALTH.clear()
+        server._CLOSE_TRIES.clear()
+        server._DEMO_UNIVERSE.update(ids=None, at=None, missing=[])
         self.spacing = patch.object(server, 'HTTP_MIN_INTERVAL', 0)
         self.spacing.start()
         self.addCleanup(self.spacing.stop)
@@ -93,9 +95,13 @@ class BlofinOnlyTest(unittest.TestCase):
 
     def http(self, session, method, url, **kw):
         self.assertEqual(method.upper(), 'GET')
-        self.assertTrue(url.startswith(server.BLOFIN_MARKET), url)
+        self.assertTrue(url.startswith(server.BLOFIN_MARKET) or url.startswith(server.DEMO_MARKET), url)
         self.assertFalse(kw.get('allow_redirects', True))
         self.urls.append(url)
+        if url.startswith(server.DEMO_MARKET):
+            # Public demo instrument list (1.7.2 demo universe); IOST is not on demo.
+            demo = getattr(self, 'demo_pairs', [p for p in server.LIQUID_PAIRS if p != 'IOST-USDT'])
+            return response(dict(code='0', data=[instrument(p) for p in demo]))
         pair = parse_qs(urlsplit(url).query)['instId'][0]
         if self.http_status != 200:
             return response(status=self.http_status)

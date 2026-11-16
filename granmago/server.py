@@ -119,6 +119,14 @@ QUOTE_MAX_AGE_SECONDS = 10
 # right before acting; this only stops the PnL/equity flicker between cycles.
 DISPLAY_MAX_AGE_SECONDS = 30
 INSTRUMENTS_TTL_SECONDS = 600
+# Panel: Blofin account / mark data older than this is not shown (reconcile
+# refreshes it every RECONCILE_SECONDS = 60 s).
+ACCOUNT_DISPLAY_MAX_AGE_SECONDS = 180
+# Local clock vs Blofin Date header. Freshness checks compare Blofin ts with
+# the local clock, so a skew close to QUOTE_MAX_AGE_SECONDS rejects every quote.
+CLOCK_SKEW_ALERT_SECONDS = 3
+CLOSE_RETRY_SECONDS = 15
+DEMO_MARKET = "https://demo-trading-openapi.blofin.com/api/v1/market/"
 # Blofin publishes a new 4H/1D candle ~70 s after the boundary (measured
 # 14/11/2026). The just-closed candle stays acceptable for 180 s.
 CANDLE_CLOSE_GRACE_SECONDS = 180
@@ -251,9 +259,45 @@ def parse_pairs(value, fallback=None):
 
 
 def active_pairs():
-    """Pairs the scanner walks. Open positions outside this list stay monitored."""
+    """Pairs the scanner walks. Open positions outside this list stay monitored.
+
+    In demo, pairs that do not exist on the demo endpoint (e.g. IOST-USDT) are
+    left out, using the cached demo instrument list (no network here)."""
     settings = _settings()
-    return parse_pairs(settings.get("pairs"), LIQUID_PAIRS)
+    pairs = parse_pairs(settings.get("pairs"), LIQUID_PAIRS)
+    demo = _DEMO_UNIVERSE.get("ids")
+    if TRADER is not None and demo:
+        pairs = [p for p in pairs if p in demo]
+    return pairs
+
+
+_DEMO_UNIVERSE = {"ids": None, "at": None, "missing": []}
+
+
+def refresh_demo_universe(force=False):
+    """Public demo instrument list, cached INSTRUMENTS_TTL_SECONDS. Call
+    outside LOCK. On failure the previous list (or no filter) is kept."""
+    if TRADER is None:
+        return _DEMO_UNIVERSE.get("ids")
+    now = time.monotonic()
+    if not force and _DEMO_UNIVERSE["at"] is not None and now - _DEMO_UNIVERSE["at"] < INSTRUMENTS_TTL_SECONDS:
+        return _DEMO_UNIVERSE["ids"]
+    body = fetch_json(DEMO_MARKET + "instruments")
+    try:
+        items = body["data"] if isinstance(body, dict) and str(body.get("code")) == "0" else None
+        ids = {i["instId"] for i in items if isinstance(i, dict) and i.get("state") == "live"} if items else None
+    except (KeyError, TypeError):
+        ids = None
+    if not ids:
+        _record_market("demo:universe", False, last_fail_reason() or "sin lista")
+        return _DEMO_UNIVERSE.get("ids")
+    configured = parse_pairs(_settings().get("pairs"), LIQUID_PAIRS)
+    missing = sorted(p for p in configured if p not in ids)
+    if missing != _DEMO_UNIVERSE.get("missing"):
+        with LOCK:
+            add_log("Pares sin instrumento en Blofin demo (no se escanean en demo): %s" % (", ".join(missing) or "ninguno"))
+    _DEMO_UNIVERSE.update(ids=ids, at=now, missing=missing)
+    return ids
 
 
 def _apply_runtime_options(settings):
@@ -1077,15 +1121,88 @@ def public_state():
             snap[name] = {"balance": book.get("balance"), "initialBalance": book.get("initialBalance"),
                           "trades": len(book.get("history") or []), "openPositions": len(book.get("openPositions") or []),
                           "at": book.get("at")}
+    now_ms = now_epoch() * 1000
     for pos in snap.get("openPositions", []):
         mark = pos.get("lastMarket") or {}
-        stale = (pos.get("priceStale", False) or mark.get("source") != "Blofin"
-                 or not _fresh_timestamp(mark.get("ts"), DISPLAY_MAX_AGE_SECONDS))
+        # Display staleness = age of the last good Blofin quote. A single failed
+        # refresh (pos["priceStale"] set by the monitor) does not blank a price
+        # that is still within DISPLAY_MAX_AGE_SECONDS.
+        stale = (mark.get("source") != "Blofin" or not _fresh_timestamp(mark.get("ts"), DISPLAY_MAX_AGE_SECONDS))
         pos["priceStale"] = stale
         if stale:
             pos["price"] = None
             pos["unrealized"] = None
+        ex = pos.get("exchangeMark")
+        if isinstance(ex, dict):
+            age = _age_seconds(ex.get("atMs"), now_ms)
+            if age is None or age > ACCOUNT_DISPLAY_MAX_AGE_SECONDS:
+                pos["exchangeMark"] = None
+            else:
+                ex["ageSeconds"] = age
+    acc = snap.get("exchangeAccount")
+    if isinstance(acc, dict):
+        acc["ageSeconds"] = _age_seconds(acc.get("fetchedAtMs"), now_ms)
+    snap["display"] = _display_figures(snap)
     return snap
+
+
+def _age_seconds(ms, now_ms):
+    try:
+        age = (now_ms - float(ms)) / 1000.0
+    except (TypeError, ValueError):
+        return None
+    return round(age, 1) if math.isfinite(age) and age >= -QUOTE_FUTURE_SECONDS else None
+
+
+def _num_or_none(value):
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def _display_figures(snap):
+    """Balance, equity and PnL the panel shows: one source of truth, computed
+    on the server clock. Demo equity comes from Blofin (it already contains the
+    unrealized PnL) and is never rebuilt as balance + unrealized."""
+    positions = [p for p in snap.get("openPositions") or [] if isinstance(p, dict)]
+    demo = snap.get("tradingMode") == "demo"
+    initial = _num_or_none(snap.get("initialBalance"))
+    out = {"mode": snap.get("tradingMode"), "balance": None, "equity": None, "equitySource": None,
+           "unrealized": None, "unrealizedSource": None, "pnlTotal": None, "unavailable": None}
+    local_ok = all(not p.get("priceStale") for p in positions)
+    if local_ok:
+        out["unrealized"] = round(sum(_num_or_none(p.get("unrealized")) or 0.0 for p in positions), 2)
+        out["unrealizedSource"] = "local"
+    elif demo and all((not p.get("priceStale")) or p.get("exchangeMark") for p in positions):
+        out["unrealized"] = round(sum((_num_or_none(p.get("unrealized")) or 0.0) if not p.get("priceStale")
+                                      else (_num_or_none(p["exchangeMark"].get("unrealizedPnl")) or 0.0)
+                                      for p in positions), 2)
+        out["unrealizedSource"] = "blofin"
+    if demo:
+        acc = snap.get("exchangeAccount") if isinstance(snap.get("exchangeAccount"), dict) else {}
+        age = acc.get("ageSeconds")
+        fresh = age is not None and age <= ACCOUNT_DISPLAY_MAX_AGE_SECONDS
+        total = _num_or_none(acc.get("totalEquity")) if fresh else None
+        if total is None:
+            out["unavailable"] = "sin saldo Blofin reciente" if acc else "esperando el primer saldo de Blofin"
+        else:
+            out["equity"], out["equitySource"] = round(total, 2), "blofin"
+            cash = _num_or_none(acc.get("balance"))
+            out["balance"] = round(cash if cash is not None else total, 2)
+            if initial is not None:
+                out["pnlTotal"] = round(total - initial, 2)
+        return out
+    bal = _num_or_none(snap.get("balance"))
+    out["balance"] = None if bal is None else round(bal, 2)
+    if bal is not None and initial is not None:
+        out["pnlTotal"] = round(bal - initial, 2)
+    if bal is not None and out["unrealized"] is not None:
+        out["equity"], out["equitySource"] = round(bal + out["unrealized"], 2), "local"
+    elif positions:
+        out["unavailable"] = "sin precio Blofin fresco"
+    return out
 
 
 def ema(values, period):
@@ -1359,7 +1476,35 @@ _FAIL = threading.local()
 
 
 def _endpoint_name(url):
+    if url.startswith(DEMO_MARKET):
+        return "demo:" + url[len(DEMO_MARKET):].split("?", 1)[0]
     return url[len(BLOFIN_MARKET):].split("?", 1)[0] if url.startswith(BLOFIN_MARKET) else "?"
+
+
+_CLOCK = {"skew": None, "samples": deque(maxlen=20), "alerted": False}
+
+
+def _note_clock(date_header):
+    """Local clock minus Blofin's HTTP Date (1 s resolution, median of 20)."""
+    if not date_header or _clock is not None:
+        return
+    try:
+        from email.utils import parsedate_to_datetime
+        sample = time.time() - parsedate_to_datetime(date_header).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return
+    with _STATS_LOCK:
+        _CLOCK["samples"].append(sample)
+        ordered = sorted(_CLOCK["samples"])
+        _CLOCK["skew"] = round(ordered[len(ordered) // 2], 1)
+        alert = len(ordered) >= 5 and abs(_CLOCK["skew"]) > CLOCK_SKEW_ALERT_SECONDS and not _CLOCK["alerted"]
+        if alert:
+            _CLOCK["alerted"] = True
+        elif abs(_CLOCK["skew"]) <= CLOCK_SKEW_ALERT_SECONDS:
+            _CLOCK["alerted"] = False
+    if alert:
+        _alert("reloj", "El reloj local difiere %.1f s de Blofin: los precios pueden rechazarse como obsoletos "
+                        "(límite %d s). Sincroniza la hora (NTP) de Home Assistant." % (_CLOCK["skew"], QUOTE_MAX_AGE_SECONDS))
 
 
 def _record_market(endpoint, ok, reason=None, latency=None):
@@ -1402,7 +1547,9 @@ def market_stats():
                          "reasons": dict(st["reasons"]),
                          "p50ms": _pct(st["lat"], 0.5), "p95ms": _pct(st["lat"], 0.95)}
         pairs = {p: dict(h) for p, h in _PAIR_HEALTH.items() if h.get("failures") or h.get("degraded")}
-    return {"endpoints": out, "pairs": pairs, "degraded": sorted(p for p, h in pairs.items() if h.get("degraded"))}
+        skew = _CLOCK["skew"]
+    return {"endpoints": out, "pairs": pairs, "degraded": sorted(p for p, h in pairs.items() if h.get("degraded")),
+            "clockSkewSeconds": skew}
 
 
 def note_pair(pair, ok, reason=None):
@@ -1415,8 +1562,12 @@ def note_pair(pair, ok, reason=None):
             recovered = h["degraded"]
             h.update(failures=0, degraded=False, since=None, lastReason=None)
         else:
+            if h.get("lastFail") is not None and now - h["lastFail"] > PAIR_DEGRADED_SECONDS and not h["degraded"]:
+                # A pair priced rarely (no position): an old failure is not a streak.
+                h.update(failures=0, since=None)
             h["failures"] += 1
             h["lastReason"] = reason
+            h["lastFail"] = now
             if h["since"] is None:
                 h["since"] = now
             if not h["degraded"] and (h["failures"] >= PAIR_DEGRADED_FAILURES
@@ -1494,7 +1645,7 @@ def fetch_json(url, *, deadline=None):
     exact reason is available from last_fail_reason() and counted per endpoint.
     """
     global _RATE_LIMIT_UNTIL
-    if not url.startswith(BLOFIN_MARKET):
+    if not (url.startswith(BLOFIN_MARKET) or url.startswith(DEMO_MARKET)):
         raise ValueError("only Blofin public market data is allowed")
     endpoint = _endpoint_name(url)
     _set_fail(None)
@@ -1531,6 +1682,7 @@ def fetch_json(url, *, deadline=None):
                     payload.extend(chunk)
                 body = json.loads(payload)
                 _record_market(endpoint, True, latency=time.monotonic() - started)
+                _note_clock(resp.headers.get("Date"))
                 return body
             if resp.status_code not in (408, 429, 500, 502, 503, 504):
                 log.warning("Blofin GET %s HTTP %s: no se reintenta", endpoint, resp.status_code)
@@ -1871,6 +2023,8 @@ def scan_all():
     if not SCAN_LOCK.acquire(blocking=False):
         return None
     try:
+        refresh_demo_universe()
+        scan_started = time.monotonic()
         with LOCK:
             pairs = active_pairs()
             add_log("Escaneo de %d pares..." % len(pairs))
@@ -1924,6 +2078,11 @@ def scan_all():
             STATE["bestLong"] = best_l[0] if best_l else None
             STATE["bestShort"] = best_s[0] if best_s else None
             STATE["lastScanAt"] = _now()
+            STATE["lastScanSeconds"] = round(time.monotonic() - scan_started, 1)
+            if STATE["lastScanSeconds"] > SCAN_MAX_AGE_SECONDS * 0.8:
+                # Rows analysed at the start would be too old for maybe_open.
+                add_log("AVISO: el escaneo tardó %.0f s (límite de vigencia %d s): señales del principio "
+                        "del escaneo pueden descartarse." % (STATE["lastScanSeconds"], SCAN_MAX_AGE_SECONDS))
             STATE["lastTickAt"] = _now()
             bl = STATE["bestLong"]
             bs = STATE["bestShort"]
@@ -2982,9 +3141,56 @@ def _fmt_num(value):
     return text or "0"
 
 
+# ------------------------------------------------------------ supervision
+# Each background loop beats once per iteration. _supervised restarts a loop
+# that raised or returned while the process is still running; /api/health
+# reports the age of every beat (a hung loop shows up as stale).
+THREADS = {}
+THREAD_STALE_SECONDS = {"granmago-monitor": 60, "granmago-scan": 900, "granmago-trading": 120}
+
+
+def _beat(name):
+    with _STATS_LOCK:
+        t = THREADS.setdefault(name, {"restarts": 0, "lastError": None})
+        t["beat"] = time.monotonic()
+
+
+def _supervised(name, target, pause=5.0):
+    def run():
+        while not STOP.is_set():
+            _beat(name)
+            try:
+                target()
+            except Exception as exc:  # never let a loop die silently
+                log.exception("hilo %s", name)
+                with _STATS_LOCK:
+                    THREADS[name]["lastError"] = "%s: %s" % (type(exc).__name__, str(exc)[:120])
+            if STOP.is_set():
+                return
+            with _STATS_LOCK:
+                THREADS[name]["restarts"] += 1
+            _alert("hilo", "%s se reinicia (%s)" % (name, THREADS[name].get("lastError") or "terminó"))
+            if STOP.wait(pause):
+                return
+    return run
+
+
+def thread_health():
+    now = time.monotonic()
+    with _STATS_LOCK:
+        out = {}
+        for name, t in THREADS.items():
+            age = None if t.get("beat") is None else round(now - t["beat"], 1)
+            limit = THREAD_STALE_SECONDS.get(name, 300)
+            out[name] = {"beatAgeSeconds": age, "restarts": t["restarts"], "lastError": t["lastError"],
+                         "stale": age is None or age > limit}
+    return out
+
+
 def scan_loop():
     """Full market scan on the scan interval, whether or not a position is open."""
     while not STOP.is_set():
+        _beat("granmago-scan")
         with LOCK:
             running = STATE["running"]
             has_pos = bool(STATE.get("openPositions"))
@@ -3011,6 +3217,7 @@ def scan_loop():
 def monitor_loop():
     """SL/TP, then the trailing stop once it is active. Independent of the scan."""
     while not STOP.is_set():
+        _beat("granmago-monitor")
         with LOCK:
             running = STATE["running"]
             has_pos = bool(STATE.get("openPositions"))
@@ -3237,6 +3444,12 @@ def _exchange_book():
 
 def _open_on_exchange(plan, quote):
     pair = plan["pair"]
+    demo_ids = _DEMO_UNIVERSE.get("ids")
+    if demo_ids and pair not in demo_ids:
+        with LOCK:
+            STATE.get("opening", {}).pop(pair, None)
+            add_log("Entrada DEMO %s no enviada: el instrumento no existe en Blofin demo." % pair)
+        return False
     try:
         fill = TRADER.open_position({
             "pair": pair, "side": plan["side"], "notional": plan["notional"], "entry": quote.price,
@@ -3346,13 +3559,21 @@ def _settle_closed(pos, reason=None):
     return True
 
 
+_CLOSE_TRIES = {}
+
+
 def trading_cycle(force_reconcile=False):
     """One pass of the demo worker: closes, stop moves, reconcile, balance."""
     global _LAST_RECONCILE, _LAST_FX
     if TRADER is None:
         return
     with LOCK:
-        closes = [p for p in _positions() if p.get("exchange") and p.get("closeRequested")]
+        mono = time.monotonic()
+        # In memory only (monotonic clock): a restart retries at once.
+        closes = [p for p in _positions() if p.get("exchange") and p.get("closeRequested")
+                  and mono - _CLOSE_TRIES.get(p.get("clientOrderId") or p["pair"], -1e9) >= CLOSE_RETRY_SECONDS]
+        for p in closes:
+            _CLOSE_TRIES[p.get("clientOrderId") or p["pair"]] = mono
         moves = [p for p in _positions() if p.get("exchange") and p.get("slDirty") and not p.get("closeRequested")]
     for pos in closes:
         reason = pos["closeRequested"]["reason"]
@@ -3445,6 +3666,7 @@ def trading_cycle(force_reconcile=False):
 
 def trading_loop():
     while not STOP.is_set():
+        _beat("granmago-trading")
         try:
             trading_cycle()
         except Exception:
@@ -3462,8 +3684,10 @@ def health():
         last_tick = STATE.get("lastTickAt")
     stats = market_stats()
     trading = TRADER.status() if TRADER is not None else {"mode": trading_mode()}
-    ok = (not TRADING_ERROR) and (TRADER is None or TRADER.safe)
+    threads = thread_health()
+    ok = (not TRADING_ERROR) and (TRADER is None or TRADER.safe) and not any(t["stale"] for t in threads.values())
     return {
+        "threads": threads, "clockSkewSeconds": stats.get("clockSkewSeconds"),
         "version": VERSION, "mode": trading_mode(), "running": running, "killSwitch": kill,
         "openPositions": open_n, "lastTickAt": last_tick, "ok": ok, "tradingError": TRADING_ERROR,
         "degradedPairs": stats["degraded"], "safe": trading.get("safe", True),
@@ -3708,7 +3932,8 @@ def main():
     init_trading()
     if TRADER is not None:
         start_trading()
-        threading.Thread(target=trading_loop, name="granmago-trading", daemon=True).start()
+        threading.Thread(target=_supervised("granmago-trading", trading_loop), name="granmago-trading",
+                         daemon=True).start()
     with LOCK:
         add_log("Mercado exclusivo Blofin: libro (mid, ts del libro ≤ %ds) para entradas, PnL y cierres; sin fallback." % QUOTE_MAX_AGE_SECONDS)
         add_log("Umbral de entrada: %d." % entry_threshold())
@@ -3753,8 +3978,9 @@ def main():
         if STATE["running"]:
             add_log("Bot reanudado al arrancar el complemento.")
         save_state()
-    threading.Thread(target=monitor_loop, name="granmago-monitor", daemon=True).start()
-    threading.Thread(target=scan_loop, name="granmago-scan", daemon=True).start()
+    threading.Thread(target=_supervised("granmago-monitor", monitor_loop), name="granmago-monitor",
+                     daemon=True).start()
+    threading.Thread(target=_supervised("granmago-scan", scan_loop), name="granmago-scan", daemon=True).start()
     log.info(
         "GranMago Scanner %s on 0.0.0.0:%s data=%s entry_threshold=%s max_positions=%s risk_pct=%s leverage=%s trailing=%s activation_pct=%s activation_r=%s distance=%s fees=%s slip=%s regime=%s",
         VERSION,

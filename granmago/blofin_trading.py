@@ -504,7 +504,7 @@ class DemoTrader:
                 detail = self.order_detail(inst_id, cid=cid)
                 if detail:
                     return detail
-            except AmbiguousResult:
+            except (AmbiguousResult, RateLimited, BlofinError):
                 pass
             self._sleep(spacing)
         return None
@@ -571,7 +571,11 @@ class DemoTrader:
                 else:
                     self.intents.append({"clientOrderId": cid, "status": "rejected", "code": exc.code, "msg": exc.msg})
                     return self._refuse(plan, str(exc))
-            except (AmbiguousResult, RateLimited) as exc:
+            except RateLimited as exc:
+                # The limiter refuses BEFORE anything is sent: not ambiguous.
+                self.intents.append({"clientOrderId": cid, "status": "not_sent", "reason": "rate_limit"})
+                return self._refuse(plan, "presupuesto de peticiones agotado, no enviada: %s" % exc)
+            except AmbiguousResult as exc:
                 self.alert("Entrada %s %s ambigua (%s): consulto por clientOrderId, no reenvío." % (side, pair, exc))
                 detail = self._lookup_after_ambiguity(pair, cid)
                 if not detail:
@@ -613,12 +617,18 @@ class DemoTrader:
         # "effective" means the trigger already fired: it no longer protects.
         return [t for t in data if t.get("state") in ("live", None)]
 
-    def ensure_protection(self, pair, side, sl, tp, cid_base):
-        """SL must exist on the exchange. Returns tpslId ('attached' if attached), or None after closing."""
+    def ensure_protection(self, pair, side, sl, tp, cid_base, attempts=3, spacing=0.5):
+        """SL must exist on the exchange. Returns tpslId ('attached' if attached), or None after closing.
+
+        The attached SL/TP may show up in orders-tpsl-pending a moment after the
+        fill, so look a few times before placing a second one."""
         try:
-            for t in self.active_tpsl(pair):
-                if t.get("instId") == pair and t.get("slTriggerPrice"):
-                    return str(t.get("tpslId") or "attached")
+            for i in range(max(1, attempts)):
+                for t in self.active_tpsl(pair):
+                    if t.get("instId") == pair and t.get("slTriggerPrice"):
+                        return str(t.get("tpslId") or "attached")
+                if i + 1 < attempts:
+                    self._sleep(spacing)
             data = self.client.request("POST", "/api/v1/trade/order-tpsl", body={
                 "instId": pair, "marginMode": "isolated", "positionSide": "net",
                 "side": "sell" if side == "long" else "buy",
