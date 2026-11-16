@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.7.3
+
+- **Panel demo: saldo libre y margen en uso.** En demo la tarjeta "Balance (Blofin demo)" mostraba `details[USDT].balance` ("Cash balance"), que excluye el margen aislado de las posiciones abiertas: 838 junto a una Equity de 1000,43 parecía dinero perdido. Ahora:
+  - La tarjeta se llama **"Saldo libre (fuera de posiciones)"** y muestra `details[USDT].available` ("Available balance" en la doc de Blofin), con 2 decimales. Si Blofin no lo envía, usa `balance`.
+  - Nueva tarjeta **"Margen en uso"** (solo en demo). Es la suma del campo `margin` de cada posición en `GET /api/v1/account/positions` (`initialMargin` en las de margen cruzado), leída en la misma reconciliación que el saldo. Si las posiciones no se pueden leer, se usa `details[USDT].isolatedEquity − isolatedUnrealizedPnl`.
+  - Las dos tarjetas llevan un tooltip: "Equity = saldo libre + margen en uso + PnL no realizado (Blofin)".
+  - La Equity sigue siendo `totalEquity`. Paper no cambia.
+- `exchangeAccount` guarda además `positionsMargin`, `currencyIsolatedEquity`, `frozen`, `orderFrozen` y `availableEquity`. `display` añade `balanceSource`, `marginUsed` y `marginSource`.
+- Tests:
+  - contrato del panel con la etiqueta, la tarjeta y los tooltips en los 14 estados, y la identidad saldo libre + margen + no realizado = Equity;
+  - ejemplos literales de la doc (balance y positions) con sus alternativas de reserva;
+  - FakeBlofin descuenta el margen aislado del saldo, como la cuenta demo real.
+
 ## 1.7.2
 
 - **"Equity: Sin precio Blofin fresco" / "No disponible" intermitente.** 1.7.0 bajó el límite de frescura del precio a 10 s (ts del libro) pero el vigilante de posiciones seguía refrescando cada 20 s: durante ~la mitad de cada ciclo el panel marcaba las posiciones como sin precio. Ahora el vigilante refresca cada 5 s y el panel solo llama "sin precio" a un precio de más de 30 s (`DISPLAY_MAX_AGE_SECONDS`). La ejecución (SL/TP, entradas, cierres) sigue exigiendo un precio de ≤ 10 s pedido justo antes de actuar.

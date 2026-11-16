@@ -56,7 +56,8 @@ CONTRACT = {
     "exchangeAccount": (dict, type(None)),
 }
 DISPLAY = {"mode": (str,), "balance": OPT_NUM, "equity": OPT_NUM, "equitySource": OPT_STR,
-           "unrealized": OPT_NUM, "unrealizedSource": OPT_STR, "pnlTotal": OPT_NUM, "unavailable": OPT_STR}
+           "unrealized": OPT_NUM, "unrealizedSource": OPT_STR, "pnlTotal": OPT_NUM, "unavailable": OPT_STR,
+           "balanceSource": OPT_STR, "marginUsed": OPT_NUM, "marginSource": OPT_STR}
 POSITION = {"pair": (str,), "side": (str,), "entry": NUM, "sl": NUM, "tp": NUM, "priceStale": (bool,),
             "price": OPT_NUM, "unrealized": OPT_NUM}
 
@@ -165,6 +166,22 @@ class PanelContractTest(unittest.TestCase):
         self.assertEqual(d["demo_local_stale_blofin_mark"]["unrealizedSource"], "blofin")
         self.assertEqual(d["demo_account_stale"]["unavailable"], "sin saldo Blofin reciente")
         self.assertIsNone(states["demo_account_stale"]["openPositions"][0]["exchangeMark"])
+        # 1.7.3: demo shows the free balance (details.available) and the margin in use
+        # (sum of the positions' `margin`); equity = free + margin + unrealized.
+        for name in ("demo_position", "demo_local_stale_blofin_mark", "demo_stopped_position", "demo_safe_state"):
+            dd, acc = d[name], states[name]["exchangeAccount"]
+            self.assertEqual(dd["balanceSource"], "available", name)
+            self.assertEqual(dd["balance"], round(acc["available"], 2), name)
+            self.assertEqual(dd["marginSource"], "positions", name)
+            self.assertGreater(dd["marginUsed"], 0, name)
+            self.assertAlmostEqual(dd["balance"] + dd["marginUsed"] + acc["isolatedUnrealizedPnl"], dd["equity"],
+                                   delta=0.02, msg=name)
+        self.assertEqual(d["demo_empty"]["marginUsed"], 0)
+        self.assertEqual(d["demo_empty"]["balance"], d["demo_empty"]["equity"])
+        for name, snap in states.items():
+            if snap["tradingMode"] != "demo":
+                self.assertIsNone(d[name]["marginUsed"], name)
+                self.assertIsNone(d[name]["balanceSource"], name)
 
         node, env = _jsdom_env()
         if not node:
@@ -204,6 +221,19 @@ class PanelContractTest(unittest.TestCase):
         self.assertTrue(rendered["demo_position"]["resetDisabled"])
         self.assertFalse(rendered["paper_position"]["resetDisabled"])
         self.assertIn("-", t["paper_odd_history"]["historyTrades"])
+        for name, r in rendered.items():
+            demo = states[name]["tradingMode"] == "demo"
+            self.assertEqual(r["texts"]["balanceLabel"], "Saldo libre (fuera de posiciones)" if demo else "Balance", name)
+            self.assertEqual(r["marginHidden"], not demo, name)
+            self.assertNotIn("Balance (Blofin demo)", json.dumps(r["texts"]), name)
+            if not demo:
+                self.assertEqual(r["balanceTitle"], "", name)
+        self.assertRegex(t["demo_position"]["marginUsed"], r"^\d[\d.,]* USDT$")
+        self.assertRegex(t["demo_position"]["balance"], r"^\d[\d.,]*\.\d\d USDT$")
+        self.assertIn("Equity = saldo libre + margen en uso", rendered["demo_position"]["balanceTitle"])
+        self.assertIn("suma de 'margin'", rendered["demo_position"]["marginTitle"])
+        self.assertEqual(t["demo_waiting_balance"]["marginUsed"], "—")
+        self.assertEqual(t["demo_empty"]["marginUsed"], "0 USDT")
 
 
 if __name__ == "__main__":

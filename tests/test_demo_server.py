@@ -343,14 +343,20 @@ class DemoServerTest(unittest.TestCase):
         self.fake.prices[PAIR] = 620.0
         server.trading_cycle(force_reconcile=True)
         acc = server.STATE["exchangeAccount"]
-        self.assertEqual((acc["totalEquity"], acc["balance"], acc["available"]), (1000.5, 1000.5, 1000.5))
         mark = server.STATE["openPositions"][0]["exchangeMark"]
         self.assertEqual(mark["markPrice"], 620.0)
         self.assertGreater(mark["unrealizedPnl"], 0)
+        # Isolated margin leaves available/balance (real demo: 838 next to 1000.43).
+        self.assertGreater(acc["positionsMargin"], 0)
+        self.assertAlmostEqual(acc["available"] + acc["positionsMargin"] + mark["unrealizedPnl"], acc["totalEquity"], places=6)
+        self.assertAlmostEqual(acc["available"] + acc["positionsMargin"], 1000.5, places=6)
         state = self.client.get("/api/state").get_json()
-        self.assertEqual(state["exchangeAccount"]["totalEquity"], 1000.5)
+        self.assertEqual(state["exchangeAccount"]["totalEquity"], acc["totalEquity"])
+        d = state["display"]
+        self.assertEqual((d["equity"], d["balance"], d["marginUsed"]),
+                         (round(acc["totalEquity"], 2), round(acc["available"], 2), round(acc["positionsMargin"], 2)))
         persist()
-        self.assertEqual(server.load_state()["exchangeAccount"]["totalEquity"], 1000.5)
+        self.assertEqual(server.load_state()["exchangeAccount"]["totalEquity"], acc["totalEquity"])
 
     def test_reset_and_settings_refused_in_demo(self):
         self.demo()

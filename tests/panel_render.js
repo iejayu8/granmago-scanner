@@ -7,7 +7,7 @@ const html = fs.readFileSync(process.argv[2], "utf8").replace(/__INGRESS__/g, ""
 const snaps = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
 const IDS = ["balance", "equity", "pnl", "unreal", "posCount", "winrate", "tradeCount", "bestLong", "bestShort",
   "modeBadge", "modeSubtitle", "statusBadge", "heartbeat", "scanStatus", "posSummary", "tradingAlerts",
-  "openTrades", "historyTrades", "scanTable", "entryRule", "balanceLabel", "log"];
+  "openTrades", "historyTrades", "scanTable", "entryRule", "balanceLabel", "marginUsed", "log"];
 
 async function renderOne(name, snap) {
   const errors = [];
@@ -32,6 +32,9 @@ async function renderOne(name, snap) {
   const out = {
     errors, texts,
     safeBadgeHidden: d.getElementById("safeBadge").classList.contains("hidden"),
+    marginHidden: d.getElementById("marginCard").classList.contains("hidden"),
+    balanceTitle: d.getElementById("balance").title,
+    marginTitle: d.getElementById("marginUsed").title,
     alertsHidden: d.getElementById("tradingAlerts").classList.contains("hidden"),
     resetDisabled: d.getElementById("btnReset").disabled,
     initBalanceDisabled: d.getElementById("initBalance").disabled,
