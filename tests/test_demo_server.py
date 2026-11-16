@@ -312,6 +312,46 @@ class DemoServerTest(unittest.TestCase):
                        "s.initialBalance == null"):
             self.assertIn(needle, html)
 
+    # ---------------------------------------------- 1.7.2 freshness / account
+    def test_panel_not_stale_between_monitor_cycles(self):
+        # Regression: 1.7.0 lowered the freshness limit to 10 s while the monitor
+        # still refreshed every 20 s, so the panel flickered "Sin precio Blofin fresco".
+        self.assertLess(server.MONITOR_SECONDS * 2 + server.HTTP_CONNECT_TIMEOUT + server.HTTP_READ_TIMEOUT,
+                        server.DISPLAY_MAX_AGE_SECONDS)
+        self.enter()
+        pos = server.STATE["openPositions"][0]
+        for age, stale in ((0, False), (12, False), (25, False), (server.DISPLAY_MAX_AGE_SECONDS + 1, True)):
+            pos["lastMarket"] = dict(pos["lastMarket"], ts=int((base.NOW - age) * 1000))
+            pos["priceStale"] = False
+            self.assertEqual(server.public_state()["openPositions"][0]["priceStale"], stale, age)
+
+    def test_stopped_bot_keeps_prices_fresh_without_acting(self):
+        self.enter()
+        server.STATE["running"] = False
+        pos = server.STATE["openPositions"][0]
+        pos["priceStale"] = True
+        self.price = 500.0  # below the SL: must NOT close while stopped
+        server.monitor_position(display_only=True)
+        self.assertEqual(len(server.STATE["openPositions"]), 1)
+        self.assertFalse(pos["priceStale"])
+        self.assertLess(pos["unrealized"], 0)
+        self.assertFalse(server.public_state()["openPositions"][0]["priceStale"])
+
+    def test_demo_account_and_marks_read_from_blofin(self):
+        self.demo()
+        self.enter()
+        self.fake.prices[PAIR] = 620.0
+        server.trading_cycle(force_reconcile=True)
+        acc = server.STATE["exchangeAccount"]
+        self.assertEqual((acc["totalEquity"], acc["balance"], acc["available"]), (1000.5, 1000.5, 1000.5))
+        mark = server.STATE["openPositions"][0]["exchangeMark"]
+        self.assertEqual(mark["markPrice"], 620.0)
+        self.assertGreater(mark["unrealizedPnl"], 0)
+        state = self.client.get("/api/state").get_json()
+        self.assertEqual(state["exchangeAccount"]["totalEquity"], 1000.5)
+        persist()
+        self.assertEqual(server.load_state()["exchangeAccount"]["totalEquity"], 1000.5)
+
     def test_reset_and_settings_refused_in_demo(self):
         self.demo()
         self.assertEqual(self.client.post("/api/reset").status_code, 409)

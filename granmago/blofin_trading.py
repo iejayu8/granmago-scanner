@@ -378,6 +378,7 @@ class DemoTrader:
         self.last_reconcile = None
         self.last_reconcile_result = None
         self.key_info = None
+        self.last_positions = {}
 
     def __repr__(self):
         return "DemoTrader(%r)" % (self.config,)
@@ -459,15 +460,31 @@ class DemoTrader:
             "positionSide": "net"})
         self._leverage_set.add(inst_id)
 
-    def balance(self):
+    def account(self):
+        """GET /api/v1/account/balance parsed per docs.blofin.com:
+        data = {ts, totalEquity, isolatedEquity, details: [{currency, equity,
+        balance, available, isolatedUnrealizedPnl, ...}]}. Missing fields are None."""
         data = self.client.request("GET", "/api/v1/account/balance") or {}
         if isinstance(data, list):
             data = data[0] if data else {}
-        for key in ("totalEquity", "equity", "available"):
+
+        def num(src, key):
             try:
-                return float(data[key])
+                return float(src[key])
             except (KeyError, TypeError, ValueError):
-                continue
+                return None
+        usdt = next((d for d in (data.get("details") or []) if isinstance(d, dict)
+                     and d.get("currency") == "USDT"), {})
+        return {"totalEquity": num(data, "totalEquity"), "isolatedEquity": num(data, "isolatedEquity"),
+                "equity": num(usdt, "equity"), "balance": num(usdt, "balance"),
+                "available": num(usdt, "available"), "isolatedUnrealizedPnl": num(usdt, "isolatedUnrealizedPnl"),
+                "ts": data.get("ts"), "fetchedAtMs": int(self._clock() * 1000)}
+
+    def balance(self):
+        acc = self.account()
+        for key in ("totalEquity", "equity", "available"):
+            if acc.get(key) is not None:
+                return acc[key]
         return None
 
     # --------------------------------------------------------------- orders
@@ -730,6 +747,7 @@ class DemoTrader:
                 self.mark_unsafe("reconciliacion_fallida")
                 self.last_reconcile, self.last_reconcile_result = report["at"], report
                 return report
+            self.last_positions = ex  # markPrice / unrealizedPnl for the panel
             local = {p["pair"]: p for p in local_positions}
             with_sl = {t.get("instId") for t in tpsl if t.get("slTriggerPrice")}
             for pair, p in local.items():

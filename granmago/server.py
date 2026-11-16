@@ -47,7 +47,7 @@ PAIRS = list(DEFAULT_PAIRS)
 _PAIR_RE = re.compile(r"^[A-Z0-9]+-USDT$")
 MAX_CONFIGURED_PAIRS = 40
 
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 
 # Walk-forward monitoring setup. The add-on pins these on every start.
 # Leftover options and a saved copy in state.json do not change them.
@@ -86,7 +86,9 @@ FIXED_BEHAVIOUR = {
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 STATE_FILE = DATA_DIR / "state.json"
 PORT = int(os.environ.get("PORT", "8787"))
-MONITOR_SECONDS = 20
+# 1.7.2: 5 s (was 20 s). The book freshness limit is 10 s, so a 20 s cycle left
+# every open position "stale" for about half of each cycle in the panel.
+MONITOR_SECONDS = 5
 
 _LEVELS = {
     "TRACE": "DEBUG",
@@ -112,6 +114,10 @@ BLOFIN_MARKET = "https://openapi.blofin.com/api/v1/market/"
 # Freshness is the order book generation time (books?size=1 "ts"), which Blofin
 # refreshes continuously. The ticker ts is the last trade and is not used.
 QUOTE_MAX_AGE_SECONDS = 10
+# Display only: how old the last executed/monitored quote may be before the
+# panel calls it stale. Execution still needs a fresh quote (<= 10 s) fetched
+# right before acting; this only stops the PnL/equity flicker between cycles.
+DISPLAY_MAX_AGE_SECONDS = 30
 INSTRUMENTS_TTL_SECONDS = 600
 # Blofin publishes a new 4H/1D candle ~70 s after the boundary (measured
 # 14/11/2026). The just-closed candle stays acceptable for 180 s.
@@ -839,6 +845,7 @@ def default_state():
         "demoLedger": None,           # demo book while paper is active
         "killSwitch": False,
         "lastReconcileAt": None,
+        "exchangeAccount": None,      # last Blofin demo account/balance snapshot
         "migrations": [],
         "settings": {
             "riskPct": 1.0,
@@ -1073,7 +1080,7 @@ def public_state():
     for pos in snap.get("openPositions", []):
         mark = pos.get("lastMarket") or {}
         stale = (pos.get("priceStale", False) or mark.get("source") != "Blofin"
-                 or not _fresh_timestamp(mark.get("ts"), QUOTE_MAX_AGE_SECONDS))
+                 or not _fresh_timestamp(mark.get("ts"), DISPLAY_MAX_AGE_SECONDS))
         pos["priceStale"] = stale
         if stale:
             pos["price"] = None
@@ -2705,7 +2712,7 @@ def _apply_mark(pos, price, *, quote=None):
     return None
 
 
-def _monitor_one(pair):
+def _monitor_one(pair, display_only=False):
     with LOCK:
         expected = _find_position(pair)
     if expected is None:
@@ -2713,7 +2720,19 @@ def _monitor_one(pair):
     quote = fetch_quote(pair)
     with LOCK:
         pos = _find_position(pair)
-        if pos is not expected or not STATE["running"]:
+        if pos is not expected:
+            return
+        if display_only or not STATE["running"]:
+            # Bot stopped: keep price/PnL current for the panel, never act.
+            if _position_quote_valid(quote, pos):
+                pos["lastMarket"] = _quote_audit(quote)
+                pos["priceStale"] = False
+                pos["price"] = quote.price
+                pnl = position_pnl(pos, quote.price)
+                if pnl is not None:
+                    pos["unrealized"] = round(pnl, 2)
+            else:
+                pos["priceStale"] = True
             return
         if not _position_quote_valid(quote, pos):
             pos["priceStale"] = True
@@ -2732,7 +2751,7 @@ def _monitor_pool():
     return _MONITOR_POOL
 
 
-def monitor_position():
+def monitor_position(display_only=False):
     with LOCK:
         pairs = [p.get("pair") for p in _positions() if isinstance(p, dict) and p.get("pair")]
     if not pairs:
@@ -2740,7 +2759,7 @@ def monitor_position():
     # One illiquid/rate-limited pair must not hold up the other positions.
     # A persistent pool and the shared session keep TLS connections alive
     # (no new handshake every cycle); all book mutation still uses LOCK.
-    list(_monitor_pool().map(_monitor_one, pairs))
+    list(_monitor_pool().map(lambda pair: _monitor_one(pair, display_only), pairs))
     with LOCK:
         STATE["lastTickAt"] = _now()
         save_state()
@@ -2996,6 +3015,16 @@ def monitor_loop():
             running = STATE["running"]
             has_pos = bool(STATE.get("openPositions"))
         if not next_actions(running, has_pos)["monitor"]:
+            if has_pos:
+                # Stopped with open positions (in demo they live on Blofin):
+                # refresh prices for the panel only, no SL/TP from here.
+                try:
+                    monitor_position(display_only=True)
+                except Exception:
+                    log.exception("monitor (display)")
+                if not _wait(MONITOR_SECONDS):
+                    return
+                continue
             if not _wait(1):
                 return
             continue
@@ -3374,8 +3403,21 @@ def trading_cycle(force_reconcile=False):
                             pos["closeRequested"] = {"reason": "sin_sl", "at": _now()}
                         else:
                             pos["tpslId"] = tid
+            with LOCK:
+                for pos in _positions():
+                    e = (TRADER.last_positions or {}).get(pos.get("pair")) if pos.get("exchange") else None
+                    if e:
+                        try:
+                            pos["exchangeMark"] = {"markPrice": float(e.get("markPrice")),
+                                                   "unrealizedPnl": float(e.get("unrealizedPnl")),
+                                                   "at": _now(), "atMs": int(now_epoch() * 1000)}
+                        except (TypeError, ValueError):
+                            pass
             try:
-                bal = TRADER.balance()
+                acc = TRADER.account()
+                with LOCK:
+                    STATE["exchangeAccount"] = acc
+                bal = next((acc[k] for k in ("totalEquity", "equity", "available") if acc.get(k) is not None), None)
                 if bal is not None:
                     with LOCK:
                         STATE["balance"] = round(bal, 4)

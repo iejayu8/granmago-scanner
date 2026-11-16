@@ -305,8 +305,23 @@ function render(s) {
   }
   $("unreal").textContent = (unrealized >= 0 ? "+" : "") + unrealized.toFixed(2);
   $("unreal").className = "value " + (unrealized >= 0 ? "positive" : "negative");
-  $("equity").textContent = stalePrices ? "Sin precio Blofin fresco" : equity.toLocaleString(undefined, { maximumFractionDigits: 2 }) + " USDT";
-  if (stalePrices) $("unreal").textContent = "No disponible";
+  // Demo: equity is read from the Blofin account (refreshed every reconcile,
+  // ~60 s), not rebuilt from local prices. Older than 180 s = not shown.
+  const acc = s.exchangeAccount;
+  const accAge = acc && acc.fetchedAtMs ? (Date.now() - acc.fetchedAtMs) / 1000 : Infinity;
+  const demoEq = s.tradingMode === "demo" && acc && acc.totalEquity != null && accAge <= 180;
+  if (demoEq) {
+    $("equity").textContent = (+acc.totalEquity).toLocaleString(undefined, { maximumFractionDigits: 2 }) + " USDT";
+    $("equity").title = "Blofin demo, hace " + Math.max(0, Math.round(accAge)) + " s";
+  } else {
+    $("equity").textContent = stalePrices ? "Sin precio Blofin fresco" : equity.toLocaleString(undefined, { maximumFractionDigits: 2 }) + " USDT";
+  }
+  if (stalePrices) {
+    const ex = positions.filter((p) => p.priceStale && p.exchangeMark);
+    $("unreal").textContent = ex.length === positions.filter((p) => p.priceStale).length && ex.length
+      ? positions.reduce((sum, p) => sum + (p.priceStale ? +p.exchangeMark.unrealizedPnl : (+p.unrealized || 0)), 0).toFixed(2) + " (Blofin)"
+      : "No disponible";
+  }
   $("posCount").textContent = positions.length + "/" + maxPos;
   $("posSummary").textContent = stalePrices ? "PnL/equity no disponibles: falta precio Blofin fresco" : positions.length + "/" + maxPos + " posiciones · PnL no realizado "
     + (unrealized >= 0 ? "+" : "") + unrealized.toFixed(2)
@@ -390,9 +405,9 @@ function render(s) {
     return `<tr>
       <td><strong>${esc(String(p.pair).replace("-USDT", ""))}</strong></td>
       <td>${esc(String(p.side).toUpperCase())}</td>
-      <td>${fmt(p.entry)}</td><td>${p.priceStale ? "Sin precio fresco" : fmt(p.price)}</td><td>${fmt(p.sl)}</td>
+      <td>${fmt(p.entry)}</td><td>${p.priceStale ? (p.exchangeMark ? fmt(p.exchangeMark.markPrice) + " (Blofin)" : "Sin precio fresco") : fmt(p.price)}</td><td>${fmt(p.sl)}</td>
       <td>${trailOn ? '<span class="trail-badge">Trailing activo</span>' : tpCell}</td>
-      <td class="${(+p.unrealized || 0) >= 0 ? "positive" : "negative"}">${p.priceStale ? "No disponible" : (+p.unrealized || 0).toFixed(2)}</td>
+      <td class="${(+p.unrealized || 0) >= 0 ? "positive" : "negative"}">${p.priceStale ? (p.exchangeMark ? (+p.exchangeMark.unrealizedPnl).toFixed(2) + " (Blofin)" : "No disponible") : (+p.unrealized || 0).toFixed(2)}</td>
       <td>${esc(when)}</td>
       <td><button class="danger mini" type="button" data-close-pair="${esc(p.pair)}" ${busy ? "disabled" : ""}>Cerrar</button></td>
     </tr>`;

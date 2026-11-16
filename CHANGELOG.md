@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.7.2
+
+- **"Equity: Sin precio Blofin fresco" / "No disponible" intermitente.** 1.7.0 bajó el límite de frescura del precio a 10 s (ts del libro) pero el vigilante de posiciones seguía refrescando cada 20 s: durante ~la mitad de cada ciclo el panel marcaba las posiciones como sin precio. Ahora el vigilante refresca cada 5 s y el panel solo llama "sin precio" a un precio de más de 30 s (`DISPLAY_MAX_AGE_SECONDS`). La ejecución (SL/TP, entradas, cierres) sigue exigiendo un precio de ≤ 10 s pedido justo antes de actuar.
+- Con el bot detenido y posiciones abiertas (en demo viven en Blofin) el precio y el PnL siguen actualizándose para el panel, sin ejecutar SL/TP desde el bot.
+- Demo: la cuenta Blofin se lee con el formato de la documentación (`totalEquity`, `details[USDT].equity/balance/available/isolatedUnrealizedPnl`) y se guarda en `exchangeAccount`; la Equity del panel en demo es la de Blofin (sin sumar dos veces el PnL no realizado). Cada posición demo guarda `markPrice` y `unrealizedPnl` de Blofin (`exchangeMark`), que el panel muestra si falta un precio local fresco.
+
 ## 1.7.1
 
 - **El estado sobrevive a los reinicios.** `load_state()` solo conservaba las claves de `default_state()`, así que `killSwitch`, `paperSnapshot`, `balanceSource` y `lastReconcileAt` se perdían en cada reinicio: un kill switch activado por API se desactivaba al reiniciar y la copia del libro paper se volvía a tomar con el saldo demo. Ahora son claves persistentes (más `ledgerMode`, `demoLedger` y `migrations`).

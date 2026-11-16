@@ -94,12 +94,21 @@ class FakeBlofin:
         return self.ok(b)
 
     def h_get_account_balance(self, p, b):
-        return self.ok({"totalEquity": "1000.5"})
+        # Shape from docs.blofin.com GET /api/v1/account/balance.
+        return self.ok({"ts": str(int(time.time() * 1000)), "totalEquity": "1000.5", "isolatedEquity": "0",
+                        "details": [{"currency": "USDT", "equity": "1000.5", "balance": "1000.5",
+                                     "available": "1000.5", "isolatedUnrealizedPnl": "0", "ts": "1"}]})
 
     def h_get_account_positions(self, p, b):
-        return self.ok([dict(instId=i, positionSide="net", marginMode="isolated", positions=str(v["positions"]),
-                             averagePrice=str(v["averagePrice"])) for i, v in self.positions.items()
-                        if v["positions"] != 0])
+        out = []
+        for i, v in self.positions.items():
+            if v["positions"] == 0:
+                continue
+            mark = self.prices.get(i, v["averagePrice"])
+            upnl = (mark - v["averagePrice"]) * v["positions"] * self._cv(i)
+            out.append(dict(instId=i, positionSide="net", marginMode="isolated", positions=str(v["positions"]),
+                            averagePrice=str(v["averagePrice"]), markPrice=str(mark), unrealizedPnl=str(upnl)))
+        return self.ok(out)
 
     def h_get_account_funding_fees(self, p, b):
         return self.ok([{"instId": p.get("instId"), "fundingFee": self.funding_fee, "ts": str(int(time.time() * 1000))}])
