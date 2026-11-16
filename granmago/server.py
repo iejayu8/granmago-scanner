@@ -124,7 +124,7 @@ INSTRUMENTS_TTL_SECONDS = 600
 ACCOUNT_DISPLAY_MAX_AGE_SECONDS = 180
 # Local clock vs Blofin Date header. Freshness checks compare Blofin ts with
 # the local clock, so a skew close to QUOTE_MAX_AGE_SECONDS rejects every quote.
-CLOCK_SKEW_ALERT_SECONDS = 3
+CLOCK_SKEW_ALERT_SECONDS = 2
 CLOSE_RETRY_SECONDS = 15
 DEMO_MARKET = "https://demo-trading-openapi.blofin.com/api/v1/market/"
 # Blofin publishes a new 4H/1D candle ~70 s after the boundary (measured
@@ -2035,6 +2035,7 @@ def scan_all():
         for pair in pairs:
             if STOP.is_set():
                 break
+            _beat("granmago-scan")
             try:
                 row = analyze_pair(pair, threshold)
             except Exception as exc:
@@ -2055,6 +2056,7 @@ def scan_all():
             for pair in failed:
                 if STOP.is_set():
                     break
+                _beat("granmago-scan")
                 try:
                     row = analyze_pair(pair, threshold)
                 except Exception as exc:
@@ -3146,7 +3148,7 @@ def _fmt_num(value):
 # that raised or returned while the process is still running; /api/health
 # reports the age of every beat (a hung loop shows up as stale).
 THREADS = {}
-THREAD_STALE_SECONDS = {"granmago-monitor": 60, "granmago-scan": 900, "granmago-trading": 120}
+THREAD_STALE_SECONDS = {"granmago-monitor": 60, "granmago-scan": 300, "granmago-trading": 300}
 
 
 def _beat(name):
@@ -3432,6 +3434,7 @@ def start_trading():
     """Demo startup, before any scan: account checks, pending intents, reconcile."""
     if TRADER is None:
         return
+    refresh_demo_universe(force=True)  # before the first scan: IOST & co. never reach an order
     TRADER.prepare_account()
     TRADER.resolve_pending_intents()
     trading_cycle(force_reconcile=True)
@@ -3636,6 +3639,7 @@ def trading_cycle(force_reconcile=False):
                             pass
             try:
                 acc = TRADER.account()
+                acc["fetchedAtMs"] = int(now_epoch() * 1000)  # server clock, same as the panel ages
                 with LOCK:
                     STATE["exchangeAccount"] = acc
                 bal = next((acc[k] for k in ("totalEquity", "equity", "available") if acc.get(k) is not None), None)
