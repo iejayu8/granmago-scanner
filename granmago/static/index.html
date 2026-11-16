@@ -226,6 +226,24 @@ function motivo(reason) {
   return reason == null ? "-" : String(reason);
 }
 
+function cell(v) {
+  if (v === null || v === undefined || v === "") return "-";
+  if (typeof v === "number" && !isFinite(v)) return "-";
+  if (typeof v === "object") return esc(JSON.stringify(v));
+  return esc(String(v));
+}
+
+function pnlOf(p) {
+  if (!p.priceStale) return isFinite(+p.unrealized) && p.unrealized != null ? +p.unrealized : NaN;
+  return p.exchangeMark && isFinite(+p.exchangeMark.unrealizedPnl) ? +p.exchangeMark.unrealizedPnl : NaN;
+}
+
+function pnlCell(p) {
+  const v = pnlOf(p);
+  if (!isFinite(v)) return "No disponible";
+  return v.toFixed(2) + (p.priceStale ? " (Blofin)" : "");
+}
+
 function fmtR(v) {
   if (v === null || v === undefined || v === "") return "-";
   const n = +v;
@@ -291,26 +309,30 @@ function render(s) {
   const maxPos = (s.settings && Number.isFinite(+s.settings.maxPositions))
     ? +s.settings.maxPositions : 5;
   const stalePrices = positions.some((p) => p.priceStale);
-  const unrealized = positions.reduce((sum, p) => sum + (+p.unrealized || 0), 0);
-  const equity = (+s.balance || 0) + unrealized;
-  $("balance").textContent = (+s.balance || 0).toLocaleString(undefined, { maximumFractionDigits: 0 }) + " USDT";
-  // PnL of the active book only (paper or demo, each with its own initial balance).
-  if (s.initialBalance == null) {
-    $("pnl").textContent = "—";
-    $("pnl").className = "value";
-  } else {
-    const pnl = (+s.balance || 0) - (+s.initialBalance || 0);
-    $("pnl").textContent = (pnl >= 0 ? "+" : "") + pnl.toFixed(2);
-    $("pnl").className = "value " + (pnl >= 0 ? "positive" : "negative");
-  }
-  $("unreal").textContent = (unrealized >= 0 ? "+" : "") + unrealized.toFixed(2);
-  $("unreal").className = "value " + (unrealized >= 0 ? "positive" : "negative");
-  $("equity").textContent = stalePrices ? "Sin precio Blofin fresco" : equity.toLocaleString(undefined, { maximumFractionDigits: 2 }) + " USDT";
-  if (stalePrices) $("unreal").textContent = "No disponible";
+  // All money figures come from the server (s.display): one clock, one rule.
+  // Demo equity is Blofin's own totalEquity (it already includes unrealized PnL).
+  const d = s.display || {};
+  const money = (v, digits) => (v == null || !isFinite(+v)) ? null
+    : (+v).toLocaleString(undefined, { maximumFractionDigits: digits });
+  const signed = (v) => (v == null || !isFinite(+v)) ? null : ((+v >= 0 ? "+" : "") + (+v).toFixed(2));
+  const setSigned = (id, v, fallback) => {
+    const txt = signed(v);
+    $(id).textContent = txt == null ? fallback : txt;
+    $(id).className = "value" + (txt == null ? "" : (+v >= 0 ? " positive" : " negative"));
+  };
+  const bal = money(d.balance, 0);
+  $("balance").textContent = bal == null ? "—" : bal + " USDT";
+  setSigned("pnl", d.pnlTotal, "—");
+  setSigned("unreal", d.unrealized, positions.length ? "No disponible" : "+0.00");
+  if (d.unrealizedSource === "blofin" && signed(d.unrealized) != null) $("unreal").textContent += " (Blofin)";
+  const eq = money(d.equity, 2);
+  $("equity").textContent = eq == null ? (d.unavailable ? d.unavailable.charAt(0).toUpperCase() + d.unavailable.slice(1) : "—") : eq + " USDT";
+  const accAge = s.exchangeAccount && s.exchangeAccount.ageSeconds;
+  $("equity").title = d.equitySource === "blofin" && accAge != null ? "Blofin demo, hace " + Math.round(accAge) + " s" : "";
   $("posCount").textContent = positions.length + "/" + maxPos;
-  $("posSummary").textContent = stalePrices ? "PnL/equity no disponibles: falta precio Blofin fresco" : positions.length + "/" + maxPos + " posiciones · PnL no realizado "
-    + (unrealized >= 0 ? "+" : "") + unrealized.toFixed(2)
-    + " · Equity " + equity.toFixed(2);
+  $("posSummary").textContent = positions.length + "/" + maxPos + " posiciones · PnL no realizado "
+    + (signed(d.unrealized) == null ? "no disponible" : signed(d.unrealized))
+    + " · Equity " + (eq == null ? "no disponible" : eq);
   const hist = s.history || [];
   const wins = hist.filter((t) => t.pnl > 0).length;
   $("winrate").textContent = hist.length ? Math.round(wins / hist.length * 100) + "%" : "-";
@@ -355,22 +377,22 @@ function render(s) {
     const best = (bl && r.pair === bl.pair) || (bs && r.pair === bs.pair);
     const bias = r.bias === "ALCISTA" ? "L" : r.bias === "BAJISTA" ? "S" : "-";
     return `<tr class="${best ? "best" : ""}">
-      <td><strong>${esc(r.pair.replace("-USDT", ""))}</strong></td>
+      <td><strong>${esc(String(r.pair).replace("-USDT", ""))}</strong></td>
       <td class="${r.bias === "ALCISTA" ? "positive" : r.bias === "BAJISTA" ? "negative" : ""}">${bias}</td>
-      <td class="${scoreClass(r.scoreLong, entryThreshold)}">${r.scoreLong}</td>
-      <td class="${scoreClass(r.scoreShort, entryThreshold)}">${r.scoreShort}</td>
+      <td class="${scoreClass(r.scoreLong, entryThreshold)}">${cell(r.scoreLong)}</td>
+      <td class="${scoreClass(r.scoreShort, entryThreshold)}">${cell(r.scoreShort)}</td>
       <td>${r.nearEMA ? "Sí" : "No"}</td>
-      <td>${r.stoch}</td>
+      <td>${cell(r.stoch)}</td>
       <td>${r.validLong ? "LONG" : r.validShort ? "SHORT" : "-"}</td>
     </tr>`;
   }).join("") : '<tr><td colspan="7" style="color:var(--muted)">Sin escaneo</td></tr>';
 
   const top = rows[0];
   $("indicators").innerHTML = top ? `
-    Top: <strong>${top.pair}</strong> @ ${fmt(top.price)}<br>
-    Sesgo: ${top.bias}<br>
-    Score L/S: ${top.scoreLong} / ${top.scoreShort}<br>
-    EMA50 4H: ${top.ema50_4 ? fmt(top.ema50_4) : "-"} · Stoch: ${top.stoch}
+    Top: <strong>${esc(String(top.pair))}</strong> @ ${fmt(top.price)}<br>
+    Sesgo: ${cell(top.bias)}<br>
+    Score L/S: ${cell(top.scoreLong)} / ${cell(top.scoreShort)}<br>
+    EMA50 4H: ${top.ema50_4 ? fmt(top.ema50_4) : "-"} · Stoch: ${cell(top.stoch)}
     ${top.adx == null ? "" : "<br>ADX " + (+top.adx).toFixed(1)}
     ${top.er == null ? "" : " · ER " + (+top.er).toFixed(2)}
     ${top.emaSlope == null ? "" : " · pendiente día " + ((+top.emaSlope) * 100).toFixed(2) + "%"}
@@ -390,9 +412,9 @@ function render(s) {
     return `<tr>
       <td><strong>${esc(String(p.pair).replace("-USDT", ""))}</strong></td>
       <td>${esc(String(p.side).toUpperCase())}</td>
-      <td>${fmt(p.entry)}</td><td>${p.priceStale ? "Sin precio fresco" : fmt(p.price)}</td><td>${fmt(p.sl)}</td>
+      <td>${fmt(p.entry)}</td><td>${p.priceStale ? (p.exchangeMark && isFinite(+p.exchangeMark.markPrice) ? fmt(p.exchangeMark.markPrice) + " (Blofin)" : "Sin precio fresco") : fmt(p.price)}</td><td>${fmt(p.sl)}</td>
       <td>${trailOn ? '<span class="trail-badge">Trailing activo</span>' : tpCell}</td>
-      <td class="${(+p.unrealized || 0) >= 0 ? "positive" : "negative"}">${p.priceStale ? "No disponible" : (+p.unrealized || 0).toFixed(2)}</td>
+      <td class="${pnlOf(p) >= 0 ? "positive" : "negative"}">${pnlCell(p)}</td>
       <td>${esc(when)}</td>
       <td><button class="danger mini" type="button" data-close-pair="${esc(p.pair)}" ${busy ? "disabled" : ""}>Cerrar</button></td>
     </tr>`;
@@ -400,8 +422,8 @@ function render(s) {
 
   $("historyTrades").innerHTML = hist.slice(0, 30).map((t) => `
     <tr>
-      <td>${t.time}</td><td>${String(t.pair).replace("-USDT", "")}</td><td>${String(t.side).toUpperCase()}</td>
-      <td class="${t.pnl >= 0 ? "positive" : "negative"}">${(+t.pnl).toFixed(2)}</td>
+      <td>${esc(t.time == null ? "-" : String(t.time))}</td><td>${esc(String(t.pair).replace("-USDT", ""))}</td><td>${esc(String(t.side).toUpperCase())}</td>
+      <td class="${(+t.pnl || 0) >= 0 ? "positive" : "negative"}">${isFinite(+t.pnl) && t.pnl != null ? (+t.pnl).toFixed(2) : "-"}</td>
       <td>${fmtR(t.tradeR != null ? t.tradeR : t.rMultiple)}</td>
       <td>${esc(motivo(t.reason))}</td>
     </tr>
@@ -412,9 +434,17 @@ async function refresh() {
   try {
     const r = await fetch(api("/api/state"), { cache: "no-store" });
     if (!r.ok) throw new Error("http " + r.status);
-    render(await r.json());
+    var data = await r.json();
   } catch (e) {
     $("scanStatus").textContent = "Sin conexión con el servidor";
+    return;
+  }
+  try {
+    render(data);
+  } catch (e) {
+    // A rendering bug must not look like a network outage.
+    console.error("render", e);
+    $("scanStatus").textContent = "Error del panel: " + (e && e.message ? e.message : e);
   }
 }
 

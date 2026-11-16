@@ -181,6 +181,21 @@ class OpenTest(TraderCase):
         self.assertIsNone(other.open_position(plan()))
 
 
+class AccountTest(TraderCase):
+    def test_balance_parsed_like_docs(self):
+        docs = {"ts": "1697021343571", "totalEquity": "10011254.07", "isolatedEquity": "861.76",
+                "details": [{"currency": "USDT", "equity": "10014042.98", "balance": "10013119.88",
+                             "available": "9996399.47", "isolatedUnrealizedPnl": "-22.15"}]}
+        self.fake.h_get_account_balance = lambda p, b: {"code": "0", "data": docs}
+        acc = self.trader.account()
+        self.assertEqual(acc["totalEquity"], 10011254.07)
+        self.assertEqual(acc["balance"], 10013119.88)
+        self.assertEqual(acc["isolatedUnrealizedPnl"], -22.15)
+        self.assertEqual(self.trader.balance(), 10011254.07)
+        self.fake.h_get_account_balance = lambda p, b: {"code": "0", "data": {"details": []}}
+        self.assertIsNone(self.trader.balance())
+
+
 class ReconcileTest(TraderCase):
     def test_clean_book_is_ok(self):
         self.trader.prepare_account()
