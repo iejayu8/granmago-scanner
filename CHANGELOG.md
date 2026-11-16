@@ -6,6 +6,24 @@
 - Con el bot detenido y posiciones abiertas (en demo viven en Blofin) el precio y el PnL siguen actualizándose para el panel, sin ejecutar SL/TP desde el bot.
 - Demo: la cuenta Blofin se lee con el formato de la documentación (`totalEquity`, `details[USDT].equity/balance/available/isolatedUnrealizedPnl`) y se guarda en `exchangeAccount`; la Equity del panel en demo es la de Blofin (sin sumar dos veces el PnL no realizado). Cada posición demo guarda `markPrice` y `unrealizedPnl` de Blofin (`exchangeMark`), que el panel muestra si falta un precio local fresco.
 
+**Auditoría de robustez 1.7.2** (mismo tipo de fallo: dos piezas con supuestos distintos):
+
+- Panel: un fallo puntual de refresco ya no borra un precio que sigue dentro de los 30 s; la frescura de pantalla depende solo de la edad del último precio Blofin bueno.
+- Panel: la edad del saldo Blofin se calcula en el servidor (`ageSeconds`), no con el reloj del navegador contra un ts del servidor. El sello `fetchedAtMs` lo pone el servidor.
+- Panel: balance, equity, no realizado y PnL salen de un único cálculo del servidor (`display`). En demo la Equity es `totalEquity` de Blofin, nunca saldo + no realizado; la tarjeta Balance muestra `details[USDT].balance`. Marcas Blofin de más de 180 s no se muestran.
+- Panel: un error de dibujo ya no se presenta como "Sin conexión con el servidor"; se ve "Error del panel: …" y va a la consola. Celdas del escaneo/historial sin "undefined"/"NaN" con datos incompletos; historial escapado.
+- `/api/state` y `/api/health` nunca emiten `NaN`/`Infinity` (JSON inválido que dejaba el panel en "Sin conexión").
+- Demo: los pares que no existen en Blofin demo (IOST-USDT) se excluyen del escaneo y de las entradas; la lista se carga al arrancar, antes del primer escaneo, y se conserva si una recarga falla.
+- Demo: lectura defensiva de las respuestas de Blofin (`num()`): una posición ilegible nunca cuenta como "sin posición" (estado seguro), fills con tamaño 0 o ts ilegible ya no dan ZeroDivisionError/ValueError, funding no numérico se ignora, un `averagePrice` "0.000" (orden aún sin fill, como en la doc) nunca se apunta como entrada a 0, NaN/inf se descartan.
+- Demo: un rechazo del limitador de peticiones antes del POST es una negativa limpia (`not_sent`), no una orden ambigua (antes: estado seguro falso). La consulta tras ambigüedad tolera límites y errores.
+- Demo: el SL/TP adjunto que aparece tarde en `orders-tpsl-pending` se reconsulta antes de colocar un segundo TPSL (sin SL duplicado).
+- Demo: los cierres que fallan se reintentan cada 15 s (antes cada 5 s), con el control en memoria para que un reinicio reintente de inmediato.
+- Reloj: se mide la desviación del reloj local contra la cabecera `Date` de Blofin (mediana de 20); con más de 2 s hay alerta y sale en `/api/health` (`clockSkewSeconds`).
+- Pares: el disyuntor solo degrada por fallos seguidos; fallos aislados separados más de 60 s ya no se acumulan.
+- Hilos: escaneo, vigilante y trading se supervisan (se reinician si fallan o terminan, con alerta) y laten en cada vuelta y en cada par del escaneo; `/api/health` muestra `threads` y `ok=false` si alguno se para.
+- El escaneo registra su duración (`lastScanSeconds`) y avisa si se acerca a la vigencia de las señales.
+- Tests nuevos: invariantes de tiempos (fallan con los valores de 1.7.0), contrato panel↔API con render headless real de `index.html` (jsdom) en 14 estados, simulación de ~6 h con reloj falso (latencia, timeouts, 5xx, 429, libros vacíos, IOST, reinicios, paper→demo→paper→demo, bot parado, kill switch), ejemplos literales de la doc de Blofin y variantes malformadas, universo demo, desviación de reloj, disyuntor, supervisión y estrés concurrente.
+
 ## 1.7.1
 
 - **El estado sobrevive a los reinicios.** `load_state()` solo conservaba las claves de `default_state()`, así que `killSwitch`, `paperSnapshot`, `balanceSource` y `lastReconcileAt` se perdían en cada reinicio: un kill switch activado por API se desactivaba al reiniciar y la copia del libro paper se volvía a tomar con el saldo demo. Ahora son claves persistentes (más `ledgerMode`, `demoLedger` y `migrations`).

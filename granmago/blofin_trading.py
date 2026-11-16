@@ -71,6 +71,16 @@ class BlofinError(RuntimeError):
         self.path = path
 
 
+def num(value, default=None):
+    """Blofin sends numbers as strings. Finite float, or default for missing,
+    empty, non-numeric, NaN or infinite values (never raises)."""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if math.isfinite(out) else default
+
+
 class AmbiguousResult(RuntimeError):
     """The request may or may not have reached Blofin (timeout, reset, 5xx)."""
 
@@ -439,7 +449,7 @@ class DemoTrader:
                 mode = self.client.request("GET", "/api/v1/account/position-mode") or {}
                 if mode.get("positionMode") != "net_mode":
                     positions = self.client.request("GET", "/api/v1/account/positions") or []
-                    if any(float(p.get("positions") or 0) != 0 for p in positions):
+                    if any(num(p.get("positions"), 1.0) != 0 for p in positions if isinstance(p, dict)):  # unreadable = assume open
                         self.mark_unsafe("position_mode_no_net_con_posiciones")
                         return False
                     self.client.request("POST", "/api/v1/account/set-position-mode",
@@ -468,16 +478,13 @@ class DemoTrader:
         if isinstance(data, list):
             data = data[0] if data else {}
 
-        def num(src, key):
-            try:
-                return float(src[key])
-            except (KeyError, TypeError, ValueError):
-                return None
-        usdt = next((d for d in (data.get("details") or []) if isinstance(d, dict)
-                     and d.get("currency") == "USDT"), {})
-        return {"totalEquity": num(data, "totalEquity"), "isolatedEquity": num(data, "isolatedEquity"),
-                "equity": num(usdt, "equity"), "balance": num(usdt, "balance"),
-                "available": num(usdt, "available"), "isolatedUnrealizedPnl": num(usdt, "isolatedUnrealizedPnl"),
+        if not isinstance(data, dict):
+            data = {}
+        details = data.get("details") if isinstance(data.get("details"), list) else []
+        usdt = next((d for d in details if isinstance(d, dict) and d.get("currency") == "USDT"), {})
+        return {"totalEquity": num(data.get("totalEquity")), "isolatedEquity": num(data.get("isolatedEquity")),
+                "equity": num(usdt.get("equity")), "balance": num(usdt.get("balance")),
+                "available": num(usdt.get("available")), "isolatedUnrealizedPnl": num(usdt.get("isolatedUnrealizedPnl")),
                 "ts": data.get("ts"), "fetchedAtMs": int(self._clock() * 1000)}
 
     def balance(self):
@@ -584,7 +591,7 @@ class DemoTrader:
                     return None
                 order_id = detail.get("orderId")
             detail = self._wait_fill(pair, cid, order_id)
-            filled = float((detail or {}).get("filledSize") or 0)
+            filled = num((detail or {}).get("filledSize"), 0.0)
             if not detail or filled <= 0:
                 state = (detail or {}).get("state")
                 if state in ("canceled", "partially_canceled") or (detail and filled == 0 and state != "live"):
@@ -595,10 +602,11 @@ class DemoTrader:
                 return None
             fill = {
                 "pair": pair, "side": side, "contracts": filled, "contractValue": cv,
-                "entry": float(detail.get("averagePrice") or plan["entry"]),
+                # docs: averagePrice is "0.000…" until filled; never book a 0 entry.
+                "entry": num(detail.get("averagePrice"), 0.0) > 0 and num(detail.get("averagePrice")) or plan["entry"],
                 "orderId": str(detail.get("orderId") or order_id or ""), "clientOrderId": cid,
-                "fee": abs(float(detail.get("fee") or 0)), "sl": sl, "tp": tp,
-                "openedMs": int(detail.get("updateTime") or detail.get("createTime") or self._clock() * 1000),
+                "fee": abs(num(detail.get("fee"), 0.0)), "sl": sl, "tp": tp,
+                "openedMs": int(num(detail.get("updateTime")) or num(detail.get("createTime")) or self._clock() * 1000),
             }
             fill["notional"] = round(fill["contracts"] * cv * fill["entry"], 4)
             self.intents.append({"clientOrderId": cid, "status": "filled", "orderId": fill["orderId"],
@@ -700,7 +708,17 @@ class DemoTrader:
 
     def positions(self):
         data = self.client.request("GET", "/api/v1/account/positions") or []
-        return {p["instId"]: p for p in data if float(p.get("positions") or 0) != 0}
+        out = {}
+        for p in data if isinstance(data, list) else []:
+            if not isinstance(p, dict):
+                continue
+            size = num(p.get("positions"))
+            if not p.get("instId") or (size is None and p.get("positions") not in (None, "")):
+                # A position we cannot read is never treated as "no position".
+                raise BlofinError("parse", "posición ilegible: %r" % (p,)[:200], "/api/v1/account/positions")
+            if size:
+                out[p["instId"]] = p
+        return out
 
     def position(self, pair):
         return self.positions().get(pair)
@@ -710,16 +728,19 @@ class DemoTrader:
         data = self.client.request("GET", "/api/v1/trade/fills-history",
                                    params={"instId": pair, "begin": str(int(since_ms))}) or []
         close_side = "sell" if side == "long" else "buy"
-        fills = [f for f in data if f.get("side") == close_side and int(f.get("ts") or 0) >= since_ms]
+        fills = [f for f in (data if isinstance(data, list) else []) if isinstance(f, dict)
+                 and f.get("side") == close_side and num(f.get("ts"), 0) >= since_ms
+                 and num(f.get("fillSize"), 0) > 0 and num(f.get("fillPrice"), 0) > 0]
         if not fills:
             return None
-        qty = sum(float(f["fillSize"]) for f in fills)
-        avg = sum(float(f["fillPrice"]) * float(f["fillSize"]) for f in fills) / qty
-        return {"exit": avg, "contracts": qty, "fees": sum(abs(float(f.get("fee") or 0)) for f in fills),
-                "grossPnl": sum(float(f.get("fillPnl") or 0) for f in fills),
+        qty = sum(num(f["fillSize"]) for f in fills)
+        avg = sum(num(f["fillPrice"]) * num(f["fillSize"]) for f in fills) / qty
+        # docs: fee is positive when charged; the fake and older answers send it negative.
+        return {"exit": avg, "contracts": qty, "fees": sum(abs(num(f.get("fee"), 0.0)) for f in fills),
+                "grossPnl": sum(num(f.get("fillPnl"), 0.0) for f in fills),
                 "orderIds": sorted({str(f.get("orderId")) for f in fills}),
                 "tradeIds": sorted({str(f.get("tradeId")) for f in fills}),
-                "ts": max(int(f.get("ts") or 0) for f in fills)}
+                "ts": int(max(num(f.get("ts"), 0) for f in fills))}
 
     def funding(self, pair, begin_ms, end_ms):
         """Funding paid(-)/received(+) in the window, or None when unavailable."""
@@ -731,10 +752,13 @@ class DemoTrader:
         except (BlofinError, AmbiguousResult, RateLimited):
             return None
         total = 0.0
-        for row in data:
+        for row in data if isinstance(data, list) else []:
+            if not isinstance(row, dict):
+                continue
             for key in ("fundingFee", "fee", "amount"):
-                if row.get(key) not in (None, ""):
-                    total += float(row[key])
+                value = num(row.get(key))
+                if value is not None:
+                    total += value
                     break
         return total
 
@@ -765,7 +789,7 @@ class DemoTrader:
                 if e is None:
                     report["missingOnExchange"].append(pair)
                     continue
-                size = abs(float(e.get("positions") or 0))
+                size = abs(num(e.get("positions"), 0.0))
                 if p.get("contracts") and abs(size - float(p["contracts"])) > 1e-9:
                     report["sizeMismatch"].append({"pair": pair, "local": p["contracts"], "exchange": size})
                 if pair not in with_sl:
@@ -801,7 +825,7 @@ class DemoTrader:
             else:
                 self.intents.append({"clientOrderId": cid, "status": "found_" + str(detail.get("state")),
                                      "orderId": detail.get("orderId")})
-                if float(detail.get("filledSize") or 0) > 0 and rec.get("kind") == "entry":
+                if num(detail.get("filledSize"), 0.0) > 0 and rec.get("kind") == "entry":
                     unresolved.append(cid)  # a real position the local book may not know
         if unresolved:
             self.mark_unsafe("intenciones_sin_resolver")

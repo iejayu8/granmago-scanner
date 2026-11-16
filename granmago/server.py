@@ -3632,10 +3632,12 @@ def trading_cycle(force_reconcile=False):
                     e = (TRADER.last_positions or {}).get(pos.get("pair")) if pos.get("exchange") else None
                     if e:
                         try:
-                            pos["exchangeMark"] = {"markPrice": float(e.get("markPrice")),
-                                                   "unrealizedPnl": float(e.get("unrealizedPnl")),
-                                                   "at": _now(), "atMs": int(now_epoch() * 1000)}
-                        except (TypeError, ValueError):
+                            mark = blofin_trading.num(e.get("markPrice"))
+                            upnl = blofin_trading.num(e.get("unrealizedPnl"))
+                            if mark is not None and mark > 0 and upnl is not None:
+                                pos["exchangeMark"] = {"markPrice": mark, "unrealizedPnl": upnl,
+                                                       "at": _now(), "atMs": int(now_epoch() * 1000)}
+                        except (TypeError, ValueError, AttributeError):
                             pass
             try:
                 acc = TRADER.account()
@@ -3737,9 +3739,21 @@ def index():
     return html.replace("__INGRESS__", ingress)
 
 
+def _finite(obj):
+    """Replace NaN/Infinity (invalid JSON: the panel's res.json() would fail and
+    show "Sin conexión") with None, recursively."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_finite(v) for v in obj]
+    return obj
+
+
 @app.route("/api/state")
 def api_state():
-    return jsonify(public_state())
+    return jsonify(_finite(public_state()))
 
 
 @app.route("/api/start", methods=["POST"])
@@ -3886,7 +3900,7 @@ def public_state_locked_free():
 
 @app.route("/api/health")
 def api_health():
-    return jsonify(health())
+    return jsonify(_finite(health()))
 
 
 def kill_switch(enabled, close_all=False):
