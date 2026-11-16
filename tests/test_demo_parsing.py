@@ -30,7 +30,10 @@ DOCS_POSITIONS = [
      "createTime": "1695352782370", "updateTime": "1695352782372", "leverage": "3"},
     {"positionId": "5483", "instId": "BCH-USDT", "instType": "SWAP", "marginMode": "cross", "positionSide": "net",
      "adl": "5", "positions": "-290", "availablePositions": "-290", "averagePrice": "1890.000000000000000000",
-     "markPrice": "1889", "unrealizedPnl": "2.9", "createTime": "1695090016933", "updateTime": "1695090016931",
+     "markPrice": "1889", "marginRatio": "172426.851188979265788635",
+     "liquidationPrice": "3418227.599542259480103079", "unrealizedPnl": "2.9",
+     "unrealizedPnlRatio": "0.001587301587301587", "initialMargin": "1826.033333333333333333",
+     "maintenanceMargin": "54.781", "createTime": "1695090016933", "updateTime": "1695090016931",
      "leverage": "3"}]
 DOCS_TPSL = [{"tpslId": "2411", "instId": "ETH-USDT", "marginMode": "cross", "positionSide": "net", "side": "sell",
               "tpTriggerPrice": "1666.000000000000000000", "tpOrderPrice": None, "tpTriggerPriceType": "last",
@@ -103,6 +106,50 @@ class DocsExamplesTest(TraderCase):
         fill = self.trader.open_position(plan())
         self.assertIsNotNone(fill)
         self.assertGreater(fill["entry"], 600)
+
+
+class FreeBalanceAndMarginTest(TraderCase):
+    """1.7.3: 'Saldo libre' = details.available, 'Margen en uso' = positions' margin."""
+
+    def display(self, acc, positions=()):
+        import test_demo_server as tds
+        snap = {"tradingMode": "demo", "initialBalance": 10000000.0,
+                "openPositions": [dict(p, priceStale=False, unrealized=0.0) for p in positions],
+                "exchangeAccount": dict(acc, ageSeconds=1.0)}
+        return tds.server._display_figures(snap)
+
+    def test_docs_literal_balance_and_positions(self):
+        self.fake.h_get_account_balance = ok(DOCS_BALANCE)
+        self.fake.h_get_account_positions = ok(DOCS_POSITIONS)
+        acc = self.trader.account()
+        self.assertAlmostEqual(acc["available"], 9996399.4708691159703362725)
+        self.assertAlmostEqual(acc["currencyIsolatedEquity"], 862.0032)
+        self.assertAlmostEqual(acc["orderFrozen"], 14920.99447263216)
+        self.assertAlmostEqual(acc["frozen"], 15805.14967263216)
+        margin = self.trader.positions_margin(self.trader.positions())
+        self.assertAlmostEqual(margin, 53.06 + 1826.033333333333)  # isolated `margin` + cross `initialMargin`
+        d = self.display(dict(acc, positionsMargin=margin), [{"pair": "ETH-USDT"}, {"pair": "BCH-USDT"}])
+        self.assertEqual(d["balance"], 9996399.47)
+        self.assertEqual(d["balanceSource"], "available")
+        self.assertEqual(d["marginUsed"], 1879.09)
+        self.assertEqual(d["marginSource"], "positions")
+        self.assertEqual(d["equity"], 10011254.08)  # totalEquity, unchanged
+
+    def test_fallbacks(self):
+        self.fake.h_get_account_balance = ok(DOCS_BALANCE)
+        acc = self.trader.account()
+        # positions unreadable/absent -> isolatedEquity - isolatedUnrealizedPnl
+        self.assertIsNone(self.trader.positions_margin({"X": {"margin": "abc"}}))
+        d = self.display(dict(acc, positionsMargin=None), [{"pair": "ETH-USDT"}])
+        self.assertEqual(d["marginSource"], "isolatedEquity")
+        self.assertEqual(d["marginUsed"], round(862.0032 + 22.152, 2))
+        # no available -> cash balance; nothing at all -> None, never NaN
+        d = self.display(dict(acc, available=None, positionsMargin=0.0))
+        self.assertEqual((d["balance"], d["balanceSource"], d["marginUsed"]), (10013119.89, "balance", 0.0))
+        d = self.display({"totalEquity": 5.0, "available": None, "balance": None}, [{"pair": "ETH-USDT"}])
+        self.assertIsNone(d["balance"])
+        self.assertIsNone(d["marginUsed"])
+        self.assertEqual(self.trader.positions_margin({}), 0.0)
 
 
 class MalformedTest(TraderCase):

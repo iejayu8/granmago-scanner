@@ -89,6 +89,7 @@
   <div class="grid">
     <div class="card"><h3 id="balanceLabel">Balance</h3><div class="value" id="balance">—</div></div>
     <div class="card"><h3>Equity</h3><div class="value" id="equity">—</div></div>
+    <div class="card hidden" id="marginCard"><h3>Margen en uso</h3><div class="value" id="marginUsed">—</div></div>
     <div class="card"><h3>PnL total</h3><div class="value" id="pnl">—</div></div>
     <div class="card"><h3>PnL no realizado</h3><div class="value" id="unreal">—</div></div>
     <div class="card"><h3>Posiciones</h3><div class="value" id="posCount">0/3</div></div>
@@ -265,7 +266,8 @@ function renderMode(s) {
     : mode === "blocked" ? "Trading bloqueado: revisa la configuración" : "Paper trading en el servidor";
   const unsafe = demo && trading.safe === false;
   $("safeBadge").classList.toggle("hidden", !unsafe);
-  $("balanceLabel").textContent = demo ? "Balance (Blofin demo)" : "Balance";
+  $("balanceLabel").textContent = demo ? "Saldo libre (fuera de posiciones)" : "Balance";
+  $("marginCard").classList.toggle("hidden", !demo);
 
   const lines = [];
   if (s.tradingError) lines.push("Trading bloqueado: " + s.tradingError);
@@ -320,8 +322,15 @@ function render(s) {
     $(id).textContent = txt == null ? fallback : txt;
     $(id).className = "value" + (txt == null ? "" : (+v >= 0 ? " positive" : " negative"));
   };
-  const bal = money(d.balance, 0);
+  const demoMode = d.mode === "demo";
+  const bal = money(d.balance, demoMode ? 2 : 0);
   $("balance").textContent = bal == null ? "—" : bal + " USDT";
+  const help = "Equity = saldo libre + margen en uso + PnL no realizado (Blofin)";
+  $("balance").title = demoMode ? "Disponible para nuevas operaciones (Blofin 'available'). " + help : "";
+  const mu = money(d.marginUsed, 2);
+  $("marginUsed").textContent = mu == null ? "—" : mu + " USDT";
+  $("marginUsed").title = demoMode ? "Margen bloqueado en las posiciones abiertas"
+    + (d.marginSource === "positions" ? " (suma de 'margin' de Blofin). " : d.marginSource ? " (isolatedEquity − PnL aislado). " : ". ") + help : "";
   setSigned("pnl", d.pnlTotal, "—");
   setSigned("unreal", d.unrealized, positions.length ? "No disponible" : "+0.00");
   if (d.unrealizedSource === "blofin" && signed(d.unrealized) != null) $("unreal").textContent += " (Blofin)";

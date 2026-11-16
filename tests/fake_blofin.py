@@ -95,9 +95,26 @@ class FakeBlofin:
 
     def h_get_account_balance(self, p, b):
         # Shape from docs.blofin.com GET /api/v1/account/balance.
-        return self.ok({"ts": str(int(time.time() * 1000)), "totalEquity": "1000.5", "isolatedEquity": "0",
-                        "details": [{"currency": "USDT", "equity": "1000.5", "balance": "1000.5",
-                                     "available": "1000.5", "isolatedUnrealizedPnl": "0", "ts": "1"}]})
+        # Isolated positions: their margin leaves `balance`/`available` and sits in
+        # isolatedEquity (margin + unrealized), as the real demo account showed
+        # (balance 838 next to equity 1000.43, 16/11/2026).
+        margin = upnl = 0.0
+        for i, v in self.positions.items():
+            if v["positions"]:
+                margin += self._margin(i, v)
+                upnl += self._upnl(i, v)
+        free = 1000.5 - margin
+        iso = margin + upnl
+        return self.ok({"ts": str(int(time.time() * 1000)), "totalEquity": repr(free + iso), "isolatedEquity": repr(iso),
+                        "details": [{"currency": "USDT", "equity": repr(free + iso), "balance": repr(free),
+                                     "available": repr(free), "isolatedEquity": repr(iso), "frozen": "0",
+                                     "orderFrozen": "0", "isolatedUnrealizedPnl": repr(upnl), "ts": "1"}]})
+
+    def _margin(self, inst, v):
+        return abs(v["positions"]) * self._cv(inst) * v["averagePrice"] / float(self.leverage.get(inst, 3))
+
+    def _upnl(self, inst, v):
+        return (self.prices.get(inst, v["averagePrice"]) - v["averagePrice"]) * v["positions"] * self._cv(inst)
 
     def h_get_account_positions(self, p, b):
         out = []
@@ -107,7 +124,8 @@ class FakeBlofin:
             mark = self.prices.get(i, v["averagePrice"])
             upnl = (mark - v["averagePrice"]) * v["positions"] * self._cv(i)
             out.append(dict(instId=i, positionSide="net", marginMode="isolated", positions=str(v["positions"]),
-                            averagePrice=str(v["averagePrice"]), markPrice=str(mark), unrealizedPnl=str(upnl)))
+                            averagePrice=str(v["averagePrice"]), markPrice=str(mark), unrealizedPnl=str(upnl),
+                            margin=repr(self._margin(i, v)), leverage="3"))
         return self.ok(out)
 
     def h_get_account_funding_fees(self, p, b):

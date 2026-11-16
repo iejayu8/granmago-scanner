@@ -47,7 +47,7 @@ PAIRS = list(DEFAULT_PAIRS)
 _PAIR_RE = re.compile(r"^[A-Z0-9]+-USDT$")
 MAX_CONFIGURED_PAIRS = 40
 
-VERSION = "1.7.2"
+VERSION = "1.7.3"
 
 # Walk-forward monitoring setup. The add-on pins these on every start.
 # Leftover options and a saved copy in state.json do not change them.
@@ -1170,7 +1170,8 @@ def _display_figures(snap):
     demo = snap.get("tradingMode") == "demo"
     initial = _num_or_none(snap.get("initialBalance"))
     out = {"mode": snap.get("tradingMode"), "balance": None, "equity": None, "equitySource": None,
-           "unrealized": None, "unrealizedSource": None, "pnlTotal": None, "unavailable": None}
+           "unrealized": None, "unrealizedSource": None, "pnlTotal": None, "unavailable": None,
+           "balanceSource": None, "marginUsed": None, "marginSource": None}
     local_ok = all(not p.get("priceStale") for p in positions)
     if local_ok:
         out["unrealized"] = round(sum(_num_or_none(p.get("unrealized")) or 0.0 for p in positions), 2)
@@ -1189,8 +1190,26 @@ def _display_figures(snap):
             out["unavailable"] = "sin saldo Blofin reciente" if acc else "esperando el primer saldo de Blofin"
         else:
             out["equity"], out["equitySource"] = round(total, 2), "blofin"
-            cash = _num_or_none(acc.get("balance"))
-            out["balance"] = round(cash if cash is not None else total, 2)
+            # 1.7.3: the card is the FREE balance (docs: details.available =
+            # "Available balance"), not details.balance ("Cash balance"),
+            # which next to Equity looked like money had disappeared.
+            free, src = _num_or_none(acc.get("available")), "available"
+            if free is None:
+                free, src = _num_or_none(acc.get("balance")), "balance"
+            out["balance"] = None if free is None else round(free, 2)
+            out["balanceSource"] = None if free is None else src
+            # Margin in use: sum of the positions' `margin` (Blofin), else
+            # details.isolatedEquity - isolatedUnrealizedPnl (margin of isolated
+            # positions without their PnL), else 0 when nothing is open.
+            margin, msrc = _num_or_none(acc.get("positionsMargin")), "positions"
+            if margin is None:
+                iso, iupnl = _num_or_none(acc.get("currencyIsolatedEquity")), _num_or_none(acc.get("isolatedUnrealizedPnl"))
+                if iso is not None:
+                    margin, msrc = iso - (iupnl or 0.0), "isolatedEquity"
+            if margin is None and not positions:
+                margin, msrc = 0.0, "positions"
+            out["marginUsed"] = None if margin is None else round(max(0.0, margin), 2)
+            out["marginSource"] = None if margin is None else msrc
             if initial is not None:
                 out["pnlTotal"] = round(total - initial, 2)
         return out
@@ -3642,6 +3661,8 @@ def trading_cycle(force_reconcile=False):
             try:
                 acc = TRADER.account()
                 acc["fetchedAtMs"] = int(now_epoch() * 1000)  # server clock, same as the panel ages
+                # Same cycle as the reconcile that just read the positions.
+                acc["positionsMargin"] = TRADER.positions_margin(TRADER.last_positions)
                 with LOCK:
                     STATE["exchangeAccount"] = acc
                 bal = next((acc[k] for k in ("totalEquity", "equity", "available") if acc.get(k) is not None), None)

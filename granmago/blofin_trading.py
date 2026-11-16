@@ -485,7 +485,23 @@ class DemoTrader:
         return {"totalEquity": num(data.get("totalEquity")), "isolatedEquity": num(data.get("isolatedEquity")),
                 "equity": num(usdt.get("equity")), "balance": num(usdt.get("balance")),
                 "available": num(usdt.get("available")), "isolatedUnrealizedPnl": num(usdt.get("isolatedUnrealizedPnl")),
+                "currencyIsolatedEquity": num(usdt.get("isolatedEquity")), "frozen": num(usdt.get("frozen")),
+                "orderFrozen": num(usdt.get("orderFrozen")), "availableEquity": num(usdt.get("availableEquity")),
                 "ts": data.get("ts"), "fetchedAtMs": int(self._clock() * 1000)}
+
+    @staticmethod
+    def positions_margin(positions):
+        """Margin locked in open positions per GET /api/v1/account/positions:
+        `margin` (isolated) or `initialMargin` (cross). None if any is unreadable."""
+        total = 0.0
+        for p in (positions or {}).values():
+            m = num(p.get("margin"))
+            if m is None:
+                m = num(p.get("initialMargin"))
+            if m is None or m < 0:
+                return None
+            total += m
+        return total
 
     def balance(self):
         acc = self.account()
