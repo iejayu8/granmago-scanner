@@ -70,6 +70,7 @@ class BlofinOnlyTest(unittest.TestCase):
         server._RATE_LIMIT_UNTIL = 0
         server._NEXT_REQUEST_AT = 0
         server._INSTRUMENTS.clear()
+        server._DEMO_INSTRUMENTS.clear()
         server._PAIR_HEALTH.clear()
         server._CLOSE_TRIES.clear()
         server._DEMO_UNIVERSE.update(ids=None, at=None, missing=[])
@@ -101,7 +102,7 @@ class BlofinOnlyTest(unittest.TestCase):
         if url.startswith(server.DEMO_MARKET):
             # Public demo instrument list (1.7.2 demo universe); IOST is not on demo.
             demo = getattr(self, 'demo_pairs', [p for p in server.LIQUID_PAIRS if p != 'IOST-USDT'])
-            return response(dict(code='0', data=[instrument(p) for p in demo]))
+            return response(dict(code='0', data=[self.edit_meta(instrument(p)) for p in demo]))
         pair = parse_qs(urlsplit(url).query)['instId'][0]
         if self.http_status != 200:
             return response(status=self.http_status)

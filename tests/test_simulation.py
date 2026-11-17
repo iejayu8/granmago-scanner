@@ -180,7 +180,7 @@ class SimulationTest(unittest.TestCase):
         server.STATE, server.STATE_FILE, server._clock = self.saved
         server._RATE_LIMIT_UNTIL = 0
         server._NEXT_REQUEST_AT = 0
-        for d in (server._INSTRUMENTS, server._PAIR_HEALTH, server._CLOSE_TRIES):
+        for d in (server._INSTRUMENTS, server._DEMO_INSTRUMENTS, server._PAIR_HEALTH, server._CLOSE_TRIES):
             d.clear()
         server._DEMO_UNIVERSE.update(ids=None, at=None, missing=[])
         self.tmp.cleanup()
@@ -214,7 +214,7 @@ class SimulationTest(unittest.TestCase):
         # that would switch the in-memory ledger and save it).
         server.TRADER = server.TRADING_CONFIG = server.JOURNAL = server.TRADING_ERROR = None
         server.STATE = server.load_state()
-        for d in (server._INSTRUMENTS, server._PAIR_HEALTH, server._CLOSE_TRIES):
+        for d in (server._INSTRUMENTS, server._DEMO_INSTRUMENTS, server._PAIR_HEALTH, server._CLOSE_TRIES):
             d.clear()
         server._DEMO_UNIVERSE.update(ids=None, at=None, missing=[])
         server._RATE_LIMIT_UNTIL = 0

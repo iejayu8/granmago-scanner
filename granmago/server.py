@@ -47,7 +47,7 @@ PAIRS = list(DEFAULT_PAIRS)
 _PAIR_RE = re.compile(r"^[A-Z0-9]+-USDT$")
 MAX_CONFIGURED_PAIRS = 40
 
-VERSION = "1.7.3"
+VERSION = "1.7.4"
 
 # Walk-forward monitoring setup. The add-on pins these on every start.
 # Leftover options and a saved copy in state.json do not change them.
@@ -1167,7 +1167,11 @@ def _display_figures(snap):
     on the server clock. Demo equity comes from Blofin (it already contains the
     unrealized PnL) and is never rebuilt as balance + unrealized."""
     positions = [p for p in snap.get("openPositions") or [] if isinstance(p, dict)]
-    demo = snap.get("tradingMode") == "demo"
+    # 1.7.4: the active BOOK decides, not only the mode. With trading blocked
+    # (e.g. demo without keys, or live) the demo ledger stays active: its
+    # balance is Blofin's totalEquity, so "balance + unrealized" would count
+    # the open PnL twice and show a demo book as if it were paper.
+    demo = snap.get("tradingMode") == "demo" or snap.get("ledgerMode") == "demo"
     initial = _num_or_none(snap.get("initialBalance"))
     out = {"mode": snap.get("tradingMode"), "balance": None, "equity": None, "equitySource": None,
            "unrealized": None, "unrealizedSource": None, "pnlTotal": None, "unavailable": None,
@@ -1814,30 +1818,51 @@ def _valid_meta(meta, inst_id):
 def instrument_meta(inst_id, force=False, *, deadline=None):
     """Instrument metadata, cached INSTRUMENTS_TTL_SECONDS. force=True refetches
     (used right before a real/demo order). None when not live/compatible."""
+    return _instrument_meta_from(BLOFIN_MARKET, _INSTRUMENTS, inst_id, force, deadline)
+
+
+_DEMO_INSTRUMENTS = {}
+
+
+def demo_instrument_meta(inst_id, force=False, *, deadline=None):
+    """Order specs of the Blofin DEMO exchange (1.7.4). Demo orders must use
+    the demo lotSize/minSize/tickSize/maxMarketSize: on 17/11/2026 the public
+    lists differed for ADA, DOGE, XRP, PEPE (lot 0.01 live vs 0.1 demo), LINK,
+    ZEC (0.1 vs 1), DOT, ENA, PEPE (demo tick 10x) and maxMarketSize of SOL,
+    TAO, WLD, XRP, INJ, ETH. Live specs made those demo orders invalid."""
+    return _instrument_meta_from(DEMO_MARKET, _DEMO_INSTRUMENTS, inst_id, force, deadline)
+
+
+def _instrument_meta_from(base, cache, inst_id, force, deadline):
     now = time.monotonic()
     if not force:
         with _INSTRUMENTS_LOCK:
-            hit = _INSTRUMENTS.get(inst_id)
+            hit = cache.get(inst_id)
         if hit and now - hit[0] < INSTRUMENTS_TTL_SECONDS:
             return hit[1]
-    body = fetch_json(BLOFIN_MARKET + "instruments?instId=" + inst_id, deadline=deadline)
+    body = fetch_json(base + "instruments?instId=" + inst_id, deadline=deadline)
     try:
         items = _api_code(body, "instrumento")
+        if base == DEMO_MARKET and isinstance(items, list):
+            # Keep only the requested instrument (the list may come unfiltered).
+            items = [i for i in items if isinstance(i, dict) and i.get("instId") == inst_id] or items[:0]
+        if not items:
+            raise _Reject("instrumento %s no existe en %s" % (inst_id, "Blofin demo" if base == DEMO_MARKET else "Blofin"))
         if len(items) != 1 or not _valid_meta(items[0], inst_id):
             raise _Reject("instrumento no live/compatible (state=%s apiPermission=%s)" % (
                 (items[0] or {}).get("state"), (items[0] or {}).get("apiPermission")))
     except _Reject as exc:
         with _INSTRUMENTS_LOCK:
-            _INSTRUMENTS.pop(inst_id, None)
+            cache.pop(inst_id, None)
         _set_fail(str(exc))
         return None
     except (TypeError, IndexError, KeyError, AttributeError):
         with _INSTRUMENTS_LOCK:
-            _INSTRUMENTS.pop(inst_id, None)
+            cache.pop(inst_id, None)
         _set_fail("instrumento malformado")
         return None
     with _INSTRUMENTS_LOCK:
-        _INSTRUMENTS[inst_id] = (time.monotonic(), items[0])
+        cache[inst_id] = (time.monotonic(), items[0])
     return items[0]
 
 
@@ -3437,7 +3462,7 @@ def init_trading(environ=None, transport=None, sleep=time.sleep):
     if cfg.mode == "demo":
         import fiscal_journal
         TRADER = blofin_trading.DemoTrader(cfg, DATA_DIR, transport=transport, sleep=sleep,
-                                           instrument_meta=lambda inst, force=False: instrument_meta(inst, force))
+                                           instrument_meta=lambda inst, force=False: demo_instrument_meta(inst, force))
         JOURNAL = fiscal_journal.FiscalJournal(DATA_DIR / "fiscal_journal_demo.sqlite", mode="demo",
                                                engine_version=VERSION, instance=env.get("GRANMAGO_INSTANCE", "ha"))
         with LOCK:
@@ -3609,7 +3634,7 @@ def trading_cycle(force_reconcile=False):
             TRADER.alert("Cierre %s falló: %r" % (pos["pair"], exc), "error")
     for pos in moves:
         try:
-            meta = instrument_meta(pos["pair"])
+            meta = demo_instrument_meta(pos["pair"])  # demo tickSize, not live (1.7.4)
             new_id, sl = TRADER.replace_stop(pos["pair"], pos["side"], pos["sl"], pos["tp"], pos.get("tpslId"),
                                              pos.get("clientOrderId") or "", float((meta or {}).get("tickSize") or 0))
             with LOCK:
@@ -3790,14 +3815,14 @@ def api_start():
                 bal = float(body["initialBalance"])
             except (TypeError, ValueError):
                 bal = STATE["balance"]
-            if bal > 0:
+            if math.isfinite(bal) and bal > 0:  # 1.7.4: NaN/Infinity never become the balance
                 STATE["balance"] = bal
                 STATE["initialBalance"] = bal
         STATE["running"] = True
         add_log("Bot iniciado en el servidor. Sigue aunque cierres esta página.")
         save_state()
     kick()
-    return jsonify(public_state())
+    return jsonify(_finite(public_state()))
 
 
 @app.route("/api/stop", methods=["POST"])
@@ -3809,7 +3834,7 @@ def api_stop():
             " El SL/TP sigue en Blofin y la conciliación sigue activa." if TRADER is not None else ""))
         save_state()
     kick()
-    return jsonify(public_state())
+    return jsonify(_finite(public_state()))
 
 
 @app.route("/api/reset", methods=["POST"])
@@ -3823,7 +3848,7 @@ def api_reset():
             bal = float(body.get("initialBalance") or STATE["settings"].get("initialHint") or os.environ.get("INITIAL_BALANCE") or 10000)
         except (TypeError, ValueError):
             bal = 10000
-        if bal <= 0:
+        if not math.isfinite(bal) or bal <= 0:  # 1.7.4: NaN passed "bal <= 0"
             bal = 10000
         running = STATE["running"]
         settings = STATE["settings"]
@@ -3837,7 +3862,7 @@ def api_reset():
         STATE["settings"] = settings
         add_log("Reset. Balance %.2f" % bal)
         save_state()
-    return jsonify(public_state())
+    return jsonify(_finite(public_state()))
 
 
 def _apply_settings_locked(body):
@@ -3863,7 +3888,7 @@ def api_settings():
     with LOCK:
         _apply_settings_locked(body)
         save_state()
-    return jsonify(public_state())
+    return jsonify(_finite(public_state()))
 
 
 @app.route("/api/scan", methods=["POST"])
@@ -3896,6 +3921,11 @@ def api_close_position():
             if expected is None:
                 return jsonify({"ok": False, "error": "sin_posicion"}), 409
             if expected.get("exchange"):
+                if TRADER is None:
+                    # 1.7.4: trading blocked, nobody would send this close; queuing
+                    # it would fire it on Blofin whenever demo comes back.
+                    add_log("No se cierra %s: posición DEMO y el trading está bloqueado (%s)." % (pair, TRADING_ERROR))
+                    return jsonify({"ok": False, "error": "trading_bloqueado", "detail": TRADING_ERROR}), 409
                 _request_exchange_close(expected, "manual")
                 save_state()
                 return jsonify(dict(public_state_locked_free(), ok=True, queued=True)), 202
@@ -3910,7 +3940,7 @@ def api_close_position():
                 return jsonify({"ok": False, "error": "sin_precio"}), 503
             close_position("manual", quote.price, pair, quote=quote)
             save_state()
-        return jsonify(public_state())
+        return jsonify(_finite(public_state()))
     finally:
         _closing.release()
 
@@ -3932,6 +3962,12 @@ def kill_switch(enabled, close_all=False):
                                        " y cierre de todas las posiciones" if enabled and close_all else ""))
         _alert("kill_switch", "activado" if enabled else "desactivado")
         pairs = [p["pair"] for p in _positions()] if enabled and close_all else []
+        if TRADER is None:
+            # 1.7.4: demo positions cannot be closed while trading is blocked.
+            held = [p["pair"] for p in _positions() if p.get("exchange") and p["pair"] in pairs]
+            if held:
+                add_log("Kill switch: %s son posiciones DEMO y el trading está bloqueado; no se cierran." % ", ".join(held))
+            pairs = [p for p in pairs if p not in held]
         for pair in pairs:
             pos = _find_position(pair)
             if pos is not None and pos.get("exchange"):

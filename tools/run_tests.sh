@@ -6,7 +6,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 JSDOM_DIR="${GRANMAGO_JSDOM_DIR:-$HOME/.cache/granmago-jsdom}"
 if [ ! -d "$JSDOM_DIR/node_modules/jsdom" ] && [ ! -d /workspace/granmago-robustez-1.7.2/node_modules/jsdom ]; then
-  mkdir -p "$JSDOM_DIR" && (cd "$JSDOM_DIR" && npm install --silent --no-audit --no-fund jsdom >/dev/null)
+  # Without a package.json npm 11 walks up and fails ("Tracker idealTree already exists").
+  mkdir -p "$JSDOM_DIR" && (cd "$JSDOM_DIR" && { [ -f package.json ] || npm init -y >/dev/null; } \
+    && npm install --silent --no-audit --no-fund jsdom >/dev/null)
 fi
 export GRANMAGO_JSDOM_DIR="${GRANMAGO_JSDOM_DIR:-$JSDOM_DIR}"
 [ -d "$GRANMAGO_JSDOM_DIR/node_modules/jsdom" ] || export GRANMAGO_JSDOM_DIR=/workspace/granmago-robustez-1.7.2

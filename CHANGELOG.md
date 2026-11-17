@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.7.4
+
+Pasada de calidad del 17/11/2026 (smoke paper/demo + exploratorio sobre 1.7.2–1.7.3).
+
+- **Demo: las órdenes usan las especificaciones del exchange demo.** El tamaño (`lotSize`, `minSize`, `maxMarketSize`) y el redondeo de SL/TP (`tickSize`) de las órdenes demo se calculaban con `GET /api/v1/market/instruments` del exchange **real**. Las listas públicas del 17/11/2026 difieren en pares configurados: ADA, DOGE, XRP y PEPE (lote 0,01 real / 0,1 demo), LINK y ZEC (0,1 / 1), DOT, ENA y PEPE (tick 10 veces mayor en demo) y `maxMarketSize` de SOL, TAO, WLD, XRP, INJ y ETH. Blofin demo podía rechazar esas entradas o el SL/TP. Ahora la entrada y el movimiento del SL leen `instruments?instId=` de `demo-trading-openapi.blofin.com` (caché propia de 10 min). Precios y escaneo siguen saliendo del mercado real.
+- **Trading bloqueado con el libro demo activo.** Con `trading_mode: demo` sin claves (o `live`), el libro activo sigue siendo el demo, pero el panel lo calculaba como paper: Equity = saldo (que ya es `totalEquity` de Blofin) + PnL no realizado, contando dos veces el PnL. Ahora manda el libro (`ledgerMode`): Equity de Blofin mientras el saldo sea reciente y "sin saldo Blofin reciente" después. Además, cerrar una posición DEMO (botón o kill switch con `closeAll`) se rechaza con `409 trading_bloqueado` en vez de quedar en cola y dispararse en Blofin cuando vuelva el modo demo.
+- `/api/reset` y `/api/start` ignoran un `initialBalance` `NaN`/`Infinity` (por API; `NaN` pasaba el filtro `bal <= 0` y dejaba el saldo en NaN). Las respuestas de `start`, `stop`, `reset`, `settings` y `close_position` pasan por el mismo filtro de NaN que `/api/state`.
+- Panel: un error al dibujar la respuesta de un botón (Iniciar, Detener…) muestra "Error del panel" en vez de "Sin conexión con el servidor", igual que el refresco.
+- `tools/run_tests.sh`: crea el `package.json` del directorio de jsdom antes de `npm install` (npm 11 fallaba en silencio y la suite salía con código 1 sin ejecutar nada).
+- Tests: `tests/test_qa_1_7_4.py` (8 tests, todos fallan en 1.7.3).
+
 ## 1.7.3
 
 - **Panel demo: saldo libre y margen en uso.** En demo la tarjeta "Balance (Blofin demo)" mostraba `details[USDT].balance` ("Cash balance"), que excluye el margen aislado de las posiciones abiertas: 838 junto a una Equity de 1000,43 parecía dinero perdido. Ahora:
