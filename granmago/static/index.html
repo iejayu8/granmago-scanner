@@ -473,11 +473,18 @@ async function post(path, body) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body || {})
     });
-    const data = await r.json();
-    if (data && typeof data.balance === "number") render(data);
-    else refresh();
+    var data = await r.json();
   } catch (e) {
     $("scanStatus").textContent = "Sin conexión con el servidor";
+    return;
+  }
+  if (!(data && typeof data.balance === "number")) return refresh();
+  try {
+    render(data);
+  } catch (e) {
+    // Same rule as refresh(): a rendering bug is not a network outage.
+    console.error("render", e);
+    $("scanStatus").textContent = "Error del panel: " + (e && e.message ? e.message : e);
   }
 }
 
