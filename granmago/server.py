@@ -47,7 +47,7 @@ PAIRS = list(DEFAULT_PAIRS)
 _PAIR_RE = re.compile(r"^[A-Z0-9]+-USDT$")
 MAX_CONFIGURED_PAIRS = 40
 
-VERSION = "1.7.5"
+VERSION = "1.7.6"
 
 # Walk-forward monitoring setup. The add-on pins these on every start.
 # Leftover options and a saved copy in state.json do not change them.
@@ -891,7 +891,8 @@ def default_state():
         "lastReconcileAt": None,
         "exchangeAccount": None,      # last Blofin demo account/balance snapshot
         "migrations": [],
-        "lastPaperRebuild": None,     # 1.7.5: what the paper rebuild changed, if anything
+        "lastPaperRebuild": None,
+        "demoBaseMigration": None,    # 1.7.6: demo initialBalance USD -> USDT     # 1.7.5: what the paper rebuild changed, if anything
         "settings": {
             "riskPct": 1.0,
             "leverage": 3,
@@ -1163,6 +1164,41 @@ def _num_or_none(value):
     return out if math.isfinite(out) else None
 
 
+def _demo_equity_usdt(acc):
+    """Demo account equity in USDT: details[USDT].equity; totalEquity (USD) only
+    as a fallback when Blofin does not send the currency row."""
+    if not isinstance(acc, dict):
+        return None
+    eq = _num_or_none(acc.get("equity"))
+    return eq if eq is not None else _num_or_none(acc.get("totalEquity"))
+
+
+DEMO_USDT_BASE_MIGRATION = "1.7.6-demo-usdt-base"
+
+
+def _migrate_demo_base_usdt(acc):
+    """Up to 1.7.5 the demo initialBalance was taken from totalEquity (USD).
+    Convert it once to USDT with the account's own USDT/USD ratio, so PnL total
+    = equity (USDT) - initial (USDT). Caller holds LOCK; demo book active."""
+    done = STATE.setdefault("migrations", [])
+    if DEMO_USDT_BASE_MIGRATION in done:
+        return
+    initial = _num_or_none(STATE.get("initialBalance"))
+    eq, usd = _num_or_none(acc.get("equity")), _num_or_none(acc.get("totalEquity"))
+    if initial is None:
+        done.append(DEMO_USDT_BASE_MIGRATION)  # a new base is taken in USDT
+        return
+    if eq is None or usd is None or eq <= 0 or usd <= 0 or not 0.9 < eq / usd < 1.1:
+        return  # retry on the next readable balance
+    new = round(initial * eq / usd, 4)
+    log.warning("Migración 1.7.6: saldo inicial DEMO de USD a USDT %.4f -> %.4f (USDT/USD %.6f).",
+                initial, new, eq / usd)
+    add_log("Migración 1.7.6: saldo inicial DEMO en USDT %.2f (antes %.2f en USD de Blofin)." % (new, initial))
+    STATE["initialBalance"] = new
+    STATE["demoBaseMigration"] = {"old": initial, "new": new, "ratio": eq / usd, "at": _now()}
+    done.append(DEMO_USDT_BASE_MIGRATION)
+
+
 def _display_figures(snap):
     """Balance, equity and PnL the panel shows: one source of truth, computed
     on the server clock. Demo equity comes from Blofin (it already contains the
@@ -1190,7 +1226,9 @@ def _display_figures(snap):
         acc = snap.get("exchangeAccount") if isinstance(snap.get("exchangeAccount"), dict) else {}
         age = acc.get("ageSeconds")
         fresh = age is not None and age <= ACCOUNT_DISPLAY_MAX_AGE_SECONDS
-        total = _num_or_none(acc.get("totalEquity")) if fresh else None
+        # 1.7.6: equity in USDT (details[USDT].equity). totalEquity is "in USD"
+        # per the docs: ~0.1 % off and it did not add up with the USDT cards.
+        total = _demo_equity_usdt(acc) if fresh else None
         if total is None:
             out["unavailable"] = "sin saldo Blofin reciente" if acc else "esperando el primer saldo de Blofin"
         else:
@@ -3816,16 +3854,21 @@ def trading_cycle(force_reconcile=False):
                 acc["positionsMargin"] = TRADER.positions_margin(TRADER.last_positions)
                 with LOCK:
                     STATE["exchangeAccount"] = acc
-                bal = next((acc[k] for k in ("totalEquity", "equity", "available") if acc.get(k) is not None), None)
+                # 1.7.6: USDT equity (details[USDT].equity), not totalEquity (USD).
+                bal = next((acc[k] for k in ("equity", "totalEquity", "available") if acc.get(k) is not None), None)
                 if bal is not None:
                     with LOCK:
                         STATE["balance"] = round(bal, 4)
                         STATE["balanceSource"] = "blofin-demo"
+                        _migrate_demo_base_usdt(acc)
                         if STATE.get("initialBalance") is None:
                             # Demo starts from the first balance Blofin reports
-                            # (minus the PnL of demo trades already booked).
+                            # (minus the PnL of demo trades already booked and
+                            # the open PnL already inside that equity).
                             booked = sum(float(h.get("pnl") or 0) for h in STATE.get("history") or [])
-                            STATE["initialBalance"] = round(bal - booked, 4)
+                            open_pnl = sum((_num_or_none((p.get("exchangeMark") or {}).get("unrealizedPnl")) or 0.0)
+                                           for p in _positions() if p.get("exchange"))
+                            STATE["initialBalance"] = round(bal - booked - open_pnl, 4)
                             add_log("Saldo inicial DEMO fijado en %.2f USDT (Blofin)." % STATE["initialBalance"])
             except Exception as exc:
                 TRADER.alert("Balance demo no disponible: %r" % exc)

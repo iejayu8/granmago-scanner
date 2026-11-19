@@ -45,6 +45,7 @@ class FakeBlofin:
         self.tpsl_error = False
         self.fee_rate = 0.0006
         self.funding_fee = "-0.05"
+        self.usdt_usd = 0.999035  # USDT priced in USD, as Blofin's totalEquity
 
     # ------------------------------------------------------------ transport
     def __call__(self, method, url, headers, data, timeout):
@@ -105,7 +106,11 @@ class FakeBlofin:
                 upnl += self._upnl(i, v)
         free = 1000.5 - margin
         iso = margin + upnl
-        return self.ok({"ts": str(int(time.time() * 1000)), "totalEquity": repr(free + iso), "isolatedEquity": repr(iso),
+        # totalEquity / isolatedEquity are "in USD" (docs); details are USDT.
+        # Real demo 19/11: equity 1013.7669 USDT vs totalEquity 1012.7891 USD.
+        usd = self.usdt_usd
+        return self.ok({"ts": str(int(time.time() * 1000)), "totalEquity": repr((free + iso) * usd),
+                        "isolatedEquity": repr(iso * usd),
                         "details": [{"currency": "USDT", "equity": repr(free + iso), "balance": repr(free),
                                      "available": repr(free), "isolatedEquity": repr(iso), "frozen": "0",
                                      "orderFrozen": "0", "isolatedUnrealizedPnl": repr(upnl), "ts": "1"}]})

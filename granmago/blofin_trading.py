@@ -505,7 +505,7 @@ class DemoTrader:
 
     def balance(self):
         acc = self.account()
-        for key in ("totalEquity", "equity", "available"):
+        for key in ("equity", "totalEquity", "available"):  # USDT first; totalEquity is in USD
             if acc.get(key) is not None:
                 return acc[key]
         return None

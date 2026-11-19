@@ -149,9 +149,10 @@ class PanelContractTest(unittest.TestCase):
             self.assertIsInstance(s.get(key), NUM, "%s: settings.%s" % (name, key))
         d = snap["display"]
         if snap["tradingMode"] == "demo" and d["equity"] is not None:
-            # Never balance + unrealized in demo: equity is Blofin's totalEquity.
+            # Never balance + unrealized in demo: equity is Blofin's USDT equity
+            # (details[USDT].equity), not totalEquity (USD).
             self.assertEqual(d["equitySource"], "blofin")
-            self.assertEqual(d["equity"], round(snap["exchangeAccount"]["totalEquity"], 2))
+            self.assertEqual(d["equity"], round(snap["exchangeAccount"]["equity"], 2))
 
     def test_contract_and_headless_render_of_every_state(self):
         states = self.build_states()

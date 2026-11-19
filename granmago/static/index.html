@@ -312,7 +312,7 @@ function render(s) {
     ? +s.settings.maxPositions : 5;
   const stalePrices = positions.some((p) => p.priceStale);
   // All money figures come from the server (s.display): one clock, one rule.
-  // Demo equity is Blofin's own totalEquity (it already includes unrealized PnL).
+  // Demo equity is Blofin details[USDT].equity (USDT; it already includes unrealized PnL).
   const d = s.display || {};
   const money = (v, digits) => (v == null || !isFinite(+v)) ? null
     : (+v).toLocaleString(undefined, { maximumFractionDigits: digits });

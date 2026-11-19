@@ -54,7 +54,7 @@ class SignatureTest(unittest.TestCase):
     def test_client_signs_every_request_and_fake_verifies(self):
         fake = FakeBlofin()
         client = bt.BlofinPrivateClient(config(), transport=fake)
-        self.assertEqual(client.request("GET", "/api/v1/account/balance")["totalEquity"], "1000.5")
+        self.assertEqual(client.request("GET", "/api/v1/account/balance")["details"][0]["equity"], "1000.5")
         client.request("GET", "/api/v1/trade/orders-tpsl-pending", params={"instId": "XMR-USDT", "x": None})
         self.assertEqual(fake.calls[-1][2], {"instId": "XMR-USDT"})
         client.request("GET", "/api/v1/trade/orders-tpsl-pending", params={"instId": None})  # no bare "?"
@@ -191,7 +191,7 @@ class AccountTest(TraderCase):
         self.assertEqual(acc["totalEquity"], 10011254.07)
         self.assertEqual(acc["balance"], 10013119.88)
         self.assertEqual(acc["isolatedUnrealizedPnl"], -22.15)
-        self.assertEqual(self.trader.balance(), 10011254.07)
+        self.assertEqual(self.trader.balance(), 10014042.98)  # 1.7.6: USDT equity, not totalEquity (USD)
         self.fake.h_get_account_balance = lambda p, b: {"code": "0", "data": {"details": []}}
         self.assertIsNone(self.trader.balance())
 
