@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.7.5
+
+- **Libro paper con el saldo demo de 1.7.0 (999,282 en vez de 10.382,24 USDT).**
+  - **Qué pasaba:** en el complemento (1.7.4, demo) la migración `1.7.1-ledgers` constaba como hecha, pero la copia del libro paper seguía con el saldo de Blofin de 1.7.0: 999,282 USDT, inicial 10.000, 8 operaciones, fecha 14/11 20:24. Al volver a `trading_mode: paper` se habría restaurado 999,282.
+  - **Causa:** la migración 1.7.1 solo daba la copia por contaminada si su saldo era igual al saldo actual. Cuando arrancó la 1.7.1, `trading_cycle` ya había actualizado el saldo con una lectura nueva de Blofin (999,416), así que la copia se conservó tal cual y la migración se marcó como hecha.
+  - **Arreglo:** nueva migración única `1.7.5-paper-rebuild`, que funciona aunque `1.7.1-ledgers` ya esté marcada.
+    - Comprueba el libro paper (la copia en demo o el libro activo en paper) contra su propia regla: saldo = `initialBalance` + PnL realizado de sus operaciones paper − comisiones de entrada de sus posiciones abiertas.
+    - Lo reconstruye solo si se dan las dos condiciones que deja la contaminación de 1.7.0. La primera: la diferencia supera 5 USDT o el 1 % del saldo inicial. La segunda: el saldo coincide (±5 %) con una cifra demo de Blofin que ya tenemos (saldo o inicial del libro demo, o `exchangeAccount`).
+    - Con el estado del 19/11 el resultado es 10.000 + 382,24 = **10.382,24 USDT** con sus 8 operaciones. Un libro paper que no cuadra pero no parece demo solo se registra.
+    - Guarda la copia anterior en `/data/paper_snapshot_backup_<libro>_<fecha>.json`, lo anota en el registro (`Migración 1.7.5: …`) y deja el resumen en `lastPaperRebuild`.
+    - No toca el libro demo, sus posiciones (el SOL-USDT abierto) ni Blofin: no hace ninguna llamada.
+    - No adivina nada: si falta `initialBalance` o el historial está truncado a 200 filas, solo lo registra.
+    - Es idempotente: un libro correcto no se toca, ni siquiera forzando otra pasada.
+- Tests: `tests/test_paper_rebuild_175.py` (7 tests; 5 fallan en 1.7.4). Reproducen el estado del 19/11 y comprueban la idempotencia, que el libro demo queda intacto, el caso paper activo, que los libros sanos no se tocan y la causa raíz.
+
 ## 1.7.4
 
 Pasada de calidad del 17/11/2026 (smoke paper/demo + exploratorio sobre 1.7.2–1.7.3).

@@ -47,7 +47,7 @@ PAIRS = list(DEFAULT_PAIRS)
 _PAIR_RE = re.compile(r"^[A-Z0-9]+-USDT$")
 MAX_CONFIGURED_PAIRS = 40
 
-VERSION = "1.7.4"
+VERSION = "1.7.5"
 
 # Walk-forward monitoring setup. The add-on pins these on every start.
 # Leftover options and a saved copy in state.json do not change them.
@@ -891,6 +891,7 @@ def default_state():
         "lastReconcileAt": None,
         "exchangeAccount": None,      # last Blofin demo account/balance snapshot
         "migrations": [],
+        "lastPaperRebuild": None,     # 1.7.5: what the paper rebuild changed, if anything
         "settings": {
             "riskPct": 1.0,
             "leverage": 3,
@@ -3318,6 +3319,15 @@ def trading_mode():
 # keys; the other is parked in paperSnapshot / demoLedger. Caller holds LOCK.
 BOOK_KEYS = ("balance", "initialBalance", "history", "openPositions", "tradeSeq", "usedSignals", "cooldowns")
 LEDGER_MIGRATION = "1.7.1-ledgers"
+PAPER_REBUILD_MIGRATION = "1.7.5-paper-rebuild"
+# A paper book always satisfies balance = initialBalance + sum(pnl of its trades)
+# - entry fees of its open positions (up to rounding). A gap this large means
+# the book carries a Blofin demo balance (the 1.7.0 contamination).
+PAPER_REBUILD_MIN_GAP_USDT = 5.0
+PAPER_REBUILD_MIN_GAP_PCT = 0.01
+# ...and only when the paper balance looks like a Blofin demo figure we hold
+# (demo initial/balance/equity, within 5 %): the exact 1.7.0 signature.
+PAPER_REBUILD_DEMO_MATCH_PCT = 0.05
 
 
 def _book_copy():
@@ -3405,6 +3415,121 @@ def _migrate_ledgers_1_7_1():
     done.append(LEDGER_MIGRATION)
 
 
+def _paper_book_expected(book):
+    """(expected balance, paper rows) for a paper book, or (None, reason)."""
+    try:
+        initial = float(book.get("initialBalance"))
+    except (TypeError, ValueError):
+        return None, "sin initialBalance"
+    if not math.isfinite(initial) or initial <= 0:
+        return None, "initialBalance inválido"
+    rows = [h for h in (book.get("history") or []) if isinstance(h, dict)]
+    if len(rows) >= 200:
+        return None, "historial truncado (200)"  # older trades are gone: cannot rebuild
+    paper = [h for h in rows if not h.get("exchange")]
+    try:
+        pnl = sum(float(h.get("pnl") or 0) for h in paper)
+        fees = sum(float(p.get("entryFee") or 0) for p in (book.get("openPositions") or [])
+                   if isinstance(p, dict) and not p.get("exchange"))
+    except (TypeError, ValueError):
+        return None, "pnl ilegible"
+    return round(initial + pnl - fees, 4), paper
+
+
+def _demo_balance_refs():
+    refs = []
+    if STATE.get("ledgerMode") == "demo" or STATE.get("balanceSource") == "blofin-demo":
+        refs += [STATE.get("balance"), STATE.get("initialBalance")]
+    demo = STATE.get("demoLedger") if isinstance(STATE.get("demoLedger"), dict) else {}
+    refs += [demo.get("balance"), demo.get("initialBalance")]
+    acc = STATE.get("exchangeAccount") if isinstance(STATE.get("exchangeAccount"), dict) else {}
+    refs += [acc.get(k) for k in ("totalEquity", "balance", "available", "equity")]
+    out = []
+    for r in refs:
+        try:
+            r = float(r)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(r) and r > 0:
+            out.append(r)
+    return out
+
+
+def _backup_paper_book(book, label):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.fromtimestamp(now_epoch()).strftime("%Y%m%d-%H%M%S")
+    path = DATA_DIR / ("paper_snapshot_backup_%s_%s.json" % (label, stamp))
+    n = 1
+    while path.exists():
+        n += 1
+        path = DATA_DIR / ("paper_snapshot_backup_%s_%s_%d.json" % (label, stamp, n))
+    path.write_text(json.dumps(book, indent=2), encoding="utf-8")
+    return path
+
+
+def _migrate_paper_rebuild_1_7_5():
+    """Repair paper books still carrying the 1.7.0 demo balance. Caller holds LOCK.
+
+    1.7.1 only rebuilt the paper snapshot when it equalled the CURRENT balance;
+    by then trading_cycle had refreshed the balance from Blofin (999.282 vs
+    999.416), so the corrupt snapshot was kept and the flag set anyway. This
+    checks the paper book itself (parked snapshot in demo, active book in
+    paper) against initialBalance + its own paper trades. Never touches the
+    demo book, demo positions or Blofin. Runs once; idempotent anyway.
+    """
+    done = STATE.setdefault("migrations", [])
+    if PAPER_REBUILD_MIGRATION in done:
+        return None
+    report = None
+    mode = STATE.get("ledgerMode") or "paper"
+    if mode == "demo" or STATE.get("balanceSource") == "blofin-demo":
+        book, where = STATE.get("paperSnapshot"), "paperSnapshot"
+    else:
+        book, where = _book_copy(), "activo"
+    if isinstance(book, dict):
+        expected, paper = _paper_book_expected(book)
+        try:
+            current = float(book.get("balance"))
+        except (TypeError, ValueError):
+            current = None
+        gap = None if expected is None or current is None else abs(current - expected)
+        looks_demo = current is not None and any(
+            abs(current - r) <= PAPER_REBUILD_DEMO_MATCH_PCT * r for r in _demo_balance_refs())
+        if expected is None:
+            log.warning("Migración 1.7.5: libro paper (%s) sin comprobar: %s.", where, paper)
+            add_log("Migración 1.7.5: libro paper (%s) sin comprobar: %s." % (where, paper))
+        elif gap is not None and gap > max(PAPER_REBUILD_MIN_GAP_USDT,
+                                           PAPER_REBUILD_MIN_GAP_PCT * float(book["initialBalance"])) and not looks_demo:
+            log.warning("Migración 1.7.5: libro paper (%s) %.2f no cuadra con sus operaciones (%.2f) pero no "
+                        "parece un saldo demo: sin cambios.", where, current, expected)
+            add_log("Migración 1.7.5: libro paper (%s) %.2f no cuadra con sus operaciones (%.2f); no parece saldo "
+                    "demo, sin cambios." % (where, current, expected))
+        elif gap is not None and gap > max(
+                PAPER_REBUILD_MIN_GAP_USDT, PAPER_REBUILD_MIN_GAP_PCT * float(book["initialBalance"])):
+            backup = _backup_paper_book(book, where)
+            report = {"where": where, "old": current, "new": expected, "trades": len(paper),
+                      "backup": backup.name}
+            if where == "paperSnapshot":
+                fixed = dict(book, balance=expected, history=paper, at=_now(), rebuiltBy=PAPER_REBUILD_MIGRATION,
+                             previousBalance=current, backup=backup.name)
+                fixed.setdefault("tradeSeq", _max_trade_id(paper))
+                fixed.setdefault("usedSignals", {})
+                fixed.setdefault("cooldowns", {})
+                STATE["paperSnapshot"] = fixed
+            else:
+                STATE["balance"] = expected
+                STATE["history"] = paper
+            log.warning("Migración 1.7.5: libro paper (%s) reconstruido %s -> %.2f USDT (%d operaciones paper); "
+                        "copia en %s", where, current, expected, len(paper), backup)
+            add_log("Migración 1.7.5: libro paper reconstruido de %s a %.2f USDT (%d operaciones). Copia: %s" % (
+                current, expected, len(paper), backup.name))
+        else:
+            add_log("Migración 1.7.5: libro paper correcto (%.2f USDT, %d operaciones)." % (current, len(paper)))
+    done.append(PAPER_REBUILD_MIGRATION)
+    STATE["lastPaperRebuild"] = report
+    return report
+
+
 def _switch_ledger(target):
     """Make the paper or demo book active. The paper snapshot is taken only
     when the active book really is paper, never from a Blofin balance."""
@@ -3457,6 +3582,7 @@ def init_trading(environ=None, transport=None, sleep=time.sleep):
     blofin_trading.install_redactor(cfg.secrets())
     with LOCK:
         _migrate_ledgers_1_7_1()
+        _migrate_paper_rebuild_1_7_5()
         _switch_ledger(cfg.mode)
         save_state()
     if cfg.mode == "demo":
