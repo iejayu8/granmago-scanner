@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.7.6
+
+- **Demo: Equity y PnL total en USDT.** Blofin devuelve `totalEquity` "en USD" (según su documentación), y el panel lo mostraba como la Equity en USDT. El saldo inicial demo también salía de ese campo. Por eso las tarjetas no cuadraban.
+  - Ejemplo con la cuenta real (19/11, 16:56): saldo libre 742,54 + margen 255,41 + PnL no realizado de Blofin 15,82 = **1013,77 USDT** (`details[USDT].equity`). El panel mostraba 1012,79, que es la misma cantidad en USD (USDT ≈ 0,99904 USD).
+  - Ahora la Equity demo y el saldo demo salen de `details[USDT].equity`; `totalEquity` solo se usa si falta la fila de USDT.
+- **Saldo inicial demo en USDT.** La migración única `1.7.6-demo-usdt-base` convierte el saldo inicial que había en USD con la relación USDT/USD de la propia cuenta. En la cuenta real: 999,416 USD → 1000,38 USDT.
+  - El PnL total pasa de +13,37 (en USD) a +13,39 USDT, el mismo resultado económico ya en la misma unidad que la Equity.
+  - Deja constancia en el registro y en `demoBaseMigration`. No toca el historial, las posiciones ni Blofin.
+- Si el saldo inicial demo se fija con una posición abierta, se descuenta el PnL no realizado de esa posición (antes quedaba dentro de la base).
+- FakeBlofin devuelve `totalEquity` en USD (×0,999035), como la cuenta real.
+- Tests: `tests/test_pnl_demo_176.py` (5 tests, todos fallan en 1.7.5) con las cifras reales del 19/11. Se ajustan los tests que daban por hecho que Equity = `totalEquity`.
+
 ## 1.7.5
 
 - **Libro paper con el saldo demo de 1.7.0 (999,282 en vez de 10.382,24 USDT).**

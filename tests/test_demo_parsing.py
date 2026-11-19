@@ -133,7 +133,7 @@ class FreeBalanceAndMarginTest(TraderCase):
         self.assertEqual(d["balanceSource"], "available")
         self.assertEqual(d["marginUsed"], 1879.09)
         self.assertEqual(d["marginSource"], "positions")
-        self.assertEqual(d["equity"], 10011254.08)  # totalEquity, unchanged
+        self.assertEqual(d["equity"], 10014042.99)  # 1.7.6: details[USDT].equity; totalEquity is USD
 
     def test_fallbacks(self):
         self.fake.h_get_account_balance = ok(DOCS_BALANCE)
@@ -164,7 +164,7 @@ class MalformedTest(TraderCase):
                     self.assertTrue(math.isfinite(v), (data, k, v))
             json.dumps(acc, allow_nan=False)
         self.fake.h_get_account_balance = ok([DOCS_BALANCE])
-        self.assertAlmostEqual(self.trader.balance(), 10011254.077985990315787910)
+        self.assertAlmostEqual(self.trader.balance(), 10014042.988958415234430699548)
 
     def test_unreadable_position_is_never_no_position(self):
         self.fake.h_get_trade_orders_pending = ok([])

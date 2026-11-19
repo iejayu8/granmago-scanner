@@ -98,7 +98,7 @@ class QA174Test(unittest.TestCase):
         d = self.client.get("/api/state").get_json()["display"]
         self.assertEqual(d["mode"], "blocked")
         self.assertEqual(d["equitySource"], "blofin")
-        self.assertEqual(d["equity"], round(acc["totalEquity"], 2))
+        self.assertEqual(d["equity"], round(acc["equity"], 2))
         self.assertEqual(d["balance"], round(acc["available"], 2))
 
     def test_blocked_demo_book_close_is_refused_not_queued(self):

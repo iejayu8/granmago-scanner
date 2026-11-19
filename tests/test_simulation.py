@@ -281,7 +281,7 @@ class SimulationTest(unittest.TestCase):
         if snap["tradingMode"] == "demo":
             acc = snap.get("exchangeAccount")
             if d["equity"] is not None:
-                self.assertEqual(d["equity"], round(acc["totalEquity"], 2))
+                self.assertEqual(d["equity"], round(acc["equity"], 2))  # USDT, not totalEquity (USD)
             if acc and acc.get("ageSeconds") is not None:
                 self.assertGreaterEqual(acc["ageSeconds"], -1)
         elif d["equity"] is not None:

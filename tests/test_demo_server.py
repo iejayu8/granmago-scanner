@@ -348,13 +348,13 @@ class DemoServerTest(unittest.TestCase):
         self.assertGreater(mark["unrealizedPnl"], 0)
         # Isolated margin leaves available/balance (real demo: 838 next to 1000.43).
         self.assertGreater(acc["positionsMargin"], 0)
-        self.assertAlmostEqual(acc["available"] + acc["positionsMargin"] + mark["unrealizedPnl"], acc["totalEquity"], places=6)
+        self.assertAlmostEqual(acc["available"] + acc["positionsMargin"] + mark["unrealizedPnl"], acc["equity"], places=6)
         self.assertAlmostEqual(acc["available"] + acc["positionsMargin"], 1000.5, places=6)
         state = self.client.get("/api/state").get_json()
         self.assertEqual(state["exchangeAccount"]["totalEquity"], acc["totalEquity"])
         d = state["display"]
         self.assertEqual((d["equity"], d["balance"], d["marginUsed"]),
-                         (round(acc["totalEquity"], 2), round(acc["available"], 2), round(acc["positionsMargin"], 2)))
+                         (round(acc["equity"], 2), round(acc["available"], 2), round(acc["positionsMargin"], 2)))
         persist()
         self.assertEqual(server.load_state()["exchangeAccount"]["totalEquity"], acc["totalEquity"])
 
