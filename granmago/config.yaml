@@ -1,5 +1,5 @@
 name: GranMago Scanner
-version: "1.7.7"
+version: "1.8.0"
 slug: granmago
 description: Scanner GranMago. Paper por defecto; demo de Blofin opcional (modo real bloqueado). El bot corre en el servidor aunque cierres la página.
 url: https://github.com/iejayu8/granmago-scanner
@@ -14,6 +14,8 @@ ingress: true
 ingress_port: 8787
 panel_icon: mdi:crystal-ball
 panel_title: GranMago
+map:
+  - share:rw
 ports:
   8787/tcp: 8787
 ports_description:
@@ -32,6 +34,8 @@ options:
   blofin_api_passphrase: ""
   control_token: ""
   kill_switch: false
+  fiscal_export_dir: /share/granmago-fiscal
+  fiscal_export_minutes: 15
   pairs:
     - BTC-USDT
     - ETH-USDT
@@ -75,5 +79,7 @@ schema:
   blofin_api_passphrase: password?
   control_token: password?
   kill_switch: bool
+  fiscal_export_dir: str?
+  fiscal_export_minutes: int(0,1440)
   pairs:
     - match(^[A-Za-z0-9]+-USDT$)

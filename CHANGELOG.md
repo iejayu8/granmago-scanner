@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.8.0
+
+- **Exportación del diario fiscal a /share.** El complemento copia cada `fiscal_journal_<modo>.sqlite` (demo ahora, `real` cuando exista) a `/share/granmago-fiscal/` para que se pueda leer fuera de él:
+  - `fiscal_journal_<modo>.sqlite`: copia consistente con la API de backup de SQLite, nunca `cp` en caliente. Queda en `journal_mode=DELETE` y conserva los triggers append-only.
+  - `fiscal_journal_<modo>.csv`: la vista `trades_eur` (operaciones + tipo BCE), con la columna `mode` (paper/demo/real).
+  - `manifest.json`: hora, versión, filas y SHA-256 de cada fichero.
+  - Escritura atómica: fichero temporal en la misma carpeta, fsync y rename. Permisos 0644.
+  - El diario original se abre en solo lectura y no se modifica nunca.
+- **Opciones nuevas:**
+  - `fiscal_export_dir` (por defecto `/share/granmago-fiscal`). Para el NAS: `/share/nas_ugreen/<carpeta>`.
+  - `fiscal_export_minutes` (por defecto 15; 0 = solo tras cada cierre).
+  - `map: share:rw` en `config.yaml`.
+- **Cuándo se exporta:** tras cada cierre y cada N minutos, en un hilo propio. Un NAS lento o desmontado nunca bloquea el trading.
+- **Fallos:** si la carpeta no existe (NAS desmontado) o no se puede escribir, solo se registra un aviso deduplicado (contador y última vez), que desaparece al volver a exportar bien. La carpeta por defecto se crea si existe `/share`; cualquier otra ruta tiene que existir ya, para no crear en local una carpeta que debería estar en el NAS. Una ruta dentro de `/data` se rechaza.
+- **Sin secretos:** antes de publicar cada fichero se comprueba que no contiene la API key, el secret, la passphrase, el token de control ni los tokens de HA. Si apareciera alguno, esa exportación se cancela y no se publica nada.
+- **Traza fiscal por operación (demo/real), esquema 2 del diario.** Migración idempotente con `ALTER TABLE ADD COLUMN`: no reescribe ninguna fila existente (las antiguas quedan con NULL en las columnas nuevas).
+  - Faltaba y se añade:
+    - `entry_trade_ids`: tradeIds de los fills de entrada, leídos en `fills-history` filtrando por el orderId de entrada;
+    - `entry_fee_usdt` y `exit_fee_usdt`: comisiones separadas, la de entrada ahora sale de los fills y no del detalle de la orden;
+    - `fee_source`;
+    - hora de apertura del primer fill de entrada (`open_time_source`/`close_time_source`; antes salía del `updateTime` de la orden);
+    - `missing_fields`, que señala lo que Blofin no dio;
+    - `row_hash_version`.
+  - Funding: sin dato de Blofin, `funding_status = unavailable` (antes `pending` con 0) y el CSV lo deja vacío. Si la operación dura más de 7 días (la consulta de funding de Blofin cubre como máximo 7), queda como `exchange_partial_7d`.
+  - Ya estaban y se comprueban: orderId de entrada y salida, tradeIds de salida, comisiones de los fills de salida, `fundingUsdt` y horas de apertura y cierre.
+- Tests: `tests/test_fiscal_export_180.py` (13 tests). Cubren los campos fiscales en demo y en `real` con el simulador, la migración sin tocar filas, la exportación sqlite/CSV/manifest, la columna `mode`, la exportación tras un cierre y por intervalo, la ruta configurable, la ruta inexistente y la ausencia de secretos.
+
 ## 1.7.7
 
 - **Alerta de saldo Blofin.** El 20/11 entre las 07:18 y las 07:30 (Madrid), `GET /api/v1/account/balance` devolvió `code=500 «Server internal error»`. El panel siguió mostrando 4 veces «Balance demo no disponible» después de que Blofin volviera a responder.

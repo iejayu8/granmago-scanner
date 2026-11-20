@@ -813,10 +813,33 @@ class DemoTrader:
                 "tradeIds": sorted({str(f.get("tradeId")) for f in fills}),
                 "ts": int(max(num(f.get("ts"), 0) for f in fills))}
 
+    def entry_fills(self, pair, side, order_id, since_ms):
+        """1.8.0: Blofin fills of the entry order (fiscal trace): tradeIds, fees,
+        first fill ts. None when Blofin does not return them (never invented)."""
+        if not order_id:
+            return None
+        try:
+            data = self.client.request("GET", "/api/v1/trade/fills-history",
+                                       params={"instId": pair, "begin": str(int(max(0, since_ms)))}) or []
+        except (BlofinError, AmbiguousResult, RateLimited):
+            return None
+        open_side = "buy" if side == "long" else "sell"
+        fills = [f for f in (data if isinstance(data, list) else []) if isinstance(f, dict)
+                 and str(f.get("orderId")) == str(order_id) and f.get("side") == open_side
+                 and num(f.get("fillSize"), 0) > 0 and f.get("tradeId") not in (None, "")]
+        if not fills:
+            return None
+        return {"tradeIds": sorted({str(f["tradeId"]) for f in fills}),
+                "fees": sum(abs(num(f.get("fee"), 0.0)) for f in fills),
+                "contracts": sum(num(f["fillSize"]) for f in fills),
+                "ts": int(min(num(f.get("ts"), 0) for f in fills)) or None}
+
+    FUNDING_MAX_WINDOW_MS = 7 * 86400 * 1000
+
     def funding(self, pair, begin_ms, end_ms):
         """Funding paid(-)/received(+) in the window, or None when unavailable."""
-        if end_ms - begin_ms > 7 * 86400 * 1000:
-            begin_ms = end_ms - 7 * 86400 * 1000
+        if end_ms - begin_ms > self.FUNDING_MAX_WINDOW_MS:
+            begin_ms = end_ms - self.FUNDING_MAX_WINDOW_MS
         try:
             data = self.client.request("GET", "/api/v1/account/funding-fees", params={
                 "instId": pair, "begin": str(int(begin_ms)), "end": str(int(end_ms))}) or []

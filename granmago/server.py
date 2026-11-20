@@ -47,7 +47,7 @@ PAIRS = list(DEFAULT_PAIRS)
 _PAIR_RE = re.compile(r"^[A-Z0-9]+-USDT$")
 MAX_CONFIGURED_PAIRS = 40
 
-VERSION = "1.7.7"
+VERSION = "1.8.0"
 
 # Walk-forward monitoring setup. The add-on pins these on every start.
 # Leftover options and a saved copy in state.json do not change them.
@@ -1653,8 +1653,115 @@ ALERTS = deque(maxlen=50)
 BALANCE_ALERT_KEY = "balance-demo"  # 1.7.7: one deduplicated alert, cleared when the balance reads again
 
 
-def _alert(kind, msg):
-    ALERTS.append({"at": _now(), "kind": kind, "msg": str(msg)[:300]})
+def _alert(kind, msg, key=None):
+    """key (1.8.0): the same alert is kept once with count/firstAt instead of
+    a new entry every time."""
+    entry = {"at": _now(), "kind": kind, "msg": str(msg)[:300]}
+    if key is not None:
+        prev = next((a for a in ALERTS if a.get("key") == key), None)
+        if prev is not None:
+            ALERTS.remove(prev)
+        entry.update(key=key, firstAt=(prev or entry).get("firstAt", entry["at"]),
+                     count=int((prev or {}).get("count") or 0) + 1)
+    ALERTS.append(entry)
+    return entry
+
+
+def _clear_alert(key):
+    for a in [a for a in ALERTS if a.get("key") == key]:
+        ALERTS.remove(a)
+
+
+# ============================================================ fiscal export
+# 1.8.0: copy of the append-only fiscal journals to /share (fiscal_export.py).
+# Runs on its own thread: a slow or unmounted NAS never blocks trading.
+FISCAL_EXPORT_ALERT_KEY = "fiscal-export"
+FISCAL_EXPORT_WAKE = threading.Event()
+FISCAL_EXPORT = {"dir": None, "minutes": None, "lastOkAt": None, "lastOkMono": None, "lastAttemptMono": None,
+                 "lastError": None, "failures": 0, "files": [], "reason": None}
+_FISCAL_EXPORT_LOCK = threading.Lock()
+
+
+def configure_fiscal_export(env=None):
+    import fiscal_export
+    env = os.environ if env is None else env
+    dest = (env.get("FISCAL_EXPORT_DIR") or "").strip() or fiscal_export.DEFAULT_DIR
+    try:
+        minutes = int(float(env.get("FISCAL_EXPORT_MINUTES", fiscal_export.DEFAULT_MINUTES)))
+    except (TypeError, ValueError):
+        minutes = fiscal_export.DEFAULT_MINUTES
+    FISCAL_EXPORT.update(dir=dest, minutes=max(0, min(1440, minutes)))
+    return dict(FISCAL_EXPORT)
+
+
+def request_fiscal_export(reason):
+    FISCAL_EXPORT["reason"] = reason
+    FISCAL_EXPORT_WAKE.set()
+
+
+def _export_secrets():
+    out = list(TRADING_CONFIG.secrets()) if TRADING_CONFIG is not None else []
+    for name in ("BLOFIN_API_KEY", "BLOFIN_API_SECRET", "BLOFIN_API_PASSPHRASE", "CONTROL_TOKEN",
+                 "SUPERVISOR_TOKEN", "HA_TOKEN"):
+        if os.environ.get(name):
+            out.append(os.environ[name])
+    return out
+
+
+def fiscal_export_now(reason="manual"):
+    """Export once. Never raises: a failure is one deduplicated alert."""
+    import fiscal_export
+    if FISCAL_EXPORT["dir"] is None:
+        configure_fiscal_export()
+    with _FISCAL_EXPORT_LOCK:
+        FISCAL_EXPORT["lastAttemptMono"] = time.monotonic()
+        try:
+            manifest = fiscal_export.export_all(DATA_DIR, FISCAL_EXPORT["dir"], secrets=_export_secrets(),
+                                                engine_version=VERSION)
+        except Exception as exc:
+            FISCAL_EXPORT["failures"] += 1
+            msg = "Exportación fiscal a %s fallida: %s" % (FISCAL_EXPORT["dir"], exc)
+            first = FISCAL_EXPORT["lastError"] != msg
+            FISCAL_EXPORT["lastError"] = msg
+            if first or FISCAL_EXPORT["failures"] % 10 == 0:
+                log.warning("%s (x%d)", msg, FISCAL_EXPORT["failures"])
+            _alert("fiscal", msg, key=FISCAL_EXPORT_ALERT_KEY)
+            return False
+        if FISCAL_EXPORT["lastError"]:
+            log.info("Exportación fiscal recuperada (%s).", FISCAL_EXPORT["dir"])
+        FISCAL_EXPORT.update(lastError=None, failures=0, lastOkMono=time.monotonic(), lastOkAt=_now(),
+                             files=[] if manifest is None else manifest["files"], reason=reason)
+        _clear_alert(FISCAL_EXPORT_ALERT_KEY)
+        return manifest is not None
+
+
+def fiscal_export_due(now_mono=None):
+    """True when a close asked for an export or the interval elapsed."""
+    if FISCAL_EXPORT_WAKE.is_set():
+        return True
+    minutes = FISCAL_EXPORT["minutes"]
+    if not minutes:
+        return False
+    now_mono = time.monotonic() if now_mono is None else now_mono
+    last = FISCAL_EXPORT["lastAttemptMono"]
+    return last is None or now_mono - last >= minutes * 60
+
+
+def fiscal_export_step(now_mono=None):
+    if not fiscal_export_due(now_mono):
+        return None
+    reason = "cierre" if FISCAL_EXPORT_WAKE.is_set() else "intervalo"
+    FISCAL_EXPORT_WAKE.clear()
+    return fiscal_export_now(FISCAL_EXPORT.get("reason") if reason == "cierre" else reason)
+
+
+def fiscal_export_loop():
+    while not STOP.is_set():
+        try:
+            fiscal_export_step()
+        except Exception:  # never dies; fiscal_export_now already never raises
+            log.exception("exportación fiscal")
+        FISCAL_EXPORT_WAKE.wait(30)
 
 
 def _retry_after_seconds(value):
@@ -3706,8 +3813,18 @@ def _request_exchange_close(pos, reason, fraction=1.0):
     return None
 
 
-def _book_exchange_close(pos, reason, fills, funding):
-    """Record a close with real Blofin fills. Caller holds LOCK."""
+def _book_exchange_close(pos, reason, fills, funding, entry=None):
+    """Record a close with real Blofin fills. Caller holds LOCK.
+
+    entry: Blofin fills of the entry order (TRADER.entry_fills) or None. With
+    them the entry fee is the fills' fee; without, the order-detail fee stays
+    and the journal flags it (missing_fields)."""
+    if entry:
+        pos["entryTradeIds"] = ",".join(entry["tradeIds"])
+        pos["entryFee"] = entry["fees"]
+        if entry.get("ts"):
+            pos["entryFillTs"] = int(entry["ts"])
+    fee_source = "blofin_fills" if entry else "blofin_order_detail+fills"
     pair = pos["pair"]
     cv = float(pos.get("contractValue") or 0)
     contracts = float(pos.get("contracts") or 0)
@@ -3728,7 +3845,9 @@ def _book_exchange_close(pos, reason, fills, funding):
         "fees": round(fills["fees"] + entry_fee, 6), "notional": round(contracts * cv * entry, 4),
         "tradeId": pos.get("tradeId"), "exchange": pos.get("exchange"),
         "exitOrderId": ",".join(fills["orderIds"]), "exchangeTradeIds": ",".join(fills["tradeIds"]),
-        "fundingUsdt": funding,
+        "fundingUsdt": funding, "fundingWindowTruncated": bool(fills.get("fundingWindowTruncated")),
+        "entryFees": round(entry_fee, 8), "exitFees": round(fills["fees"], 8), "feeSource": fee_source,
+        "entryOrderId": pos.get("entryOrderId"), "entryTradeIds": pos.get("entryTradeIds") or "",
         "exitMarket": {"source": "Blofin-demo-fill", "instId": pair, "ts": fills["ts"], "price": fills["exit"],
                        "observedAt": datetime.fromtimestamp(fills["ts"] / 1000, timezone.utc)
                        .astimezone().isoformat(timespec="seconds")},
@@ -3747,6 +3866,7 @@ def _book_exchange_close(pos, reason, fills, funding):
         except Exception as exc:
             log.error("diario fiscal demo: %r", exc)
             _alert("diario", "fallo al escribir el diario: %r" % exc)
+        request_fiscal_export("cierre %s" % pair)  # 1.8.0: copy to /share off the trading thread
     return closed
 
 
@@ -3762,11 +3882,16 @@ def _settle_closed(pos, reason=None):
     fills = TRADER.exit_fills(pos["pair"], pos["side"], int(pos.get("openedMs") or 0))
     if not fills:
         return False
-    funding = TRADER.funding(pos["pair"], int(pos.get("openedMs") or 0), fills["ts"])
+    opened = int(pos.get("openedMs") or 0)
+    funding = TRADER.funding(pos["pair"], opened, fills["ts"])
+    if funding is not None and (not opened or fills["ts"] - opened > TRADER.FUNDING_MAX_WINDOW_MS):
+        fills = dict(fills, fundingWindowTruncated=True)  # Blofin's funding query covers 7 days at most
+    # 1.8.0: entry fills for the fiscal trace (tradeIds, real fees, fill time).
+    entry = TRADER.entry_fills(pos["pair"], pos["side"], pos.get("entryOrderId"), opened - 120000)
     with LOCK:
         if pos not in _positions():
             return True
-        _book_exchange_close(pos, reason or _guess_exchange_reason(pos, fills["exit"]), fills, funding)
+        _book_exchange_close(pos, reason or _guess_exchange_reason(pos, fills["exit"]), fills, funding, entry)
         save_state()
     return True
 
@@ -3916,6 +4041,7 @@ def health():
         "degradedPairs": stats["degraded"], "safe": trading.get("safe", True),
         "unsafeReasons": trading.get("unsafeReasons", []),
         "alerts": (list(ALERTS)[-5:]) + (trading.get("alerts", [])[-5:]),
+        "fiscalExport": {k: FISCAL_EXPORT[k] for k in ("dir", "minutes", "lastOkAt", "lastError", "failures", "files")},
     }
 
 
@@ -4176,6 +4302,9 @@ def api_kill_switch():
 def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     init_trading()
+    cfg = configure_fiscal_export()
+    log.info("Exportación fiscal: %s cada %s min y tras cada cierre.", cfg["dir"], cfg["minutes"] or "-")
+    threading.Thread(target=fiscal_export_loop, name="granmago-fiscal-export", daemon=True).start()
     if TRADER is not None:
         start_trading()
         threading.Thread(target=_supervised("granmago-trading", trading_loop), name="granmago-trading",
