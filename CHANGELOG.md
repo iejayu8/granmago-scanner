@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.7.7
+
+- **Alerta de saldo Blofin.** El 20/11 entre las 07:18 y las 07:30 (Madrid), `GET /api/v1/account/balance` devolvió `code=500 «Server internal error»`. El panel siguió mostrando 4 veces «Balance demo no disponible» después de que Blofin volviera a responder.
+  - **Reintento con espera:** la lectura del saldo (un GET, nunca órdenes) se reintenta ante errores transitorios: código 5xx de Blofin, timeout, conexión cortada o HTTP 5xx. Son 3 intentos con esperas de 0,5 s y 1,5 s, como máximo 2 s por ciclo. Un 429/403 o un error de negocio no se reintenta.
+  - **Deduplicación:** una alerta repetida (misma clave o mismo texto) es una sola entrada con `count`, `firstAt` y `at` (última vez). El panel muestra «(×N, última hh:mm:ss)». El log la anota la 1.ª vez y cada 10 repeticiones.
+  - **Limpieza:** «Balance demo no disponible» desaparece en cuanto el saldo se vuelve a leer bien.
+  - **Sin datos inventados:** si Blofin no da el saldo, se mantiene la última lectura real con su antigüedad. No se usa ninguna otra fuente.
+- Tests: `tests/test_blofin_alerts_177.py` simula el 500 de Blofin. 5 de sus 6 tests fallan en 1.7.6; el sexto comprueba que no se reintentan los errores de negocio.
+
 ## 1.7.6
 
 - **Demo: Equity y PnL total en USDT.** Blofin devuelve `totalEquity` "en USD" (según su documentación), y el panel lo mostraba como la Equity en USDT. El saldo inicial demo también salía de ese campo. Por eso las tarjetas no cuadraban.

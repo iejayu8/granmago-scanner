@@ -43,6 +43,7 @@ class FakeBlofin:
         self.timeout_before_order = False
         self.ignore_attached = False
         self.tpsl_error = False
+        self.balance_errors = 0  # next N balance GETs answer code 500 (as Blofin on 20/11/2026)
         self.fee_rate = 0.0006
         self.funding_fee = "-0.05"
         self.usdt_usd = 0.999035  # USDT priced in USD, as Blofin's totalEquity
@@ -95,6 +96,9 @@ class FakeBlofin:
         return self.ok(b)
 
     def h_get_account_balance(self, p, b):
+        if self.balance_errors:
+            self.balance_errors -= 1
+            return {"code": "500", "msg": "Server internal error", "data": None}
         # Shape from docs.blofin.com GET /api/v1/account/balance.
         # Isolated positions: their margin leaves `balance`/`available` and sits in
         # isolatedEquity (margin + unrealized), as the real demo account showed

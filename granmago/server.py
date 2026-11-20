@@ -47,7 +47,7 @@ PAIRS = list(DEFAULT_PAIRS)
 _PAIR_RE = re.compile(r"^[A-Z0-9]+-USDT$")
 MAX_CONFIGURED_PAIRS = 40
 
-VERSION = "1.7.6"
+VERSION = "1.7.7"
 
 # Walk-forward monitoring setup. The add-on pins these on every start.
 # Leftover options and a saved copy in state.json do not change them.
@@ -1650,6 +1650,7 @@ def pair_degraded(pair):
 
 
 ALERTS = deque(maxlen=50)
+BALANCE_ALERT_KEY = "balance-demo"  # 1.7.7: one deduplicated alert, cleared when the balance reads again
 
 
 def _alert(kind, msg):
@@ -3854,6 +3855,7 @@ def trading_cycle(force_reconcile=False):
                 acc["positionsMargin"] = TRADER.positions_margin(TRADER.last_positions)
                 with LOCK:
                     STATE["exchangeAccount"] = acc
+                TRADER.clear_alert(BALANCE_ALERT_KEY)  # 1.7.7: read OK again, drop the stale alert
                 # 1.7.6: USDT equity (details[USDT].equity), not totalEquity (USD).
                 bal = next((acc[k] for k in ("equity", "totalEquity", "available") if acc.get(k) is not None), None)
                 if bal is not None:
@@ -3871,7 +3873,7 @@ def trading_cycle(force_reconcile=False):
                             STATE["initialBalance"] = round(bal - booked - open_pnl, 4)
                             add_log("Saldo inicial DEMO fijado en %.2f USDT (Blofin)." % STATE["initialBalance"])
             except Exception as exc:
-                TRADER.alert("Balance demo no disponible: %r" % exc)
+                TRADER.alert("Balance demo no disponible: %r" % exc, key=BALANCE_ALERT_KEY)
         with LOCK:
             STATE["lastReconcileAt"] = _now()
             save_state()

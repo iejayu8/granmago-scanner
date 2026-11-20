@@ -277,7 +277,7 @@ function renderMode(s) {
   const recent = [].concat(trading.alerts || [], s.alerts || [])
     .filter((a) => a && a.msg && a.level !== "info")
     .slice(-4)
-    .map((a) => "Alerta: " + a.msg);
+    .map((a) => "Alerta: " + a.msg + (a.count > 1 ? " (×" + a.count + ", última " + new Date(a.at).toLocaleTimeString("es-ES") + ")" : ""));
   lines.push(...recent);
   const box = $("tradingAlerts");
   box.replaceChildren(...lines.map((t) => { const d = document.createElement("div"); d.textContent = t; return d; }));
