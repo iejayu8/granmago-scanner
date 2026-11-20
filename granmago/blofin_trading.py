@@ -89,6 +89,26 @@ class RateLimited(RuntimeError):
     pass
 
 
+# 1.7.7: read-only GETs (account balance) are retried on transient Blofin
+# failures: a body code 5xx ("Server internal error", 20/11/2026 07:18-07:30)
+# or an AmbiguousResult (timeout, reset, HTTP 5xx). Bounded so a trading cycle
+# waits at most READ_RETRY_BUDGET_SECONDS of backoff. Never used for orders.
+READ_RETRY_DELAYS = (0.5, 1.5)  # 3 attempts: wait 0.5 s, then 1.5 s
+READ_RETRY_BUDGET_SECONDS = 2.0
+ALERT_LOG_EVERY = 10  # a repeated alert is logged on 1st, 10th, 20th...
+
+
+def is_transient(exc):
+    """True for failures worth retrying on an idempotent GET: AmbiguousResult
+    or a BlofinError with a 5xx code. Never for 429/403 (rate limit/firewall)
+    or business errors."""
+    if isinstance(exc, AmbiguousResult):
+        return True
+    if isinstance(exc, BlofinError):
+        return exc.code.isdigit() and 500 <= int(exc.code) <= 599
+    return False
+
+
 # --------------------------------------------------------------------- config
 class TradingConfig:
     __slots__ = ("mode", "base_url", "_key", "_secret", "_passphrase", "leverage", "trigger_type")
@@ -394,11 +414,31 @@ class DemoTrader:
         return "DemoTrader(%r)" % (self.config,)
 
     # -------------------------------------------------------------- status
-    def alert(self, msg, level="warning"):
-        entry = {"at": int(self._clock() * 1000), "level": level, "msg": str(msg)[:400]}
+    def alert(self, msg, level="warning", key=None):
+        """Record an alert. The same alert (same key, or same text without a
+        key) is kept once: count, firstAt and at (= last time) are updated and
+        it moves to the end, instead of a new entry every cycle."""
+        now_ms = int(self._clock() * 1000)
+        msg = str(msg)[:400]
+        key = key or msg
+        prev = next((a for a in self.alerts if a.get("key") == key), None)
+        if prev is not None:
+            self.alerts.remove(prev)
+            entry = dict(prev, msg=msg, level=level, at=now_ms, count=int(prev.get("count") or 1) + 1)
+        else:
+            entry = {"at": now_ms, "firstAt": now_ms, "count": 1, "key": key, "level": level, "msg": msg}
         self.alerts.append(entry)
-        getattr(log, "error" if level == "error" else "warning")("TRADING %s", msg)
+        if entry["count"] == 1 or entry["count"] % ALERT_LOG_EVERY == 0:
+            getattr(log, "error" if level == "error" else "warning")(
+                "TRADING %s%s", msg, "" if entry["count"] == 1 else " (x%d)" % entry["count"])
         return entry
+
+    def clear_alert(self, key):
+        """Drop an alert once its cause is gone (e.g. the balance reads again)."""
+        gone = [a for a in self.alerts if a.get("key") == key]
+        for a in gone:
+            self.alerts.remove(a)
+        return len(gone)
 
     def mark_unsafe(self, reason):
         if reason not in self.unsafe_reasons:
@@ -470,11 +510,26 @@ class DemoTrader:
             "positionSide": "net"})
         self._leverage_set.add(inst_id)
 
+    def _read_with_retry(self, method, path, params=None):
+        """Idempotent read with bounded backoff on transient errors (see
+        READ_RETRY_DELAYS). Re-raises the last error; never invents data."""
+        waited = 0.0
+        for attempt in range(len(READ_RETRY_DELAYS) + 1):
+            try:
+                return self.client.request(method, path, params=params)
+            except (BlofinError, AmbiguousResult) as exc:
+                delay = READ_RETRY_DELAYS[attempt] if attempt < len(READ_RETRY_DELAYS) else None
+                if not is_transient(exc) or delay is None or waited + delay > READ_RETRY_BUDGET_SECONDS:
+                    raise
+                log.info("Blofin %s %s transitorio (%r); reintento en %.1f s", method, path, exc, delay)
+                self._sleep(delay)
+                waited += delay
+
     def account(self):
         """GET /api/v1/account/balance parsed per docs.blofin.com:
         data = {ts, totalEquity, isolatedEquity, details: [{currency, equity,
         balance, available, isolatedUnrealizedPnl, ...}]}. Missing fields are None."""
-        data = self.client.request("GET", "/api/v1/account/balance") or {}
+        data = self._read_with_retry("GET", "/api/v1/account/balance") or {}
         if isinstance(data, list):
             data = data[0] if data else {}
 
