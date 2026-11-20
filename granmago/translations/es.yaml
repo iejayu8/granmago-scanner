@@ -40,10 +40,13 @@ configuration:
     description: Activado, el bot no abre posiciones nuevas. Las abiertas mantienen su SL/TP. Para cerrarlas también usa POST /api/kill_switch con closeAll.
   fiscal_export_dir:
     name: Carpeta de exportación fiscal
-    description: Dónde se copia el diario fiscal (sqlite consistente + CSV + manifest.json). El defecto es /share/granmago-fiscal. Para el NAS usa una carpeta ya creada en él, por ejemplo /share/nas_ugreen/granmago-fiscal; si no existe (NAS desmontado) solo se avisa, sin crearla en local. Nunca se exportan claves ni tokens.
+    description: Dónde se copia el diario fiscal (sqlite consistente + CSV + manifest.json). Siempre se genera primero en local (/share/granmago-fiscal, o /data/granmago-fiscal-staging si /share no se puede escribir) y después se copian los ficheros ya hechos al destino. El defecto es /share/granmago-fiscal. Para el NAS usa una carpeta ya creada en él, por ejemplo /share/nas_ugreen/granmago-fiscal; si no existe (NAS desmontado) solo se avisa, sin crearla en local. Nunca se exportan claves ni tokens.
   fiscal_export_minutes:
     name: Intervalo de exportación fiscal (min)
     description: Cada cuántos minutos se exporta, además de tras cada cierre. 0 = solo tras cada cierre. De 0 a 1440. El defecto es 15.
+  fiscal_export_timeout_seconds:
+    name: Timeout de copia fiscal (s)
+    description: Tiempo máximo para copiar la exportación ya generada al destino (por ejemplo el NAS). Si se supera, o el NAS no está montado, se avisa en el log y la exportación local queda intacta. De 5 a 600. El defecto es 60.
   pairs:
     name: Pares
     description: Swaps USDT que se escanean, un símbolo por línea (por ejemplo BTC-USDT). El defecto son los 28 pares de la monitorización. Una lista vacía usa esos 28 y sustituye la lista guardada en el estado. Se usan como máximo 40. Una posición abierta en un par que quites se sigue vigilando hasta que cierre.

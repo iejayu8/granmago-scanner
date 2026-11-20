@@ -80,6 +80,9 @@ fi
 if bashio::config.has_value 'fiscal_export_minutes'; then
   export FISCAL_EXPORT_MINUTES="$(bashio::config 'fiscal_export_minutes')"
 fi
+if bashio::config.has_value 'fiscal_export_timeout_seconds'; then
+  export FISCAL_EXPORT_TIMEOUT_SECONDS="$(bashio::config 'fiscal_export_timeout_seconds')"
+fi
 if bashio::config.exists 'pairs'; then
   export PAIRS="$(bashio::config 'pairs')"
 fi

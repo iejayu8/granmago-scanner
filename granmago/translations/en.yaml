@@ -40,10 +40,13 @@ configuration:
     description: When on, the bot opens no new positions. Open positions keep their SL/TP. To also close them use the kill switch button or POST /api/kill_switch with closeAll.
   fiscal_export_dir:
     name: Fiscal export folder
-    description: Where the fiscal journal is copied (consistent sqlite + CSV + manifest.json). Default /share/granmago-fiscal. For the NAS use a folder that already exists on it, e.g. /share/nas_ugreen/granmago-fiscal; if it is missing (NAS unmounted) the add-on only warns and never creates it locally. Keys and tokens are never exported.
+    description: Where the fiscal journal is copied (consistent sqlite + CSV + manifest.json). It is always built locally first (/share/granmago-fiscal, or /data/granmago-fiscal-staging if /share is not writable) and the finished files are then copied to the destination. Default /share/granmago-fiscal. For the NAS use a folder that already exists on it, e.g. /share/nas_ugreen/granmago-fiscal; if it is missing (NAS unmounted) the add-on only warns and never creates it locally. Keys and tokens are never exported.
   fiscal_export_minutes:
     name: Fiscal export interval (min)
     description: How often to export, besides after every close. 0 = only after closes. 0 to 1440. Default 15.
+  fiscal_export_timeout_seconds:
+    name: Fiscal copy timeout (s)
+    description: Maximum time to copy the finished export to the destination (e.g. the NAS). If it is exceeded, or the NAS is not mounted, the add-on logs a warning and the local export stays intact. 5 to 600. Default 60.
   pairs:
     name: Pairs
     description: USDT swaps to scan, one symbol per entry (for example BTC-USDT). Default is the 28-pair monitoring book. An empty list uses those 28 and replaces a list saved in the add-on state. At most 40 symbols are used. An open position on a pair you remove stays monitored until it closes.

@@ -62,9 +62,14 @@ class Base(unittest.TestCase):
         server.configure_fiscal_export({"FISCAL_EXPORT_DIR": str(self.dest), "FISCAL_EXPORT_MINUTES": "15"})
         self.env = patch.dict(os.environ, {"CONTROL_TOKEN": TOKEN})
         self.env.start()
+        # 1.8.1: never touch a real /share from tests; staging lives in the tmp share
+        self.staging = Path(self.share.name) / "staging"
+        self.stg = patch.object(fiscal_export, "STAGING_DIR", str(self.staging))
+        self.stg.start()
 
     def tearDown(self):
         self.env.stop()
+        self.stg.stop()
         server.FISCAL_EXPORT.clear()
         server.FISCAL_EXPORT.update(self.saved)
         server.FISCAL_EXPORT_WAKE.clear()
@@ -255,16 +260,12 @@ class ExportTest(Base):
         self.assertTrue(server.fiscal_export_now("test"))
         self.assertFalse([a for a in server.ALERTS if a.get("key") == server.FISCAL_EXPORT_ALERT_KEY])
 
-    def test_default_dir_created_only_under_existing_share(self):
-        self.close_one()
-        default = Path(self.share.name) / "granmago-fiscal-default"
-        with patch.object(fiscal_export, "DEFAULT_DIR", str(default)):
-            self.assertEqual(fiscal_export.resolve_dest(str(default), self.tmp.name), default)
-            self.assertTrue(default.is_dir())
+    def test_dest_validation(self):
+        # 1.8.1: string-only checks (no filesystem access before the copy thread)
         with self.assertRaises(fiscal_export.ExportError):  # never inside /data
-            fiscal_export.resolve_dest(str(Path(self.tmp.name) / "x"), self.tmp.name)
+            fiscal_export.validate_dest(str(Path(self.tmp.name) / "x"), self.tmp.name)
         with self.assertRaises(fiscal_export.ExportError):
-            fiscal_export.resolve_dest("relative/path", self.tmp.name)
+            fiscal_export.validate_dest("relative/path", self.tmp.name)
 
     def test_no_secrets_in_export(self):
         self.close_one()
