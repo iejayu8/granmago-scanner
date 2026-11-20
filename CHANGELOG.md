@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.8.1
+
+- **Exportación fiscal al NAS sin colgarse.** En 1.8.0, con `fiscal_export_dir` en una carpeta SMB/CIFS (`/share/nas_ugreen/granmago-fiscal`), el backup de SQLite se hacía directamente sobre el NAS. El bloqueo de ficheros de SQLite sobre CIFS se colgaba y solo quedaba un `.fiscal_journal_demo.sqlite.*.tmp` de 0 B, sin CSV, sin manifest y sin nada en el log.
+- **Staging local:** la exportación completa (backup sqlite, CSV y `manifest.json`, por modo) se genera siempre primero en local, con la misma escritura atómica y el mismo control de secretos que en 1.8.0.
+  - La carpeta es `/share/granmago-fiscal` (disco local de HA). Si no se puede escribir, se usa `/data/granmago-fiscal-staging`.
+  - Si el destino es el propio staging (el valor por defecto), no se copia nada.
+- **Copia al destino:**
+  - se copian los ficheros ya generados, enteros: cada uno a un `.tmp` en el destino, fsync, comprobación de tamaño y SHA-256, y `os.replace`;
+  - `manifest.json` va el último;
+  - en el NAS no se hace ninguna escritura sqlite.
+- **Timeout:**
+  - la copia corre en un hilo aparte con un límite de `fiscal_export_timeout_seconds` (opción nueva, por defecto 60 s, de 5 a 600);
+  - un montaje colgado no bloquea ni el hilo de exportación ni el motor;
+  - mientras una copia siga colgada no se lanza otra.
+- **NAS no montado o con fallo:**
+  - motivos: que falte la carpeta padre, que falte la carpeta, que `/share/<nombre>` no sea un punto de montaje, que no haya permiso de escritura, un timeout o un error de copia;
+  - se registra un WARNING con la ruta y la causa (la 1.ª vez, cuando cambia la causa y cada 10), con un único aviso deduplicado en el panel;
+  - la exportación local queda intacta;
+  - la ruta del NAS nunca se crea.
+- **Limpieza:** antes de cada exportación se borran los `.tmp` huérfanos (`.fiscal_journal_*.tmp`, `.manifest.json.*.tmp`) del destino y del staging.
+- Tests: `tests/test_fiscal_export_181.py` (10 tests). Cubren un destino lento que supera el timeout, un destino ausente, un punto de montaje ausente, la limpieza de `.tmp` huérfanos, que staging y destino tengan el mismo contenido (SHA-256), que no se abra sqlite en el destino, la elección del staging y los secretos. Se ajustan los tests de 1.8.0 para usar un staging temporal.
+
 ## 1.8.0
 
 - **Exportación del diario fiscal a /share.** El complemento copia cada `fiscal_journal_<modo>.sqlite` (demo ahora, `real` cuando exista) a `/share/granmago-fiscal/` para que se pueda leer fuera de él:

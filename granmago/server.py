@@ -47,7 +47,7 @@ PAIRS = list(DEFAULT_PAIRS)
 _PAIR_RE = re.compile(r"^[A-Z0-9]+-USDT$")
 MAX_CONFIGURED_PAIRS = 40
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 
 # Walk-forward monitoring setup. The add-on pins these on every start.
 # Leftover options and a saved copy in state.json do not change them.
@@ -1677,7 +1677,7 @@ def _clear_alert(key):
 # Runs on its own thread: a slow or unmounted NAS never blocks trading.
 FISCAL_EXPORT_ALERT_KEY = "fiscal-export"
 FISCAL_EXPORT_WAKE = threading.Event()
-FISCAL_EXPORT = {"dir": None, "minutes": None, "lastOkAt": None, "lastOkMono": None, "lastAttemptMono": None,
+FISCAL_EXPORT = {"dir": None, "minutes": None, "timeout": None, "staging": None, "remoteOkAt": None, "lastOkAt": None, "lastOkMono": None, "lastAttemptMono": None,
                  "lastError": None, "failures": 0, "files": [], "reason": None}
 _FISCAL_EXPORT_LOCK = threading.Lock()
 
@@ -1690,7 +1690,11 @@ def configure_fiscal_export(env=None):
         minutes = int(float(env.get("FISCAL_EXPORT_MINUTES", fiscal_export.DEFAULT_MINUTES)))
     except (TypeError, ValueError):
         minutes = fiscal_export.DEFAULT_MINUTES
-    FISCAL_EXPORT.update(dir=dest, minutes=max(0, min(1440, minutes)))
+    try:
+        timeout = int(float(env.get("FISCAL_EXPORT_TIMEOUT_SECONDS", fiscal_export.DEFAULT_COPY_TIMEOUT)))
+    except (TypeError, ValueError):
+        timeout = fiscal_export.DEFAULT_COPY_TIMEOUT
+    FISCAL_EXPORT.update(dir=dest, minutes=max(0, min(1440, minutes)), timeout=max(5, min(600, timeout)))
     return dict(FISCAL_EXPORT)
 
 
@@ -1716,23 +1720,38 @@ def fiscal_export_now(reason="manual"):
     with _FISCAL_EXPORT_LOCK:
         FISCAL_EXPORT["lastAttemptMono"] = time.monotonic()
         try:
-            manifest = fiscal_export.export_all(DATA_DIR, FISCAL_EXPORT["dir"], secrets=_export_secrets(),
-                                                engine_version=VERSION)
+            res = fiscal_export.export_all(DATA_DIR, FISCAL_EXPORT["dir"], secrets=_export_secrets(),
+                                           engine_version=VERSION, timeout=FISCAL_EXPORT["timeout"] or 60)
         except Exception as exc:
-            FISCAL_EXPORT["failures"] += 1
-            msg = "Exportación fiscal a %s fallida: %s" % (FISCAL_EXPORT["dir"], exc)
-            first = FISCAL_EXPORT["lastError"] != msg
-            FISCAL_EXPORT["lastError"] = msg
-            if first or FISCAL_EXPORT["failures"] % 10 == 0:
-                log.warning("%s (x%d)", msg, FISCAL_EXPORT["failures"])
-            _alert("fiscal", msg, key=FISCAL_EXPORT_ALERT_KEY)
-            return False
+            return _fiscal_export_failed("Exportación fiscal local fallida (destino %s): %s"
+                                         % (FISCAL_EXPORT["dir"], exc))
+        if res is None:
+            return False  # no journal yet
+        FISCAL_EXPORT.update(staging=res["staging"], files=res["manifest"]["files"], reason=reason,
+                             lastOkMono=time.monotonic(), lastOkAt=_now())
+        if res["cleaned"]:
+            log.info("Exportación fiscal: borrados %d .tmp huérfanos en %s.", len(res["cleaned"]), res["dest"])
+        if res["remoteError"]:
+            # 1.8.1: local staging export is complete and kept as is.
+            return _fiscal_export_failed("Exportación fiscal: copia a %s fallida: %s. La exportación local en %s "
+                                         "queda intacta." % (res["dest"], res["remoteError"], res["staging"]))
         if FISCAL_EXPORT["lastError"]:
             log.info("Exportación fiscal recuperada (%s).", FISCAL_EXPORT["dir"])
-        FISCAL_EXPORT.update(lastError=None, failures=0, lastOkMono=time.monotonic(), lastOkAt=_now(),
-                             files=[] if manifest is None else manifest["files"], reason=reason)
+        FISCAL_EXPORT.update(lastError=None, failures=0, remoteOkAt=_now())
         _clear_alert(FISCAL_EXPORT_ALERT_KEY)
-        return manifest is not None
+        return True
+
+
+def _fiscal_export_failed(msg):
+    """WARNING with path and cause (first time, when the cause changes, every
+    10th repeat) and one deduplicated alert. Caller holds _FISCAL_EXPORT_LOCK."""
+    FISCAL_EXPORT["failures"] += 1
+    first = FISCAL_EXPORT["lastError"] != msg
+    FISCAL_EXPORT["lastError"] = msg
+    if first or FISCAL_EXPORT["failures"] % 10 == 0:
+        log.warning("%s (x%d)", msg, FISCAL_EXPORT["failures"])
+    _alert("fiscal", msg, key=FISCAL_EXPORT_ALERT_KEY)
+    return False
 
 
 def fiscal_export_due(now_mono=None):
@@ -4041,7 +4060,8 @@ def health():
         "degradedPairs": stats["degraded"], "safe": trading.get("safe", True),
         "unsafeReasons": trading.get("unsafeReasons", []),
         "alerts": (list(ALERTS)[-5:]) + (trading.get("alerts", [])[-5:]),
-        "fiscalExport": {k: FISCAL_EXPORT[k] for k in ("dir", "minutes", "lastOkAt", "lastError", "failures", "files")},
+        "fiscalExport": {k: FISCAL_EXPORT[k] for k in ("dir", "staging", "minutes", "timeout", "lastOkAt", "remoteOkAt",
+                                                      "lastError", "failures", "files")},
     }
 
 
@@ -4303,7 +4323,8 @@ def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     init_trading()
     cfg = configure_fiscal_export()
-    log.info("Exportación fiscal: %s cada %s min y tras cada cierre.", cfg["dir"], cfg["minutes"] or "-")
+    log.info("Exportación fiscal: staging local, copia a %s (timeout %ss) cada %s min y tras cada cierre.",
+             cfg["dir"], cfg["timeout"], cfg["minutes"] or "-")
     threading.Thread(target=fiscal_export_loop, name="granmago-fiscal-export", daemon=True).start()
     if TRADER is not None:
         start_trading()

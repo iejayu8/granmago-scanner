@@ -1,5 +1,5 @@
 name: GranMago Scanner
-version: "1.8.0"
+version: "1.8.1"
 slug: granmago
 description: Scanner GranMago. Paper por defecto; demo de Blofin opcional (modo real bloqueado). El bot corre en el servidor aunque cierres la página.
 url: https://github.com/iejayu8/granmago-scanner
@@ -36,6 +36,7 @@ options:
   kill_switch: false
   fiscal_export_dir: /share/granmago-fiscal
   fiscal_export_minutes: 15
+  fiscal_export_timeout_seconds: 60
   pairs:
     - BTC-USDT
     - ETH-USDT
@@ -81,5 +82,6 @@ schema:
   kill_switch: bool
   fiscal_export_dir: str?
   fiscal_export_minutes: int(0,1440)
+  fiscal_export_timeout_seconds: int(5,600)
   pairs:
     - match(^[A-Za-z0-9]+-USDT$)
