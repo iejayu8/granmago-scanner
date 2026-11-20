@@ -73,6 +73,13 @@ fi
 if bashio::config.has_value 'control_token'; then
   export CONTROL_TOKEN="$(bashio::config 'control_token')"
 fi
+# 1.8.0: fiscal journal export to /share (map share:rw). Not secret.
+if bashio::config.has_value 'fiscal_export_dir'; then
+  export FISCAL_EXPORT_DIR="$(bashio::config 'fiscal_export_dir')"
+fi
+if bashio::config.has_value 'fiscal_export_minutes'; then
+  export FISCAL_EXPORT_MINUTES="$(bashio::config 'fiscal_export_minutes')"
+fi
 if bashio::config.exists 'pairs'; then
   export PAIRS="$(bashio::config 'pairs')"
 fi

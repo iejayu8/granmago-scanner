@@ -34,7 +34,20 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+# 1.8.0 (schema 2): fiscal trace per trade, added with ALTER TABLE ADD COLUMN
+# (idempotent; existing append-only rows are never rewritten and read NULL in
+# these columns). row_hash_version: NULL = v1 hash (v1 columns), 2 = all columns.
+V2_COLUMNS = [
+    ("entry_trade_ids", "TEXT"),      # Blofin tradeIds of the entry fills
+    ("entry_fee_usdt", "REAL"),       # entry commission (Blofin fills, else order detail)
+    ("exit_fee_usdt", "REAL"),        # exit commission (Blofin closing fills)
+    ("fee_source", "TEXT"),           # blofin_fills | blofin_order_detail+fills | modelled_paper
+    ("open_time_source", "TEXT"),     # blofin_fill | blofin_order | engine
+    ("close_time_source", "TEXT"),    # blofin_fill | engine
+    ("missing_fields", "TEXT"),       # demo/real: fiscal fields Blofin did not give ('' = complete)
+    ("row_hash_version", "INTEGER"),
+]
 MADRID = ZoneInfo("Europe/Madrid")
 ECB_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist-90d.xml"
 ECB_SOURCE = "ECB eurofxref-hist-90d USD per EUR (USDT treated as USD)"
@@ -47,7 +60,8 @@ TRADE_COLUMNS = [
     "fees_usdt", "funding_usdt", "funding_status", "pnl_usdt", "r_multiple", "reason",
     "entry_order_id", "exit_order_id", "client_order_id", "tpsl_id", "exchange_trade_ids",
     "signal_close_ms", "raw_json", "row_sha256",
-]
+] + [c for c, _ in V2_COLUMNS]
+HASH_V1_COLUMNS = TRADE_COLUMNS[:TRADE_COLUMNS.index("row_sha256") + 1]
 
 DDL = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -128,6 +142,37 @@ EXPORT_COLUMNS = ["seq"] + TRADE_COLUMNS + [
     "fx_status", "fx_usd_per_eur", "fx_rate_date", "fx_source", "fx_fetched_at_utc", "pnl_eur", "fees_eur"]
 
 
+def journal_path(data_dir, mode):
+    """fiscal_journal_<mode>.sqlite (demo now; real once live trading exists)."""
+    if mode not in ("paper", "demo", "real"):
+        raise ValueError(mode)
+    return Path(data_dir) / ("fiscal_journal_%s.sqlite" % mode)
+
+
+def missing_fields(row):
+    """Fiscal fields a demo/real row should carry from Blofin but does not."""
+    out = []
+    for col in ("entry_order_id", "exit_order_id", "entry_trade_ids", "exchange_trade_ids"):
+        if not row.get(col):
+            out.append(col)
+    for col in ("entry_fee_usdt", "exit_fee_usdt"):
+        if row.get(col) is None:
+            out.append(col)
+    if row.get("fee_source") != "blofin_fills":
+        out.append("fee_source")
+    if not str(row.get("funding_status") or "").startswith("exchange"):
+        out.append("funding_usdt")
+    elif row.get("funding_status") != "exchange":
+        out.append("funding_window")
+    if not row.get("open_time_utc"):
+        out.append("open_time_utc")
+    elif row.get("open_time_source") != "blofin_fill":
+        out.append("open_time_fill")  # Blofin order time or engine clock, not the fill
+    if row.get("close_time_source") != "blofin_fill":
+        out.append("close_time_fill")
+    return out
+
+
 def _utc_iso(dt):
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -174,6 +219,19 @@ class FiscalJournal:
             con.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
             con.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('created_at_utc', ?)",
                         (_utc_iso(datetime.now(timezone.utc)),))
+            self._migrate_v2(con)
+
+    @staticmethod
+    def _migrate_v2(con):
+        """Schema 2: add the fiscal-trace columns. Idempotent; no row is touched."""
+        have = {r[1] for r in con.execute("PRAGMA table_info(trades)")}
+        for name, kind in V2_COLUMNS:
+            if name not in have:
+                con.execute("ALTER TABLE trades ADD COLUMN %s %s" % (name, kind))
+        con.execute("INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(SCHEMA_VERSION),))
+        con.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_v2_at_utc', ?)",
+                    (_utc_iso(datetime.now(timezone.utc)),))
 
     @contextlib.contextmanager
     def _connect(self):
@@ -194,9 +252,16 @@ class FiscalJournal:
         now = now or datetime.now(timezone.utc)
         exit_audit = closed.get("exitMarket") if isinstance(closed.get("exitMarket"), dict) else {}
         entry_audit = pos.get("entryMarket") if isinstance(pos.get("entryMarket"), dict) else {}
-        close_dt = _parse_time(exit_audit.get("observedAt")) or _parse_time(exit_audit.get("ts")) or now
-        open_dt = (_parse_time(entry_audit.get("observedAt")) or _parse_time(pos.get("time"))
-                   or _parse_time(entry_audit.get("ts")))
+        exchange = self.mode in ("demo", "real")
+        close_dt = _parse_time(exit_audit.get("observedAt")) or _parse_time(exit_audit.get("ts"))
+        close_src = "blofin_fill" if close_dt and str(exit_audit.get("source", "")).startswith("Blofin") else "engine"
+        close_dt = close_dt or now
+        open_dt, open_src = _parse_time(pos.get("entryFillTs")), "blofin_fill"
+        if open_dt is None:
+            open_dt = (_parse_time(entry_audit.get("observedAt")) or _parse_time(pos.get("time"))
+                       or _parse_time(entry_audit.get("ts")))
+            open_src = ("blofin_order" if open_dt and str(entry_audit.get("source", "")).startswith("Blofin")
+                        else "engine" if open_dt else None)
         entry = _num(closed.get("entry"), 0.0)
         notional = _num(closed.get("notional"), 0.0)
         leg = len(pos.get("closedPnls") or []) or 1
@@ -229,8 +294,12 @@ class FiscalJournal:
             # Paper does not model funding. Demo/real take it from Blofin's funding history
             # (GET /api/v1/account/funding-fees) when the trader passes fundingUsdt.
             "funding_usdt": _num(closed.get("fundingUsdt"), 0.0),
+            # Missing Blofin funding stays flagged: funding_status 'unavailable' and
+            # the CSV export leaves funding_usdt empty (the column is NOT NULL in v1).
             "funding_status": ("not_modelled_paper" if self.mode == "paper"
-                               else "exchange" if closed.get("fundingUsdt") is not None else "pending"),
+                               else "unavailable" if closed.get("fundingUsdt") is None
+                               else "exchange_partial_7d" if closed.get("fundingWindowTruncated")
+                               else "exchange"),
             "pnl_usdt": _num(closed.get("pnl"), 0.0),
             "r_multiple": _num(closed.get("rMultiple")),
             "reason": closed.get("reason"),
@@ -240,9 +309,17 @@ class FiscalJournal:
             "tpsl_id": str(pos.get("tpslId") or ""),
             "exchange_trade_ids": str(closed.get("exchangeTradeIds") or ""),
             "signal_close_ms": closed.get("closeMs"),
+            "entry_trade_ids": str(pos.get("entryTradeIds") or "") if exchange else None,
+            "entry_fee_usdt": _num(closed.get("entryFees")) if exchange else _num(pos.get("entryFee")),
+            "exit_fee_usdt": _num(closed.get("exitFees")) if exchange else None,
+            "fee_source": (closed.get("feeSource") or None) if exchange else "modelled_paper",
+            "open_time_source": open_src,
+            "close_time_source": close_src,
+            "row_hash_version": 2,
             "raw_json": json.dumps({"history": closed, "position": {k: v for k, v in pos.items() if k != "closedPnls"}},
                                    sort_keys=True, default=str),
         }
+        row["missing_fields"] = ",".join(missing_fields(row)) if exchange else ""
         body = json.dumps({k: row[k] for k in TRADE_COLUMNS if k not in ("row_sha256", "recorded_at_utc")},
                           sort_keys=True, default=str)
         row["row_sha256"] = hashlib.sha256(body.encode()).hexdigest()
