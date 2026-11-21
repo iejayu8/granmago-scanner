@@ -842,18 +842,24 @@ class DemoTrader:
             begin_ms = end_ms - self.FUNDING_MAX_WINDOW_MS
         try:
             data = self.client.request("GET", "/api/v1/account/funding-fees", params={
-                "instId": pair, "begin": str(int(begin_ms)), "end": str(int(end_ms))}) or []
+                "instId": pair, "begin": str(int(begin_ms)), "end": str(int(end_ms))})
         except (BlofinError, AmbiguousResult, RateLimited):
             return None
+        if data is None:
+            data = []  # "data": null = no bills (kept from 1.7.2)
+        if not isinstance(data, list):
+            return None  # 1.8.2: a malformed answer is "unavailable", never a known 0
         total = 0.0
-        for row in data if isinstance(data, list) else []:
-            if not isinstance(row, dict):
-                continue
-            for key in ("fundingFee", "fee", "amount"):
-                value = num(row.get(key))
-                if value is not None:
-                    total += value
-                    break
+        for row in data:
+            value = None
+            if isinstance(row, dict):
+                for key in ("fundingFee", "fee", "amount"):
+                    value = num(row.get(key))
+                    if value is not None:
+                        break
+            if value is None:
+                return None  # one unreadable bill: the total is unknown
+            total += value
         return total
 
     # ------------------------------------------------------- reconciliation
