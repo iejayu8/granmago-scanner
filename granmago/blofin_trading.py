@@ -409,6 +409,10 @@ class DemoTrader:
         self.last_reconcile_result = None
         self.key_info = None
         self.last_positions = {}
+        # 1.8.3: outcome of the last close-position POST per pair: "sent" (Blofin
+        # accepted our market close), "already_closed" (102005/102022: the
+        # exchange had closed it, e.g. SL/TP) or "ambiguous".
+        self.last_close = {}
 
     def __repr__(self):
         return "DemoTrader(%r)" % (self.config,)
@@ -757,6 +761,7 @@ class DemoTrader:
             cid = client_order_id(pair, reason, cid_base, int(self._clock() // 60), "x")
             self.intents.append({"clientOrderId": cid, "kind": "close", "status": "pending", "pair": pair,
                                  "reason": reason})
+            self.last_close[pair] = "sent"
             try:
                 self.client.request("POST", "/api/v1/trade/close-position", body={
                     "instId": pair, "marginMode": "isolated", "positionSide": "net", "clientOrderId": cid},
@@ -765,8 +770,12 @@ class DemoTrader:
                 if exc.code not in ("102005", "102022", "102002"):
                     self.intents.append({"clientOrderId": cid, "status": "rejected", "code": exc.code})
                     self.alert("Cierre %s rechazado: %s" % (pair, exc), "error")
+                    self.last_close[pair] = "rejected"
                     return False
+                if exc.code in ("102005", "102022"):  # no position left: closed on the exchange side
+                    self.last_close[pair] = "already_closed"
             except (AmbiguousResult, RateLimited) as exc:
+                self.last_close[pair] = "ambiguous"
                 self.alert("Cierre %s ambiguo (%s): verifico posiciones." % (pair, exc))
             remaining = self.position(pair)
             done = remaining is None

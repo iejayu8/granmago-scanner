@@ -15,7 +15,7 @@ import random
 import re
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -47,7 +47,7 @@ PAIRS = list(DEFAULT_PAIRS)
 _PAIR_RE = re.compile(r"^[A-Z0-9]+-USDT$")
 MAX_CONFIGURED_PAIRS = 40
 
-VERSION = "1.8.1"
+VERSION = "1.8.3"
 
 # Walk-forward monitoring setup. The add-on pins these on every start.
 # Leftover options and a saved copy in state.json do not change them.
@@ -3136,6 +3136,44 @@ def monitor_position(display_only=False):
         save_state()
 
 
+_MAXPOS_LOGGED = OrderedDict()  # (pair, side, candle) already logged as skipped by max_positions
+_MAXPOS_LOGGED_MAX = 500
+
+
+def _log_max_positions_skips(rows, mode):
+    """1.8.3: log the signals a full book (max_positions) leaves out, like the
+    other discard causes ("No se abre SIDE PAIR: ..."), once per pair, side and
+    candle. Caller holds LOCK."""
+    limit = max_positions()
+    occupied = {p.get("pair") for p in _positions() if isinstance(p, dict)}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        pair = row.get("pair")
+        if not pair or pair in occupied:
+            continue
+        if mode == "granmago":
+            sig = row.get("granmago")
+            if not isinstance(sig, dict) or sig.get("side") not in ("long", "short"):
+                continue
+            side, candle = sig["side"], sig.get("closeMs")
+            if _signal_used(pair, side, sig.get("confirmMs"), candle):
+                continue
+        else:
+            side, _ = _qualifying_side(row, entry_threshold())
+            if side is None:
+                continue
+            candle = int(_as_price(row.get("analyzedAtMs")) or 0) // (4 * 3600 * 1000)
+        key = (pair, side, candle)
+        if key in _MAXPOS_LOGGED:
+            continue
+        _MAXPOS_LOGGED[key] = True
+        while len(_MAXPOS_LOGGED) > _MAXPOS_LOGGED_MAX:
+            _MAXPOS_LOGGED.popitem(last=False)
+        add_log("No se abre %s %s: máximo de posiciones alcanzado (%d/%d)."
+                % (side.upper(), pair, len(_positions()), limit))
+
+
 def maybe_open():
     """Live entry gateway: never use lastScan/candle prices as execution quotes.
 
@@ -3144,7 +3182,7 @@ def maybe_open():
     """
     opened = False
     with LOCK:
-        if not STATE["running"] or len(_positions()) >= max_positions():
+        if not STATE["running"]:
             return
         if STATE.get("killSwitch"):
             return
@@ -3153,8 +3191,11 @@ def maybe_open():
         if TRADER is not None and STATE.get("initialBalance") is None:
             return  # demo balance not synced from Blofin yet
         scan = STATE.get("lastScan")
-        rows = json.loads(json.dumps(scan or []))
         mode = strategy_mode()
+        if len(_positions()) >= max_positions():
+            _log_max_positions_skips(scan, mode)
+            return
+        rows = json.loads(json.dumps(scan or []))
         if mode != "granmago":
             rows.sort(key=lambda r: max(_score_num(r.get("scoreLong")), _score_num(r.get("scoreShort"))), reverse=True)
     for row in rows:
@@ -3162,6 +3203,8 @@ def maybe_open():
         with LOCK:
             if (not STATE["running"] or STATE.get("lastScan") is not scan
                     or strategy_mode() != mode or len(_positions()) >= max_positions()):
+                if STATE["running"] and STATE.get("lastScan") is scan and strategy_mode() == mode:
+                    _log_max_positions_skips(rows[rows.index(row):], mode)  # the book filled up mid-scan
                 break
             if not pair or _find_position(pair):
                 continue
@@ -3896,11 +3939,33 @@ def _guess_exchange_reason(pos, exit_price):
     return "SL (exchange)" if abs(exit_price - sl) <= abs(exit_price - tp) else "TP (exchange)"
 
 
+CLOSE_SENT_TOLERANCE_MS = 5000  # Blofin vs box clock (CLOCK_MAX_SKEW_SECONDS)
+
+
+def _engine_close_reason(pos, fills):
+    """1.8.3: the engine's own close reason (time, manual, sin_sl...) when our
+    market close was sent and the closing fills are not older than it.
+
+    1.8.0 lost it: right after close-position Blofin's fills-history may not
+    list the fill yet, so the close loop could not settle; the reconcile then
+    saw the position missing and called _settle_closed(pos) without a reason,
+    which guessed SL/TP by distance (ADA-USDT 18/11 21:01: "TP (exchange)" for
+    a time exit)."""
+    req = pos.get("closeRequested") or {}
+    sent = pos.get("closeSentMs")
+    if not req.get("reason") or not sent:
+        return None
+    if int(fills.get("ts") or 0) < int(sent) - CLOSE_SENT_TOLERANCE_MS:
+        return None  # the exchange (SL/TP) closed it before our order
+    return req["reason"]
+
+
 def _settle_closed(pos, reason=None):
     """Fetch the real exit of a position that no longer exists on Blofin."""
     fills = TRADER.exit_fills(pos["pair"], pos["side"], int(pos.get("openedMs") or 0))
     if not fills:
         return False
+    reason = reason or _engine_close_reason(pos, fills)
     opened = int(pos.get("openedMs") or 0)
     funding = TRADER.funding(pos["pair"], opened, fills["ts"])
     if funding is not None and (not opened or fills["ts"] - opened > TRADER.FUNDING_MAX_WINDOW_MS):
@@ -3934,8 +3999,15 @@ def trading_cycle(force_reconcile=False):
     for pos in closes:
         reason = pos["closeRequested"]["reason"]
         try:
+            with LOCK:
+                # 1.8.3: when our market close went out (before the POST: the
+                # fill is never older). Kept on the position for the reconcile.
+                pos.setdefault("closeSentMs", int(now_epoch() * 1000))
             done = TRADER.close_position(pos["pair"], reason, pos.get("clientOrderId") or "")
-            if done and not _settle_closed(pos, reason):
+            if (getattr(TRADER, "last_close", {}) or {}).get(pos["pair"]) == "already_closed":
+                with LOCK:
+                    pos.pop("closeSentMs", None)  # Blofin had closed it (SL/TP): the exchange reason applies
+            if done and not _settle_closed(pos):
                 with LOCK:
                     pos["exchangeMissingSince"] = pos.get("exchangeMissingSince") or _now()
         except Exception as exc:
@@ -4346,9 +4418,11 @@ def main():
             "Costes paper: comisión %.4f%% + slippage %.4f%% por lado."
             % (fee_pct_per_side(), slippage_pct_per_side())
         )
-        add_log("Stop %s, TP %sR, parcial %sR." % (
+        add_log("Stop %s, TP %s, parcial %sR." % (
             stop_mode(),
-            _fmt_num(take_profit_r()),
+            # 1.8.3: takeProfitR only sizes the target in scanner mode.
+            ("pivote diario (takeProfitR %sR no aplica en modo Gran Mago; solo en modo scanner)"
+             % _fmt_num(take_profit_r())) if strategy_mode() == "granmago" else "%sR" % _fmt_num(take_profit_r()),
             _fmt_num(partial_tp_r()) if partial_tp_r() > 0 else "off",
         ))
         add_log("Régimen: %s. Cooldown %d min. Tope misma dirección %sR." % (
