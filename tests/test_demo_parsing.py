@@ -195,10 +195,17 @@ class MalformedTest(TraderCase):
         self.assertAlmostEqual(self.trader.exit_fills("ETH-USDT", "long", 0)["fees"], 0.19)
 
     def test_funding_variants(self):
-        for data, want in (([], 0.0), (None, 0.0), ([{"fundingFee": "abc"}, {"fee": "-0.5"}], -0.5),
-                           ([None, {"amount": "0.2"}, {"fundingFee": ""}], 0.2)):
+        # 1.8.2: one unreadable bill makes the total unknown (None -> funding_status
+        # 'unavailable'); 1.7.2 skipped it and booked a wrong total as exchange data.
+        for data, want in (([], 0.0), (None, 0.0), ([{"fundingFee": "abc"}, {"fee": "-0.5"}], None),
+                           ([None, {"amount": "0.2"}, {"fundingFee": ""}], None),
+                           ([{"fee": "-0.5"}, {"amount": "0.2"}], -0.3), ({"fundingFee": "-0.1"}, None)):
             self.fake.h_get_account_funding_fees = ok(data)
-            self.assertAlmostEqual(self.trader.funding("ETH-USDT", 0, 1), want)
+            got = self.trader.funding("ETH-USDT", 0, 1)
+            if want is None:
+                self.assertIsNone(got, data)
+            else:
+                self.assertAlmostEqual(got, want)
 
     def test_num(self):
         for v, want in (("1.5", 1.5), (2, 2.0), ("", None), (None, None), ("NaN", None), ("-inf", None),
