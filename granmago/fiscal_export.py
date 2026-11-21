@@ -171,7 +171,12 @@ class RemoteCopyError(ExportError):
 def _is_orphan_tmp(name):
     # Our temp names: "." + final name + "." + random + ".tmp" (mkstemp / copy).
     return name.startswith(".") and name.endswith(".tmp") and (
-        name.startswith(".fiscal_journal_") or name.startswith(".manifest.json."))
+        name.startswith(".fiscal_journal_") or name.startswith(".manifest.json.")
+        or any(name.startswith("." + x + ".") for x in EXTRA_NAMES))
+
+
+# 1.8.4: extra CSV files allowed next to the journals (market regime log).
+EXTRA_NAMES = ("market_regime.csv", "signal_events.csv")
 
 
 def clean_orphans(folder):
@@ -359,7 +364,8 @@ def copy_to_dest(staging, dest, names, timeout=DEFAULT_COPY_TIMEOUT):
     return box["ok"]
 
 
-def export_all(data_dir, dest, *, secrets=(), engine_version="", staging=None, timeout=DEFAULT_COPY_TIMEOUT):
+def export_all(data_dir, dest, *, secrets=(), engine_version="", staging=None, timeout=DEFAULT_COPY_TIMEOUT,
+               extra_csv=()):
     """Build the export in local staging, then copy it to `dest` if different.
 
     Returns None when there is no journal yet, else a dict with manifest,
@@ -367,12 +373,13 @@ def export_all(data_dir, dest, *, secrets=(), engine_version="", staging=None, t
     export). Raises ExportError/OSError only when the LOCAL export fails."""
     data_dir = Path(data_dir)
     sources = sorted(p for p in data_dir.glob(JOURNAL_GLOB) if p.is_file())
-    if not sources:
+    extra_csv = list(extra_csv or ())
+    if not sources and not extra_csv:
         return None
     dest = validate_dest(dest, data_dir)
     out = Path(staging) if staging is not None else choose_staging(data_dir)
     clean_orphans(out)
-    manifest = build_local(sources, out, secrets=secrets, engine_version=engine_version)
+    manifest = build_local(sources, out, secrets=secrets, engine_version=engine_version, extra_csv=extra_csv)
     result = {"manifest": manifest, "staging": str(out), "dest": str(dest), "copied": [], "cleaned": [],
               "remoteError": None}
     if os.path.normpath(str(out)) == str(dest):
@@ -385,7 +392,30 @@ def export_all(data_dir, dest, *, secrets=(), engine_version="", staging=None, t
     return result
 
 
-def build_local(sources, out, *, secrets=(), engine_version=""):
+def _write_rows_csv(out, name, columns, rows, secrets):
+    if name not in EXTRA_NAMES:
+        raise ExportError("fichero extra no permitido: %r" % (name,))
+    final = out / name
+    tmp = _tmp_in(out, name)
+    try:
+        with open(tmp, "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(columns), extrasaction="ignore")
+            w.writeheader()
+            for r in rows:
+                w.writerow(r)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    _publish(tmp, final, secrets)
+    return final, len(rows)
+
+
+def build_local(sources, out, *, secrets=(), engine_version="", extra_csv=()):
     """1.8.0 export (backup + CSV + manifest, atomic, secrets check) into the
     local folder `out`. Never used on a remote path."""
     out = Path(out)
@@ -396,6 +426,10 @@ def build_local(sources, out, *, secrets=(), engine_version=""):
             final, rows = fn(src, out, secrets)
             files.append({"file": final.name, "mode": mode, "format": kind, "rows": rows,
                           "sha256": _sha256(final), "bytes": final.stat().st_size})
+    for name, columns, rows in extra_csv:  # 1.8.4: separate files, not part of the fiscal journal
+        final, n = _write_rows_csv(out, name, columns, rows, secrets)
+        files.append({"file": final.name, "mode": "all", "format": "csv", "rows": n,
+                      "sha256": _sha256(final), "bytes": final.stat().st_size})
     manifest = {"exportedAtUtc": _utc_now(), "engineVersion": engine_version,
                 "schemaVersion": fiscal_journal.SCHEMA_VERSION, "files": files,
                 "note": "Copia de solo lectura del diario fiscal append-only de GranMago. "

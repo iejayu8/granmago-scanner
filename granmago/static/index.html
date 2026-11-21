@@ -137,6 +137,7 @@
     <h3>Ranking de oportunidades</h3>
     <p id="entryRule" style="margin:0 0 8px; font-size:0.8rem; color:var(--muted);">Umbral de entrada: 100. Solo abre con esa puntuación.</p>
     <p id="targetRule" style="margin:0 0 8px; font-size:0.8rem; color:var(--muted);"></p>
+    <p id="regimeRule" style="margin:0 0 8px; font-size:0.8rem; color:var(--muted);"></p>
     <div class="table-wrap">
       <table>
         <thead>
@@ -374,6 +375,19 @@ function render(s) {
     targetRule.textContent = "Objetivo: takeProfitR " + tpRText + " (entrada ± distancia al stop × " + tpRText + ").";
     targetRule.title = "takeProfitR solo aplica en modo scanner. En modo Gran Mago el objetivo es el pivote diario.";
   }
+  // 1.8.4: market regime, record only (no trading decision uses it).
+  const reg = s.marketRegime;
+  const fmt2 = (v) => (v == null || !Number.isFinite(+v)) ? "—" : (+v).toLocaleString("es-ES", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const regimeRule = $("regimeRule");
+  if (reg && reg.regime) {
+    const when = reg.candle_close_utc ? new Date(reg.candle_close_utc).toLocaleString("es-ES", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }) : "—";
+    regimeRule.textContent = "Régimen de mercado (vela 4H " + when + "): " + reg.regime + " · vr " + fmt2(reg.vr) + " · mv " + fmt2(reg.mv)
+      + " · " + (reg.n_symbols ?? 0) + "/" + (reg.n_basket ?? 0) + " símbolos. Solo registro: no cambia ninguna decisión.";
+  } else {
+    regimeRule.textContent = "Régimen de mercado: sin registro todavía (se calcula al cerrar cada vela 4H). Solo registro.";
+  }
+  regimeRule.title = "vr = máx(ratio BTC, mediana de la cesta), ratio = ATR14 4H / media 30 días; mv = movimiento de 12 h en ATR. "
+    + "Tranquilo: vr < 1 y mv < 1,5; brusco: vr ≥ 1,4 o mv ≥ 3; movido: el resto.";
   if (strategy === "granmago") {
     const variant = String((s.settings && s.settings.granmagoVariant) || "a").toUpperCase();
     const adds = (s.settings && Number.isFinite(+s.settings.granmagoMaxAdds))

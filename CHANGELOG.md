@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.8.4
+
+- **Registro del régimen de mercado (solo registro, no cambia ninguna decisión).** En cada vela de 4 h cerrada se calcula y se guarda el régimen con las mismas definiciones y la misma cesta que el análisis de la demo del 21/11/2026 (`PREREGISTRO.md` / `week_sim.py`):
+  - ratio = ATR14 4H (Wilder) / su media de 30 días (180 velas, desde la vela 194); vr = máx(ratio de BTC, mediana de los ratios de la cesta);
+  - mv = movimiento de 12 h en ATR (|cierre − cierre de hace 3 velas| / ATR14), máx(BTC, mediana);
+  - tranquilo si vr < 1,0 y mv < 1,5; brusco si vr ≥ 1,4 o mv ≥ 3,0; movido en el resto (con los valores sin redondear);
+  - cesta fija de 27 pares (los 28 por defecto menos IOST, BTC incluido).
+- **Datos:** solo las velas públicas 4H de Blofin que el escaneo ya descarga (sin peticiones nuevas). Si falta algo no se inventa: queda NULL y la causa en `missing` (`PAR:sin datos del escaneo`, `PAR:sin vela …`, `PAR:historial N<194 velas`). Sin BTC el régimen es «insuficiente». Si a la vela le faltan pares, se espera hasta 30 min a que Blofin la publique y luego se registra con lo que haya.
+- **Una vez por vela e idempotente tras reinicios:** clave primaria (vela, modo) en `DATA_DIR/market_regime.sqlite`, aparte del ledger y del diario fiscal, cuyos esquemas no cambian. Retención de 400 días.
+- **Señales:** cada señal abierta o descartada queda en la tabla `signal_events` (hora, par, dirección, vela de la señal, resultado `abierta`/`descartada` y motivo: `max_positions`, `cooldown`, `fuera_de_stop_objetivo`, `sl_mayor_8pct`, `tope_riesgo_direccion`, `orden_no_ejecutada`…) con la vela 4H de régimen vigente (`regime_candle_close_utc`). La vista `signal_events_regime` las une con su régimen.
+- **Exportación:** `market_regime.csv` y `signal_events.csv` se exportan junto al diario fiscal (staging y destino) como ficheros aparte y salen en el `manifest.json`. Si fallan, el diario fiscal se exporta igual.
+- **Sin efecto en el trading:** todo va en try/except y un error solo deja un WARNING; el escaneo sigue. Un test comprueba que las decisiones, el tamaño y las órdenes son las mismas sin el registro, con él y con el cálculo fallando.
+- **Panel y `/api/state`:** `marketRegime` con el último régimen; en el panel, una línea de solo lectura.
+- Tests: `tests/test_market_regime_184.py`, con una fixture de las velas 4H del análisis (`tests/fixtures/regime_week_20261121.json.gz`) que reproduce sus valores (16/11 09:00 brusco 1,51/0,17 … 19/11 21:00 movido 1,18/1,23).
+
 ## 1.8.3
 
 - **Cierre por tiempo etiquetado como «TP (exchange)».** Pasó con ADA-USDT en demo el 18/11 a las 21:01: la salida fue por tiempo y quedó como «TP (exchange)».

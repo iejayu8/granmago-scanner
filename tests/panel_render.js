@@ -7,7 +7,7 @@ const html = fs.readFileSync(process.argv[2], "utf8").replace(/__INGRESS__/g, ""
 const snaps = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
 const IDS = ["balance", "equity", "pnl", "unreal", "posCount", "winrate", "tradeCount", "bestLong", "bestShort",
   "modeBadge", "modeSubtitle", "statusBadge", "heartbeat", "scanStatus", "posSummary", "tradingAlerts",
-  "openTrades", "historyTrades", "scanTable", "entryRule", "targetRule", "balanceLabel", "marginUsed", "log"];
+  "openTrades", "historyTrades", "scanTable", "entryRule", "targetRule", "regimeRule", "balanceLabel", "marginUsed", "log"];
 
 async function renderOne(name, snap) {
   const errors = [];

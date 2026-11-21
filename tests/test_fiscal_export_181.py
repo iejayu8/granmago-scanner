@@ -154,7 +154,7 @@ class StagingTest(t180.Base):
 class OptionsTest(unittest.TestCase):
     def test_timeout_option(self):
         cfg = (t180.ROOT / "granmago" / "config.yaml").read_text(encoding="utf-8")
-        self.assertIn('version: "1.8.3"', cfg)
+        self.assertIn('version: "1.8.4"', cfg)
         self.assertIn("fiscal_export_timeout_seconds: 60", cfg)
         self.assertIn("fiscal_export_timeout_seconds: int(5,600)", cfg)
         run = (t180.ROOT / "granmago" / "run.sh").read_text(encoding="utf-8")
