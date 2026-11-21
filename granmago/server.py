@@ -47,7 +47,7 @@ PAIRS = list(DEFAULT_PAIRS)
 _PAIR_RE = re.compile(r"^[A-Z0-9]+-USDT$")
 MAX_CONFIGURED_PAIRS = 40
 
-VERSION = "1.8.3"
+VERSION = "1.8.4"
 
 # Walk-forward monitoring setup. The add-on pins these on every start.
 # Leftover options and a saved copy in state.json do not change them.
@@ -1116,6 +1116,10 @@ def public_state():
     snap["trading"] = TRADER.status() if TRADER is not None else {"mode": trading_mode()}
     snap["market"] = market_stats()
     snap["alerts"] = list(ALERTS)[-10:]
+    last = MARKET_REGIME.get("last")
+    snap["marketRegime"] = None if not last else {
+        k: last.get(k) for k in ("candle_close_utc", "mode", "regime", "vr", "mv", "btc_ratio", "basket_median_ratio",
+                                 "n_symbols", "n_basket", "missing")}
     snap["killSwitch"] = bool(snap.get("killSwitch"))
     for name in ("paperSnapshot", "demoLedger"):
         book = snap.get(name)
@@ -1717,10 +1721,17 @@ def fiscal_export_now(reason="manual"):
     import fiscal_export
     if FISCAL_EXPORT["dir"] is None:
         configure_fiscal_export()
+    extras = ()
+    store = MARKET_REGIME["store"]
+    if store is not None:  # 1.8.4: regime/signal CSVs ride along; their failure never blocks the fiscal export
+        try:
+            extras = store.export_tables()
+        except Exception as exc:
+            log.warning("Régimen de mercado: no se exporta (%r); el diario fiscal sí.", exc)
     with _FISCAL_EXPORT_LOCK:
         FISCAL_EXPORT["lastAttemptMono"] = time.monotonic()
         try:
-            res = fiscal_export.export_all(DATA_DIR, FISCAL_EXPORT["dir"], secrets=_export_secrets(),
+            res = fiscal_export.export_all(DATA_DIR, FISCAL_EXPORT["dir"], secrets=_export_secrets(), extra_csv=extras,
                                            engine_version=VERSION, timeout=FISCAL_EXPORT["timeout"] or 60)
         except Exception as exc:
             return _fiscal_export_failed("Exportación fiscal local fallida (destino %s): %s"
@@ -2222,6 +2233,7 @@ def analyze_pair(pair, threshold=None):
         c4 = fetch_candles(pair, "4H", 150)
         c_d = fetch_candles(pair, "1D", 80)
         c_w = fetch_candles(pair, "1W", 60)
+    _regime_observe(pair, c4)  # 1.8.4: record only
     row = score_market(pair, c4, c_d, c_w, threshold)
     row = _attach_granmago(row, c4, c_d, c_w)
     if row:
@@ -2306,6 +2318,7 @@ def scan_all():
                 )
             )
             save_state()
+        market_regime_step()  # 1.8.4: record only, never raises
         return results
     finally:
         SCAN_LOCK.release()
@@ -2600,27 +2613,38 @@ def open_granmago(sig, *, quote=None):
 
 
 def _granmago_plan(sig, *, quote=None):
+    """Every check and the size of a course trade (see _granmago_plan_checks).
+    1.8.4: a refusal is also written to the signal record (no effect on the result)."""
+    _PLAN_REJECT.reason = None
+    plan = _granmago_plan_checks(sig, quote=quote)
+    if not plan and isinstance(sig, dict) and MARKET_REGIME["store"] is not None:
+        _signal_event(sig.get("pair"), sig.get("side"), sig.get("closeMs"), "descartada",
+                      getattr(_PLAN_REJECT, "reason", None) or "desconocido")
+    return plan
+
+
+def _granmago_plan_checks(sig, *, quote=None):
     """Every check and the size of a course trade, without touching the book.
 
     Returns a plan dict or False. Paper applies it with a simulated fill;
     demo sends it to Blofin and applies the real fill.
     """
     if not isinstance(sig, dict):
-        return False
+        return _reject("senal_invalida")
     if quote is not None:
         if not valid_quote(quote, sig.get("pair")) or not quote.can_open:
-            return False
+            return _reject("cotizacion_invalida")
         sig = dict(sig, market=quote.price)
     pair = sig.get("pair")
     side = sig.get("side")
     if side not in ("long", "short") or not pair or _find_position(pair):
         if pair and _find_position(pair):
             add_log("Ya hay posición en %s, no se duplica." % pair)
-        return False
+        return _reject("par_ocupado" if pair and _find_position(pair) else "senal_invalida")
     if cooldown_active(pair):
-        return False
+        return _reject("cooldown")
     if not regime_allows(sig, side):
-        return False
+        return _reject("filtro_regimen_estrategia")
     signal = _as_price(sig.get("price"))
     stop = _as_price(sig.get("sl"))
     target = _as_price(sig.get("tp"))
@@ -2628,30 +2652,30 @@ def _granmago_plan(sig, *, quote=None):
     if reference is None:
         reference = signal
     if signal is None or stop is None or target is None or reference is None:
-        return False
+        return _reject("precios_incompletos")
     if _signal_used(pair, side, sig.get("confirmMs"), sig.get("closeMs")):
         add_log("Señal ya operada en %s %s, no se repite." % (side.upper(), pair))
-        return False
+        return _reject("senal_ya_operada")
     if _outside_bracket(side, reference, stop, target):
         add_log(
             "No se abre %s %s: precio %s fuera de stop %s / objetivo %s."
             % (side.upper(), pair, _fmt(reference), _fmt(stop), _fmt(target))
         )
-        return False
+        return _reject("fuera_de_stop_objetivo")
     entry = _slip_price(side, reference, closing=False)
     if entry is None or _outside_bracket(side, entry, stop, target):
-        return False
+        return _reject("fuera_de_stop_objetivo_slippage")
     dist = abs(entry - stop)
     if dist > entry * 0.08:
         add_log("SL demasiado amplio en %s" % pair)
-        return False
+        return _reject("sl_mayor_8pct")
     adds = granmago_max_adds()
     legs = 1 + adds
     risk_pct = float(STATE["settings"]["riskPct"]) / 100.0
     full_risk = STATE["balance"] * risk_pct
     leg_risk = full_risk / legs
     if leg_risk <= 0:
-        return False
+        return _reject("riesgo_cero")
     notional = round(leg_risk / (dist / entry), 2)
     room = _notional_room()
     capped = False
@@ -2660,7 +2684,7 @@ def _granmago_plan(sig, *, quote=None):
         notional = math.floor(max(0.0, room) * 100 + 1e-9) / 100.0
         if notional <= 0:
             add_log("Sin hueco de nocional para %s (tope balance × apalancamiento)." % pair)
-            return False
+            return _reject("sin_hueco_nocional")
         leg_risk = notional * (dist / entry)
         add_log(
             "Tamaño de %s limitado a %.2f USDT de nocional (tope balance × apalancamiento)."
@@ -2671,7 +2695,7 @@ def _granmago_plan(sig, *, quote=None):
             "Riesgo %s en la misma dirección ya está en el tope (%.2f R)."
             % (side, max_same_direction_risk_r())
         )
-        return False
+        return _reject("tope_riesgo_direccion")
     return {"pair": pair, "side": side, "entry": entry, "reference": reference, "signal": signal,
             "stop": stop, "target": target, "notional": notional, "capped": capped,
             "legRisk": round(leg_risk, 2), "dist": dist, "adds": adds,
@@ -2727,6 +2751,8 @@ def _granmago_position(plan, *, entry_fee):
 
 
 def _log_entry(pos, sig):
+    _signal_event(pos["pair"], pos["side"], sig.get("closeMs"), "abierta", "entrada",
+                  str(pos.get("entryOrderId") or ""))
     add_log(
         "ENTRADA GRANMAGO %s %s %s @ %s SL %s TP %s [%d/%d]%s"
         % (
@@ -3136,6 +3162,96 @@ def monitor_position(display_only=False):
         save_state()
 
 
+# ============================================================ market regime
+# 1.8.4: record-only market regime per closed 4H candle (market_regime.py) and
+# a structured log of signals opened/discarded. Nothing here is read by any
+# trading decision; every call is wrapped so an error is only a WARNING.
+MARKET_REGIME = {"store": None, "last": None, "lastPruneMs": 0}
+_REGIME_CANDLES = {}
+_REGIME_LOCK = threading.Lock()
+_PLAN_REJECT = threading.local()
+
+
+def init_market_regime(data_dir=None):
+    try:
+        import market_regime
+        store = market_regime.RegimeStore(data_dir or DATA_DIR)
+        MARKET_REGIME.update(store=store, last=store.latest(_regime_mode()))
+    except Exception as exc:
+        MARKET_REGIME["store"] = None
+        log.warning("Registro de régimen de mercado desactivado: %r", exc)
+    return MARKET_REGIME["store"]
+
+
+def _regime_mode():
+    mode = trading_mode()
+    return "real" if mode == "live" else mode if mode in ("paper", "demo") else "paper"
+
+
+def _regime_observe(pair, c4):
+    """Keep a copy of the 4H candles the scan already downloaded (no extra request)."""
+    if MARKET_REGIME["store"] is None:
+        return
+    try:
+        if isinstance(c4, list) and c4:
+            with _REGIME_LOCK:
+                _REGIME_CANDLES[pair] = [dict(x) for x in c4]
+    except Exception as exc:
+        log.warning("Régimen de mercado: velas de %s no guardadas: %r", pair, exc)
+
+
+def market_regime_step(now_ms=None):
+    """Record the regime of the last closed 4H candle once (idempotent)."""
+    store = MARKET_REGIME["store"]
+    if store is None:
+        return None
+    try:
+        import market_regime as mr
+        now_ms = int(now_epoch() * 1000) if now_ms is None else int(now_ms)
+        close_ms = mr.candle_close_for(now_ms)
+        mode = _regime_mode()
+        if store.has(close_ms, mode):
+            return None
+        with _REGIME_LOCK:
+            candles = {p: list(v) for p, v in _REGIME_CANDLES.items()}
+        want = close_ms - mr.H4_MS
+        scanned = set(active_pairs())
+        late = [p for p in mr.BASKET if p in scanned
+                and not any(int(x.get("ts") or 0) == want for x in candles.get(p) or [])]
+        if late and now_ms - close_ms < mr.PUBLISH_WAIT_MS:
+            return None  # Blofin publishes the closed candle with a delay: wait for the whole basket
+        row = mr.compute(candles, close_ms)
+        if store.record(row, mode, now_ms=now_ms, engine_version=VERSION):
+            MARKET_REGIME["last"] = dict(row, mode=mode)
+            log.info("Régimen 4H %s: %s (vr %s, mv %s, %d/%d símbolos)%s", row["candle_close_utc"], row["regime"],
+                     "-" if row["vr"] is None else "%.2f" % row["vr"], "-" if row["mv"] is None else "%.2f" % row["mv"],
+                     row["n_symbols"], row["n_basket"], (" faltan: " + row["missing"][:200]) if row["missing"] else "")
+        if now_ms - MARKET_REGIME["lastPruneMs"] >= 86400 * 1000:
+            MARKET_REGIME["lastPruneMs"] = now_ms
+            store.prune(now_ms)
+        return row
+    except Exception as exc:
+        log.warning("Régimen de mercado: cálculo fallido (sin efecto en el trading): %r", exc)
+        return None
+
+
+def _signal_event(pair, side, signal_close_ms, outcome, reason, detail=""):
+    store = MARKET_REGIME["store"]
+    if store is None:
+        return
+    try:
+        store.record_event(now_ms=int(now_epoch() * 1000), mode=_regime_mode(), pair=pair, side=side,
+                           signal_close_ms=signal_close_ms, outcome=outcome, reason=reason, detail=detail)
+    except Exception as exc:
+        log.warning("Registro de señales: evento %s %s no guardado: %r", pair, reason, exc)
+
+
+def _reject(reason):
+    """_granmago_plan refusal: same False as before, plus the cause for the record."""
+    _PLAN_REJECT.reason = reason
+    return False
+
+
 _MAXPOS_LOGGED = OrderedDict()  # (pair, side, candle) already logged as skipped by max_positions
 _MAXPOS_LOGGED_MAX = 500
 
@@ -3172,6 +3288,8 @@ def _log_max_positions_skips(rows, mode):
             _MAXPOS_LOGGED.popitem(last=False)
         add_log("No se abre %s %s: máximo de posiciones alcanzado (%d/%d)."
                 % (side.upper(), pair, len(_positions()), limit))
+        _signal_event(pair, side, candle if mode == "granmago" else None, "descartada", "max_positions",
+                      "%d/%d" % (len(_positions()), limit))
 
 
 def maybe_open():
@@ -3844,6 +3962,7 @@ def _open_on_exchange(plan, quote):
         STATE.get("opening", {}).pop(pair, None)
         if not fill:
             add_log("Entrada DEMO %s %s no ejecutada (ver alertas de trading)." % (plan["side"].upper(), pair))
+            _signal_event(pair, plan["side"], plan["sig"].get("closeMs"), "descartada", "orden_no_ejecutada")
             save_state()
             return False
         dist = abs(fill["entry"] - fill["sl"])
@@ -4394,6 +4513,7 @@ def api_kill_switch():
 def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     init_trading()
+    init_market_regime()
     cfg = configure_fiscal_export()
     log.info("Exportación fiscal: staging local, copia a %s (timeout %ss) cada %s min y tras cada cierre.",
              cfg["dir"], cfg["timeout"], cfg["minutes"] or "-")
