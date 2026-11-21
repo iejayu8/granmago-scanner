@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.8.2
+
+Pasada de calidad del 21/11/2026.
+
+- **Exportación fiscal: el NAS nunca mezcla dos exportaciones.** Si una copia al NAS superaba el timeout y se reanudaba después de una exportación local más nueva, copiaba el sqlite de la exportación antigua y el CSV y el `manifest.json` de la nueva. El SHA-256 del manifest no coincidía con el sqlite que tenía al lado, y no se avisaba. Ahora los ficheros de cada exportación se abren antes de lanzar el hilo de copia, y la copia usa esos descriptores: aunque el staging se regenere, el hilo copia un conjunto coherente. La siguiente copia deja el NAS al día.
+- **Funding de Blofin mal formado = «no disponible», nunca 0.** Si `GET /api/v1/account/funding-fees` respondía con un objeto en vez de una lista o con algún cargo ilegible (`fundingFee` no numérico, NaN o una fila que no es objeto), se anotaba funding 0 USDT como dato del exchange (`funding_status` `exchange`). Ahora se anota como `unavailable`, igual que cuando la petición falla. Una lista vacía (o `data: null`) sigue siendo 0. Se ajusta el test de 1.7.2 que daba por buena la suma ignorando los cargos ilegibles.
+- **Mensaje de copia fallida sin duplicar:** un error del sistema al copiar (p. ej. disco lleno) salía como «copia a X fallida: copia a X fallida: OSError(...)». Ahora sale una vez, con la causa (`OSError: [Errno 28] No space left on device`).
+- Tests: `tests/test_qa_1_8_2.py` (4 tests). Cubren una copia colgada que se reanuda después de una exportación nueva, el disco lleno durante la copia (sin ficheros parciales) y las respuestas de funding mal formadas.
+
 ## 1.8.1
 
 - **Exportación fiscal al NAS sin colgarse.** En 1.8.0, con `fiscal_export_dir` en una carpeta SMB/CIFS (`/share/nas_ugreen/granmago-fiscal`), el backup de SQLite se hacía directamente sobre el NAS. El bloqueo de ficheros de SQLite sobre CIFS se colgaba y solo quedaba un `.fiscal_journal_demo.sqlite.*.tmp` de 0 B, sin CSV, sin manifest y sin nada en el log.

@@ -247,20 +247,56 @@ def _check_remote(dest):
         raise ExportError("sin permiso de escritura en %s" % dest)
 
 
+class _Pinned:
+    """A staging file opened before the copy thread starts. The open fd keeps
+    the inode of THIS build: if a later export replaces the staging files
+    (os.replace) while a hung copy resumes, it still copies one consistent
+    set (sqlite, CSV and the manifest that describes them)."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.name = self.path.name
+        self.fh = open(self.path, "rb")
+
+    def close(self):
+        try:
+            self.fh.close()
+        except OSError:
+            pass
+
+
 def _copy_one(src, dest):
-    """Whole-file copy to a .tmp in dest, fsync, size + SHA-256 check, rename."""
+    """Whole-file copy to a .tmp in dest, fsync, size + SHA-256 check, rename.
+    `src` is a _Pinned staging file (a path is pinned here)."""
+    own = not isinstance(src, _Pinned)
+    if own:
+        src = _Pinned(src)
+    try:
+        return _copy_pinned(src, dest)
+    finally:
+        if own:
+            src.close()
+
+
+def _copy_pinned(src, dest):
     final = dest / src.name
     tmp = dest / (".%s.%s.tmp" % (src.name, os.urandom(4).hex()))
-    want = _sha256(src)
+    fi = src.fh
+    fi.seek(0)
+    want = hashlib.sha256()
+    for chunk in iter(lambda: fi.read(COPY_CHUNK), b""):
+        want.update(chunk)
+    size = os.fstat(fi.fileno()).st_size
     try:
         h = hashlib.sha256()
-        with open(src, "rb") as fi, open(tmp, "wb") as fo:
+        fi.seek(0)
+        with open(tmp, "wb") as fo:
             for chunk in iter(lambda: fi.read(COPY_CHUNK), b""):
                 fo.write(chunk)
                 h.update(chunk)
             fo.flush()
             os.fsync(fo.fileno())
-        if h.hexdigest() != want or tmp.stat().st_size != src.stat().st_size:
+        if h.hexdigest() != want.hexdigest() or tmp.stat().st_size != size:
             raise ExportError("copia de %s no coincide con el staging" % src.name)
         os.replace(tmp, final)
     except BaseException:
@@ -273,9 +309,10 @@ def _copy_one(src, dest):
 
 
 def _copy_files(staging, dest, names):
+    """`names` are staging file names or _Pinned files (manifest.json last)."""
     _check_remote(dest)
     cleaned = clean_orphans(dest)
-    copied = [_copy_one(staging / n, dest) for n in names]  # manifest.json is last
+    copied = [_copy_one(n if isinstance(n, _Pinned) else Path(staging) / n, dest) for n in names]
     _fsync_dir(dest)
     return {"copied": copied, "cleaned": cleaned}
 
@@ -291,12 +328,24 @@ def copy_to_dest(staging, dest, names, timeout=DEFAULT_COPY_TIMEOUT):
     if prev is not None and prev.is_alive():
         raise RemoteCopyError("la copia anterior a %s sigue colgada; no se lanza otra" % _COPY_STATE["dest"])
     box = {}
+    # 1.8.2: pin this build's files (local disk, fast) before the thread starts.
+    pinned = []
+    try:
+        for n in names:
+            pinned.append(_Pinned(Path(staging) / n))
+    except OSError as exc:
+        for f in pinned:
+            f.close()
+        raise RemoteCopyError("staging %s ilegible: %s" % (staging, exc))
 
     def run():
         try:
-            box["ok"] = _copy_files(Path(staging), Path(dest), names)
+            box["ok"] = _copy_files(Path(staging), Path(dest), pinned)
         except BaseException as exc:  # reported to the caller
             box["err"] = exc
+        finally:
+            for f in pinned:
+                f.close()
 
     t = threading.Thread(target=run, name="granmago-fiscal-copy", daemon=True)
     _COPY_STATE.update(thread=t, dest=str(dest))
@@ -306,7 +355,7 @@ def copy_to_dest(staging, dest, names, timeout=DEFAULT_COPY_TIMEOUT):
         raise RemoteCopyError("timeout de %ss copiando a %s (¿montaje SMB colgado?)" % (timeout, dest))
     if "err" in box:
         err = box["err"]
-        raise RemoteCopyError(str(err) if isinstance(err, ExportError) else "copia a %s fallida: %r" % (dest, err))
+        raise RemoteCopyError(str(err) if isinstance(err, ExportError) else "%s: %s" % (type(err).__name__, err))
     return box["ok"]
 
 
