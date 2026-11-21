@@ -43,6 +43,7 @@ class FakeBlofin:
         self.timeout_before_order = False
         self.ignore_attached = False
         self.tpsl_error = False
+        self.fills_hidden_calls = 0  # next N fills-history GETs return [] (Blofin lists new fills late)
         self.balance_errors = 0  # next N balance GETs answer code 500 (as Blofin on 20/11/2026)
         self.fee_rate = 0.0006
         self.funding_fee = "-0.05"
@@ -223,6 +224,9 @@ class FakeBlofin:
         return self.ok([])
 
     def h_get_trade_fills_history(self, p, b):
+        if self.fills_hidden_calls:
+            self.fills_hidden_calls -= 1
+            return self.ok([])
         since = int(p.get("begin") or 0)
         return self.ok([f for f in self.fills if f["instId"] == p.get("instId") and int(f["ts"]) >= since])
 

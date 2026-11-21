@@ -136,6 +136,7 @@
   <div class="card" style="margin-bottom:16px">
     <h3>Ranking de oportunidades</h3>
     <p id="entryRule" style="margin:0 0 8px; font-size:0.8rem; color:var(--muted);">Umbral de entrada: 100. Solo abre con esa puntuación.</p>
+    <p id="targetRule" style="margin:0 0 8px; font-size:0.8rem; color:var(--muted);"></p>
     <div class="table-wrap">
       <table>
         <thead>
@@ -361,6 +362,18 @@ function render(s) {
   const entryThreshold = (s.settings && Number.isFinite(+s.settings.entryThreshold))
     ? +s.settings.entryThreshold : 100;
   const strategy = (s.settings && s.settings.strategy) || "granmago";
+  // 1.8.3: takeProfitR only sets the target in scanner mode; Gran Mago aims at the daily pivot.
+  const tpR = (s.settings && Number.isFinite(+s.settings.takeProfitR)) ? +s.settings.takeProfitR : null;
+  const tpRText = tpR == null ? "—" : tpR.toLocaleString("es-ES", { maximumFractionDigits: 2 }) + "R";
+  const targetRule = $("targetRule");
+  if (strategy === "granmago") {
+    targetRule.textContent = "Objetivo: pivote diario de la señal Gran Mago. takeProfitR (" + tpRText + "): no aplica en modo Gran Mago.";
+    targetRule.title = "takeProfitR solo fija el objetivo en modo scanner (objetivo = entrada ± distancia al stop × takeProfitR). "
+      + "En modo Gran Mago el TP es el pivote diario que da la estrategia.";
+  } else {
+    targetRule.textContent = "Objetivo: takeProfitR " + tpRText + " (entrada ± distancia al stop × " + tpRText + ").";
+    targetRule.title = "takeProfitR solo aplica en modo scanner. En modo Gran Mago el objetivo es el pivote diario.";
+  }
   if (strategy === "granmago") {
     const variant = String((s.settings && s.settings.granmagoVariant) || "a").toUpperCase();
     const adds = (s.settings && Number.isFinite(+s.settings.granmagoMaxAdds))

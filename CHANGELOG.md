@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.8.3
+
+- **Cierre por tiempo etiquetado como «TP (exchange)».** Pasó con ADA-USDT en demo el 18/11 a las 21:01: la salida fue por tiempo y quedó como «TP (exchange)».
+  - Qué pasó: el motor pidió el cierre `time` y Blofin ejecutó la orden a mercado. Justo después, `fills-history` todavía no listaba el fill, así que el bucle de cierres no pudo liquidar la operación. La reconciliación vio que la posición ya no estaba en Blofin y la liquidó sin motivo, deduciéndolo por la distancia del precio de salida a SL y TP. ADA salió más cerca del TP.
+  - Arreglo: se anota cuándo sale nuestra orden de cierre (`closeSentMs`). Si los fills de cierre no son anteriores a esa hora (con 5 s de margen por el reloj), el motivo es el del motor (`time`, `manual`, `sin_sl`…), en el historial, el log y el diario fiscal.
+  - Si Blofin responde que la posición ya estaba cerrada (102005/102022: saltó el SL o el TP antes), se mantiene el motivo del exchange.
+  - El histórico de ADA no se toca: el diario es append-only y el historial live no se reescribe.
+- **Señales descartadas por `max_positions`:** ahora se registran como las demás causas, con «No se abre LONG/SHORT PAR: máximo de posiciones alcanzado (3/3).» (INFO). Una sola vez por par, dirección y vela; la memoria de deduplicación está acotada a 500 entradas.
+- **Panel:** una línea nueva «Objetivo» con tooltip. En modo Gran Mago dice que el objetivo es el pivote diario y que takeProfitR (1,7R) no aplica; en modo scanner muestra takeProfitR. La línea de arranque del log también lo aclara.
+- Tests: `tests/test_qa_183.py`, con FakeBlofin capaz de listar los fills con retraso.
+
 ## 1.8.2
 
 Pasada de calidad del 21/11/2026.
