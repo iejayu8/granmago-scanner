@@ -189,7 +189,7 @@ class ImageCopyTest(unittest.TestCase):
                 """
                 import server
                 import granmago_strategy
-                assert server.VERSION == "1.8.4"
+                assert server.VERSION == "1.8.5"
                 assert server.strategy_mode() == "granmago"
                 assert server.granmago_style() == "sweep"
                 """
@@ -209,7 +209,7 @@ class ImageCopyTest(unittest.TestCase):
 class OptionsSurfaceTest(unittest.TestCase):
     def test_schema_translations_and_run_script_list_the_same_options(self):
         config = (ADDON / "config.yaml").read_text(encoding="utf-8")
-        self.assertIn('version: "1.8.4"', config)
+        self.assertIn('version: "1.8.5"', config)
         self.assertEqual(set(_block_keys(config, "options")), SCHEMA_KEYS)
         self.assertEqual(set(_block_keys(config, "schema")), SCHEMA_KEYS)
         options_text = config.split("schema:", 1)[0]

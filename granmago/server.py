@@ -47,7 +47,7 @@ PAIRS = list(DEFAULT_PAIRS)
 _PAIR_RE = re.compile(r"^[A-Z0-9]+-USDT$")
 MAX_CONFIGURED_PAIRS = 40
 
-VERSION = "1.8.4"
+VERSION = "1.8.5"
 
 # Walk-forward monitoring setup. The add-on pins these on every start.
 # Leftover options and a saved copy in state.json do not change them.
@@ -76,10 +76,10 @@ FIXED_BEHAVIOUR = {
     "granmagoVariant": "a",
     "granmagoMaxAdds": 0,
     "granmagoMomentumExit": True,
-    "granmagoMaxHoldBars": 15,
+    "granmagoMaxHoldBars": 24,  # 1.8.5: was 15 (weekly optimisation 23/11/2026)
     "granmagoBreakevenR": 0.0,
     "granmagoMinRr": 0.0,
-    "granmagoStopPadPct": 0.3,
+    "granmagoStopPadPct": 0.2,  # 1.8.5: was 0.3
     "granmagoStyle": "sweep",
     "granmagoSetups": "both",
 }
@@ -505,9 +505,9 @@ def granmago_momentum_exit():
 
 def granmago_max_hold_bars():
     try:
-        bars = int(float(_settings().get("granmagoMaxHoldBars", 15)))
+        bars = int(float(_settings().get("granmagoMaxHoldBars", FIXED_BEHAVIOUR["granmagoMaxHoldBars"])))
     except (TypeError, ValueError):
-        return 15
+        return FIXED_BEHAVIOUR["granmagoMaxHoldBars"]
     return min(40, max(0, bars))
 
 
@@ -520,7 +520,8 @@ def granmago_min_rr():
 
 
 def granmago_stop_pad_pct():
-    return _sane_float(_settings().get("granmagoStopPadPct", 0.3), 0.3)
+    pad = FIXED_BEHAVIOUR["granmagoStopPadPct"]
+    return _sane_float(_settings().get("granmagoStopPadPct", pad), pad)
 
 
 def _sane_risk_pct(value, fallback=1.0):
