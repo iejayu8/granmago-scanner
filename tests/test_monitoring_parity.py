@@ -60,6 +60,9 @@ MONITORING_150 = {
     "granmagoSetups": "both",
     "pairs": list(server.LIQUID_PAIRS),
 }
+# 1.8.5 (weekly optimisation 23/11/2026, approved by Xavi): hold 24 bars and
+# stop pad 0.2 %. Everything else stays as in 1.5.0.
+MONITORING_185 = dict(MONITORING_150, granmagoMaxHoldBars=24, granmagoStopPadPct=0.2)
 
 HOSTILE_ENV = {
     "STRATEGY": "scanner",
@@ -215,10 +218,10 @@ class MonitoringParityTest(unittest.TestCase):
             for name in HOSTILE_ENV:
                 os.environ.pop(name, None)
 
-        for key, value in MONITORING_150.items():
+        for key, value in MONITORING_185.items():
             self.assertEqual(loaded["settings"][key], value, key)
 
-        legacy = _replay(MONITORING_150)
+        legacy = _replay(MONITORING_185)
         pinned = _replay(loaded["settings"])
         self.assertGreaterEqual(legacy["signals"], 1)
         self.assertTrue(legacy["opened"])

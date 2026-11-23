@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.8.5
+
+- **Resultado de la optimización semanal del 23/11/2026 aplicado** (`granmago-optim/2026-11-23.md`, veredicto «ROBUSTA SÍ», aprobado por Xavi). Solo cambian dos valores fijos de la estrategia Gran Mago:
+  - salida por tiempo: de **15 a 24 velas** de confirmación (`granmagoMaxHoldBars`);
+  - margen del stop: de **0,3 % a 0,2 %** del precio (`granmagoStopPadPct`; el stop sigue siendo `max(0,5 × ATR14 4H, margen)`).
+  - La salida por agotamiento (momentum) y el minRR (0) no cambian. No cambia ninguna otra lógica.
+  - Out-of-sample (5 folds de 30 días): 174 operaciones, +84,65 USDT, ΣR 8,4, PF 1,16 y DD máx. 7,5 %. Con los valores anteriores: 186 operaciones, −5,62 USDT, ΣR −0,5, PF 0,99 y DD 9,4 %. El IC95 % del R medio incluye 0, así que la evidencia es débil.
+- **Instalaciones existentes:** estos valores no son opciones del complemento (no están en `config.yaml` desde 1.5.1). El motor los fija en cada arranque desde `FIXED_BEHAVIOUR`, por encima de lo guardado en `state.json`. Al actualizar a 1.8.5 se aplican solos, sin tocar la configuración.
+  - Las posiciones ya abiertas conservan su propio máximo de 15 velas y su stop.
+  - Las entradas nuevas usan 24 velas y 0,2 %.
+- README actualizado. Tests: `tests/test_qa_185.py`. `tests/test_monitoring_parity.py` compara ahora contra la configuración 1.8.5.
+
 ## 1.8.4
 
 - **Registro del régimen de mercado (solo registro, no cambia ninguna decisión).** En cada vela de 4 h cerrada se calcula y se guarda el régimen con las mismas definiciones y la misma cesta que el análisis de la demo del 21/11/2026 (`PREREGISTRO.md` / `week_sim.py`):

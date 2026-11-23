@@ -1,7 +1,7 @@
 """Gran Mago course strategy.
 
 The add-on pins variant A, style sweep, both setups, no adds, the momentum
-exit, a 15-bar hold and a 0.3% stop pad. Arguments stay on the functions so
+exit, a 24-bar hold and a 0.2% stop pad (1.8.5; 15 bars and 0.3% before). Arguments stay on the functions so
 the research tools can still compare other readings. The score scanner is
 the other mode in this module; the add-on does not expose it.
 
@@ -44,7 +44,7 @@ Chosen readings, where the sources disagree:
 - The stop sits beyond the swept wick by max(0.5 × ATR14 of 4H, pad% of
   price). An unfilled imbalance or a big wick that reaches past that pad
   pushes the stop further. A stop wider than 8% of price is refused, same
-  ceiling as the scanner. The pad defaults to 0.3%. He quoted other people
+  ceiling as the scanner. The pad defaults to 0.2% (0.3% until 1.8.4). He quoted other people
   using 2–3% and did not give his own number.
 - The target is the nearest prior daily swing cluster in profit, 0.1% inside
   its extreme. There is no R-multiple target. Minimum reward/risk defaults
@@ -121,7 +121,7 @@ SQUEEZE_LEN = 20
 ADX_PERIOD = 14
 ATR_PERIOD = 14
 STOP_ATR_MULT = 0.5
-DEFAULT_STOP_PAD_PCT = 0.3
+DEFAULT_STOP_PAD_PCT = 0.2
 MAX_STOP_PCT = 0.08
 TP_INSIDE = 0.001
 WICK_LOOKBACK = 50
