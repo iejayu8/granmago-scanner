@@ -57,7 +57,7 @@ Chosen readings, where the sources disagree:
   watches ticks and a close-only stop would ignore the wick.
 - Momentum exit (on by default): a long exits when %K > 80 and the squeeze
   histogram is above zero and falling. The short is the mirror. Time exit
-  is 15 confirmation bars. Breakeven is off; he mentioned it and never
+  is 24 confirmation bars (15 until 1.8.4). Breakeven is off; he mentioned it and never
   taught it.
 - Adds, when enabled, are at most one or two. The first fill risks
   1/(1+adds) of the trade risk so that a full stop of every leg is still
@@ -199,6 +199,10 @@ def drop_forming(candles, bar_ms, now_ms):
                 out.append(candle)
         except (TypeError, ValueError, KeyError):
             continue
+    # 1.8.6: closed by time but still provisional on Blofin (confirm "0", OHLC
+    # still changing for a few seconds after the boundary): not closed yet.
+    while out and isinstance(out[-1], dict) and out[-1].get("confirm") is False:
+        out.pop()
     return out
 
 

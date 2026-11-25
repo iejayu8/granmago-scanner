@@ -121,6 +121,8 @@ def symbol_metrics(candles, close_ms):
     rows = sorted((x for x in candles or [] if int(x["ts"]) <= want), key=lambda x: int(x["ts"]))
     if not rows or int(rows[-1]["ts"]) != want:
         return None, None, "sin vela %s" % utc_iso(close_ms)
+    if rows[-1].get("confirm") is False:  # 1.8.6: Blofin still provisional (confirm "0")
+        return None, None, "vela %s sin confirmar" % utc_iso(close_ms)
     i = len(rows) - 1
     if i < MIN_INDEX:
         return None, None, "historial %d<%d velas" % (len(rows), MIN_INDEX + 1)
