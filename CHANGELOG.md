@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.8.6
+
+Pasada de calidad del 25/11/2026.
+
+- **Vela recién cerrada «provisional» de Blofin ya no cuenta como cerrada.** Durante unos segundos tras el cierre, `GET /api/v1/market/candles` devuelve la vela que acaba de cerrar con `confirm = "0"` y un OHLC que todavía cambia. Sondeo público del 25/11 a las 10:15 (hora de Madrid), BTC-USDT 15m: de +0 a +3 s, mínimo 59049,6 y cierre 59060,6 con `confirm` 0; desde +4 s, mínimo 59029,8 y cierre 59051,5 con `confirm` 1.
+  - Antes, el motor daba la vela por cerrada solo por la hora. Si el escaneo pasaba por un par en esos segundos, la señal Gran Mago, la salida por agotamiento y el registro de régimen 4H usaban ese OHLC provisional. El régimen se guarda una sola vez por vela, así que el valor provisional quedaba fijado.
+  - Ahora `fetch_candles` marca esas filas (`confirm: false`) y `drop_forming` las quita del final de la serie, como la vela en curso. La señal se evalúa en el escaneo siguiente (90 s) con la vela definitiva.
+  - En el régimen, una vela provisional cuenta como «no publicada»: se espera, como con una vela que falta (hasta 30 min). Si sigue provisional, queda en `missing` como `PAR:vela … sin confirmar`.
+  - Las filas sin columna `confirm` (fixtures y backtests) se tratan como antes.
+- **`signal_events` registra también los descartes previos al plan.** 1.8.4 promete que cada señal abierta o descartada queda registrada, pero `maybe_open` descartaba algunas antes de `_granmago_plan` sin anotarlas. Ahora salen como `descartada`, una vez por señal, con estos motivos:
+  - `kill_switch`: kill switch activo;
+  - `par_degradado`: par degradado o en su ciclo de prueba;
+  - `sin_ticker_fresco`: sin ticker Blofin fresco y coherente, o con el escaneo caducado.
+  - Es solo registro: ninguna decisión ni orden cambia.
+- Docstring de la estrategia actualizado: salida por tiempo a 24 velas.
+- Tests: `tests/test_qa_186.py` (8 tests).
+
 ## 1.8.5
 
 - **Resultado de la optimización semanal del 23/11/2026 aplicado** (`granmago-optim/2026-11-23.md`, veredicto «ROBUSTA SÍ», aprobado por Xavi). Solo cambian dos valores fijos de la estrategia Gran Mago:

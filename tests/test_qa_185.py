@@ -49,7 +49,7 @@ class Defaults185Test(unittest.TestCase):
     def test_not_an_addon_option(self):
         cfg = (ADDON / "config.yaml").read_text(encoding="utf-8")
         self.assertNotIn("granmago_", cfg)  # Supervisor's options.json cannot hold them
-        self.assertIn('version: "1.8.5"', cfg)
+        self.assertIn('version: "1.8.6"', cfg)
         run = (ADDON / "run.sh").read_text(encoding="utf-8")
         for key in ("granmago_max_hold_bars", "granmago_stop_pad_pct"):
             self.assertIn("  %s\n" % key, run)  # obsolete list: removed, never exported

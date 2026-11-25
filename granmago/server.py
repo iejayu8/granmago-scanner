@@ -47,7 +47,7 @@ PAIRS = list(DEFAULT_PAIRS)
 _PAIR_RE = re.compile(r"^[A-Z0-9]+-USDT$")
 MAX_CONFIGURED_PAIRS = 40
 
-VERSION = "1.8.5"
+VERSION = "1.8.6"
 
 # Walk-forward monitoring setup. The add-on pins these on every start.
 # Leftover options and a saved copy in state.json do not change them.
@@ -1962,7 +1962,12 @@ def fetch_candles(inst_id, bar, limit=120):
             if (not all(math.isfinite(v) and v > 0 for v in (o, h, l, close))
                     or not l <= min(o, close) <= max(o, close) <= h):
                 raise _Reject("vela %s OHLC incoherente ts=%s" % (bar, ts))
-            rows.append({"ts": ts, "o": o, "h": h, "l": l, "c": close})
+            row = {"ts": ts, "o": o, "h": h, "l": l, "c": close}
+            # 1.8.6: Blofin serves the just-closed candle as provisional (confirm "0")
+            # for a few seconds after the boundary, with OHLC that still change.
+            if len(c) > 8 and str(c[8]).strip() == "0":
+                row["confirm"] = False
+            rows.append(row)
         rows.sort(key=lambda c: c["ts"])
         if len({c["ts"] for c in rows}) != len(rows):
             raise _Reject("velas %s duplicadas" % bar)
@@ -3218,7 +3223,8 @@ def market_regime_step(now_ms=None):
         want = close_ms - mr.H4_MS
         scanned = set(active_pairs())
         late = [p for p in mr.BASKET if p in scanned
-                and not any(int(x.get("ts") or 0) == want for x in candles.get(p) or [])]
+                and not any(int(x.get("ts") or 0) == want and x.get("confirm") is not False
+                            for x in candles.get(p) or [])]  # 1.8.6: a provisional candle is not published
         if late and now_ms - close_ms < mr.PUBLISH_WAIT_MS:
             return None  # Blofin publishes the closed candle with a delay: wait for the whole basket
         row = mr.compute(candles, close_ms)
@@ -3293,6 +3299,23 @@ def _log_max_positions_skips(rows, mode):
                       "%d/%d" % (len(_positions()), limit))
 
 
+def _record_signal_discards(rows, mode, reason):
+    """1.8.6: course signals the loop will not try (e.g. kill switch) go to
+    signal_events like the other discards. Record only; caller holds LOCK."""
+    if mode != "granmago" or MARKET_REGIME["store"] is None:
+        return
+    occupied = {p.get("pair") for p in _positions() if isinstance(p, dict)}
+    for row in rows or []:
+        if not isinstance(row, dict) or not row.get("pair") or row.get("pair") in occupied:
+            continue
+        sig = row.get("granmago")
+        if not isinstance(sig, dict) or sig.get("side") not in ("long", "short"):
+            continue
+        if _signal_used(row["pair"], sig["side"], sig.get("confirmMs"), sig.get("closeMs")):
+            continue
+        _signal_event(row["pair"], sig["side"], sig.get("closeMs"), "descartada", reason)
+
+
 def maybe_open():
     """Live entry gateway: never use lastScan/candle prices as execution quotes.
 
@@ -3304,6 +3327,7 @@ def maybe_open():
         if not STATE["running"]:
             return
         if STATE.get("killSwitch"):
+            _record_signal_discards(STATE.get("lastScan"), strategy_mode(), "kill_switch")  # 1.8.6: record only
             return
         if TRADING_ERROR:
             return
@@ -3343,6 +3367,8 @@ def maybe_open():
             if quote is not None:
                 with LOCK:
                     add_log("%s recuperado del estado degradado: sin entrada en este ciclo." % pair)
+            if mode == "granmago":
+                _signal_event(pair, side, sig.get("closeMs"), "descartada", "par_degradado")  # 1.8.6
             continue
         with LOCK:
             if (not STATE["running"] or STATE.get("lastScan") is not scan
@@ -3354,6 +3380,8 @@ def maybe_open():
                     or not _fresh_timestamp(row.get("analyzedAtMs"), SCAN_MAX_AGE_SECONDS)
                     or reference is None or abs(quote.price / reference - 1) > ENTRY_MAX_DIVERGENCE):
                 add_log("No se abre %s: falta ticker Blofin fresco/coherente o escaneo vigente." % pair)
+                if mode == "granmago":
+                    _signal_event(pair, side, sig.get("closeMs"), "descartada", "sin_ticker_fresco")  # 1.8.6
                 continue
             if mode == "granmago" and TRADER is not None:
                 plan = _granmago_plan(dict(sig, pair=pair, market=quote.price), quote=quote)
